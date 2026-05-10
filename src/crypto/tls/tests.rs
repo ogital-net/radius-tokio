@@ -228,3 +228,176 @@ fn peer_certificate_per_field_san_accessors() {
     let all = peer.subject_alt_names().unwrap();
     assert_eq!(all.len(), 4, "all SANs: {all:?}");
 }
+
+// -----------------------------------------------------------------
+// dns_name_matches — RFC 6125 §6.4.3 unit tests. These don't need
+// a live handshake; they exercise the helper directly.
+// -----------------------------------------------------------------
+
+#[test]
+fn dns_match_exact_case_insensitive() {
+    assert!(super::dns_name_matches(
+        "host.example.com",
+        "host.example.com"
+    ));
+    assert!(super::dns_name_matches(
+        "HOST.example.com",
+        "host.EXAMPLE.com"
+    ));
+    assert!(!super::dns_name_matches(
+        "host.example.com",
+        "other.example.com"
+    ));
+}
+
+#[test]
+fn dns_match_trailing_dot() {
+    assert!(super::dns_name_matches(
+        "host.example.com.",
+        "host.example.com"
+    ));
+    assert!(super::dns_name_matches(
+        "host.example.com",
+        "host.example.com."
+    ));
+}
+
+#[test]
+fn dns_match_wildcard_left_label_only() {
+    assert!(super::dns_name_matches("*.example.com", "host.example.com"));
+    assert!(super::dns_name_matches("*.example.com", "HOST.example.com"));
+    // Wildcard matches exactly one label.
+    assert!(!super::dns_name_matches(
+        "*.example.com",
+        "deep.host.example.com"
+    ));
+    // Wildcard not in leftmost position is treated as a literal
+    // and rejected (no '*' allowed in non-leftmost labels).
+    assert!(!super::dns_name_matches("host.*.com", "host.example.com"));
+    // Partial-label wildcards rejected.
+    assert!(!super::dns_name_matches(
+        "f*o.example.com",
+        "foo.example.com"
+    ));
+    assert!(!super::dns_name_matches(
+        "*foo.example.com",
+        "myfoo.example.com"
+    ));
+}
+
+#[test]
+fn dns_match_wildcard_requires_three_labels() {
+    // RFC 6125 §6.4.3: wildcard certs covering top-level zones
+    // (*.com, *.local) are rejected.
+    assert!(!super::dns_name_matches("*.com", "example.com"));
+    assert!(!super::dns_name_matches("*.local", "host.local"));
+    assert!(super::dns_name_matches("*.example.com", "host.example.com"));
+}
+
+#[test]
+fn dns_match_rejects_malformed() {
+    assert!(!super::dns_name_matches("", "host.example.com"));
+    assert!(!super::dns_name_matches("host.example.com", ""));
+    assert!(!super::dns_name_matches(".example.com", ".example.com"));
+    assert!(!super::dns_name_matches(
+        "host..example.com",
+        "host..example.com"
+    ));
+    // Embedded NUL — one historical X.509 SAN smuggling vector.
+    assert!(!super::dns_name_matches(
+        "good.example.com\0evil.example.com",
+        "good.example.com",
+    ));
+}
+
+// -----------------------------------------------------------------
+// matches_hostname — end-to-end check using a peer cert from a
+// real handshake.
+// -----------------------------------------------------------------
+
+#[test]
+fn matches_hostname_san_dns_hit() {
+    use crate::crypto::pki::{CertificateAuthority, SubjectAltName};
+    use std::net::IpAddr;
+    let ca = CertificateAuthority::new("ca").unwrap();
+    let ca_pem = ca.cert_pem().unwrap();
+    let server = ca
+        .issue_server("radsec.test", &[SubjectAltName::Dns("radsec.test".into())])
+        .unwrap();
+    let client = ca
+        .issue_client(
+            "nas-1",
+            &[
+                SubjectAltName::Dns("nas-1.example.com".into()),
+                SubjectAltName::Ip("10.0.0.5".parse::<IpAddr>().unwrap()),
+            ],
+        )
+        .unwrap();
+
+    let server_ctx = TlsContext::server(&server.chain_pem, &server.key_pem, &ca_pem).unwrap();
+    let mut srv = TlsConnection::accept(&server_ctx).unwrap();
+    let mut cli = client_side::builder(&ca_pem)
+        .unwrap()
+        .with_client_cert(&client.chain_pem, &client.key_pem)
+        .unwrap()
+        .build()
+        .unwrap();
+    drive(&mut srv, &mut cli).expect("handshake");
+    let peer = srv.peer_certificate().expect("peer cert");
+
+    // SAN DNS exact + case-insensitive.
+    assert!(peer.matches_hostname("nas-1.example.com", false));
+    assert!(peer.matches_hostname("NAS-1.example.com", false));
+    assert!(!peer.matches_hostname("other.example.com", false));
+
+    // SAN IP literal.
+    assert!(peer.matches_hostname("10.0.0.5", false));
+    assert!(!peer.matches_hostname("10.0.0.6", false));
+
+    // CN-only "nas-1" must NOT match when SAN dNSName is present
+    // (RFC 6125 §6.4.4), even with the legacy CN flag enabled.
+    assert!(!peer.matches_hostname("nas-1", true));
+    assert!(!peer.matches_hostname("nas-1", false));
+}
+
+#[test]
+fn matches_hostname_cn_fallback_only_without_san_dns() {
+    use crate::crypto::pki::{CertificateAuthority, SubjectAltName};
+    use std::net::IpAddr;
+    let ca = CertificateAuthority::new("ca").unwrap();
+    let ca_pem = ca.cert_pem().unwrap();
+    let server = ca
+        .issue_server("radsec.test", &[SubjectAltName::Dns("radsec.test".into())])
+        .unwrap();
+    // Client cert with CN=nas-1 and only an IP SAN — no DNS SAN,
+    // so the CN-fallback path applies for DNS hostname matching.
+    // (Empty-SAN issuance is rejected by `pki` on purpose.)
+    let client = ca
+        .issue_client(
+            "nas-1",
+            &[SubjectAltName::Ip("10.0.0.5".parse::<IpAddr>().unwrap())],
+        )
+        .unwrap();
+
+    let server_ctx = TlsContext::server(&server.chain_pem, &server.key_pem, &ca_pem).unwrap();
+    let mut srv = TlsConnection::accept(&server_ctx).unwrap();
+    let mut cli = client_side::builder(&ca_pem)
+        .unwrap()
+        .with_client_cert(&client.chain_pem, &client.key_pem)
+        .unwrap()
+        .build()
+        .unwrap();
+    drive(&mut srv, &mut cli).expect("handshake");
+    let peer = srv.peer_certificate().expect("peer cert");
+
+    // Legacy mode: CN match permitted, exact case-insensitive only.
+    assert!(peer.matches_hostname("nas-1", true));
+    assert!(peer.matches_hostname("NAS-1", true));
+    assert!(!peer.matches_hostname("nas-2", true));
+    // No wildcard support in CN fallback.
+    assert!(!peer.matches_hostname("*", true));
+    // Strict mode: CN never consulted.
+    assert!(!peer.matches_hostname("nas-1", false));
+    // IP SAN still works regardless of CN-fallback flag.
+    assert!(peer.matches_hostname("10.0.0.5", false));
+}

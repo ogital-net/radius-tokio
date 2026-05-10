@@ -76,23 +76,23 @@ use std::sync::Arc;
 
 use aws_lc_sys::{
     i2d_ASN1_TYPE, ASN1_STRING_get0_data, ASN1_STRING_length, BIO_free, BIO_mem_contents, BIO_new,
-    BIO_new_mem_buf, BIO_read, BIO_reset, BIO_s_mem, BIO_write, ERR_error_string_n, ERR_get_error,
-    EVP_PKEY_free, GENERAL_NAMES_free, NID_commonName, NID_subject_alt_name, OBJ_obj2txt,
-    OPENSSL_sk_new_null, OPENSSL_sk_num, OPENSSL_sk_push, OPENSSL_sk_value,
-    PEM_read_bio_PrivateKey, PEM_read_bio_X509, SSL_CTX_check_private_key, SSL_CTX_free,
-    SSL_CTX_new, SSL_CTX_set1_cert_store, SSL_CTX_set_client_CA_list,
-    SSL_CTX_set_min_proto_version, SSL_CTX_set_num_tickets, SSL_CTX_set_options,
-    SSL_CTX_set_verify, SSL_CTX_set_verify_depth, SSL_CTX_use_PrivateKey, SSL_CTX_use_certificate,
-    SSL_accept, SSL_free, SSL_get_error, SSL_get_key_update_type, SSL_get_peer_certificate,
-    SSL_key_update, SSL_new, SSL_pending, SSL_read, SSL_set_bio, SSL_shutdown, SSL_version,
-    SSL_write, TLS_server_method, X509_NAME_ENTRY_get_data, X509_NAME_dup, X509_NAME_free,
-    X509_NAME_get_entry, X509_NAME_get_index_by_NID, X509_NAME_oneline, X509_STORE_add_cert,
-    X509_STORE_new, X509_free, X509_get_ext_d2i, X509_get_subject_name, ASN1_OBJECT, ASN1_TYPE,
-    BIO, EVP_PKEY, GENERAL_NAME, GEN_DNS, GEN_IPADD, GEN_OTHERNAME, GEN_RID, GEN_URI, OTHERNAME,
-    SSL, SSL_CTX, SSL_ERROR_NONE, SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE, SSL_ERROR_ZERO_RETURN,
-    SSL_KEY_UPDATE_NONE, SSL_KEY_UPDATE_REQUESTED, SSL_OP_NO_TICKET,
-    SSL_VERIFY_FAIL_IF_NO_PEER_CERT, SSL_VERIFY_PEER, TLS1_2_VERSION, TLS1_3_VERSION, X509,
-    X509_STORE,
+    BIO_new_mem_buf, BIO_read, BIO_reset, BIO_s_mem, BIO_write, ERR_clear_error,
+    ERR_error_string_n, ERR_get_error, EVP_PKEY_free, GENERAL_NAMES_free, NID_commonName,
+    NID_subject_alt_name, OBJ_obj2txt, OPENSSL_free, OPENSSL_sk_new_null, OPENSSL_sk_num,
+    OPENSSL_sk_push, OPENSSL_sk_value, PEM_read_bio_PrivateKey, PEM_read_bio_X509,
+    SSL_CTX_check_private_key, SSL_CTX_free, SSL_CTX_new, SSL_CTX_set1_cert_store,
+    SSL_CTX_set_client_CA_list, SSL_CTX_set_min_proto_version, SSL_CTX_set_num_tickets,
+    SSL_CTX_set_options, SSL_CTX_set_verify, SSL_CTX_set_verify_depth, SSL_CTX_use_PrivateKey,
+    SSL_CTX_use_certificate, SSL_accept, SSL_free, SSL_get_error, SSL_get_key_update_type,
+    SSL_get_peer_certificate, SSL_key_update, SSL_new, SSL_pending, SSL_read, SSL_set_bio,
+    SSL_shutdown, SSL_version, SSL_write, TLS_server_method, X509_NAME_ENTRY_get_data,
+    X509_NAME_dup, X509_NAME_free, X509_NAME_get_entry, X509_NAME_get_index_by_NID,
+    X509_NAME_oneline, X509_STORE_add_cert, X509_STORE_new, X509_free, X509_get_ext_d2i,
+    X509_get_subject_name, ASN1_OBJECT, ASN1_TYPE, BIO, EVP_PKEY, GENERAL_NAME, GEN_DNS, GEN_IPADD,
+    GEN_OTHERNAME, GEN_RID, GEN_URI, OTHERNAME, SSL, SSL_CTX, SSL_ERROR_NONE, SSL_ERROR_WANT_READ,
+    SSL_ERROR_WANT_WRITE, SSL_ERROR_ZERO_RETURN, SSL_KEY_UPDATE_NONE, SSL_KEY_UPDATE_REQUESTED,
+    SSL_OP_NO_TICKET, SSL_VERIFY_FAIL_IF_NO_PEER_CERT, SSL_VERIFY_PEER, TLS1_2_VERSION,
+    TLS1_3_VERSION, X509, X509_STORE,
 };
 
 // ============================================================================
@@ -133,29 +133,50 @@ impl std::fmt::Display for TlsError {
 
 impl std::error::Error for TlsError {}
 
-/// Pop and format the top of the libssl error queue.
+/// Pop and format every entry currently on the libssl error queue.
+///
+/// libssl pushes errors onto a thread-local FIFO; a single failed
+/// operation may push several. We drain the queue completely so
+/// the next libssl call starts from a clean slate — leftover
+/// entries would otherwise surface as spurious context in an
+/// unrelated `pop_err` report. Joins the formatted entries with
+/// `"; "` separators; returns just the prefix when the queue is
+/// empty (which is itself a bug-detector, since `pop_err` is only
+/// called on a failure path).
 pub(super) fn pop_err(prefix: &str) -> String {
-    // SAFETY: ERR_get_error has no preconditions; returns 0 if the
-    // queue is empty.
-    let code = unsafe { ERR_get_error() };
-    if code == 0 {
-        return format!("{prefix}: (no libssl error in queue)");
+    let mut messages: Vec<String> = Vec::new();
+    loop {
+        // SAFETY: ERR_get_error has no preconditions; returns 0
+        // when the queue is empty.
+        let code = unsafe { ERR_get_error() };
+        if code == 0 {
+            break;
+        }
+        let mut buf = [0u8; 256];
+        // SAFETY: buf is a valid 256-byte mutable slice.
+        // ERR_error_string_n writes a NUL-terminated string up to
+        // the supplied size. Cast to `c_char` because its
+        // signedness is platform-dependent (i8 on x86_64-linux/glibc,
+        // u8 on aarch64).
+        unsafe {
+            ERR_error_string_n(
+                code,
+                buf.as_mut_ptr().cast::<std::os::raw::c_char>(),
+                buf.len(),
+            );
+        }
+        let nul_pos = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        messages.push(String::from_utf8_lossy(&buf[..nul_pos]).into_owned());
     }
-    let mut buf = [0u8; 256];
-    // SAFETY: buf is a valid 256-byte mutable slice. ERR_error_string_n
-    // writes a NUL-terminated string into the supplied buffer up to
-    // the supplied size. Cast to `c_char` because its signedness is
-    // platform-dependent (i8 on x86_64-linux/glibc, u8 on aarch64).
-    unsafe {
-        ERR_error_string_n(
-            code,
-            buf.as_mut_ptr().cast::<std::os::raw::c_char>(),
-            buf.len(),
-        );
+    // Belt-and-suspenders: clear in case ERR_get_error skipped
+    // something on a future aws-lc revision (no-op today).
+    // SAFETY: ERR_clear_error has no preconditions.
+    unsafe { ERR_clear_error() };
+    if messages.is_empty() {
+        format!("{prefix}: (no libssl error in queue)")
+    } else {
+        format!("{prefix}: {}", messages.join("; "))
     }
-    let nul_pos = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    let msg = String::from_utf8_lossy(&buf[..nul_pos]);
-    format!("{prefix}: {msg}")
 }
 
 // ============================================================================
@@ -291,6 +312,13 @@ impl X509Owned {
     /// [`subject_alt_names`](Self::subject_alt_names) (RFC 6125
     /// §6.4.4 / RFC 6614 §2.3) or
     /// [`spki_sha256`](Self::spki_sha256) instead.
+    ///
+    /// The returned string is always the **complete** Subject DN.
+    /// We pass `NULL`/`0` to `X509_NAME_oneline`, which causes
+    /// libcrypto to allocate a buffer sized exactly to fit, so an
+    /// oversize DN can't be silently truncated into something
+    /// shorter that a careless `subject.contains(needle)` matcher
+    /// would treat as legitimate.
     pub(super) fn subject_display(&self) -> String {
         // SAFETY: cert valid; X509_get_subject_name returns an
         // interior pointer owned by the X509.
@@ -298,26 +326,23 @@ impl X509Owned {
         if name.is_null() {
             return String::new();
         }
-        // 512 covers the realistic worst case for an RFC 5280 DN
-        // (~6 RDNs each at their X.520 upper bound). X509_NAME_oneline
-        // truncates rather than failing if the buffer is too small.
-        let mut buf = [0u8; 512];
-        // SAFETY: buf valid; X509_NAME_oneline writes a
-        // NUL-terminated string up to buf_size bytes; with a
-        // non-null buf the return value points into our buffer.
-        let ptr = unsafe {
-            X509_NAME_oneline(
-                name,
-                buf.as_mut_ptr().cast::<std::os::raw::c_char>(),
-                c_int::try_from(buf.len()).unwrap_or(c_int::MAX),
-            )
-        };
+        // SAFETY: passing buf=NULL, size=0 tells X509_NAME_oneline
+        // to allocate a buffer with OPENSSL_malloc and return it;
+        // the caller must release it with OPENSSL_free. Returns
+        // NULL on allocation failure.
+        let ptr = unsafe { X509_NAME_oneline(name, std::ptr::null_mut(), 0) };
         if ptr.is_null() {
             return String::new();
         }
-        // SAFETY: ptr came from our buffer and is NUL-terminated.
-        let cstr = unsafe { CStr::from_ptr(ptr) };
-        cstr.to_string_lossy().into_owned()
+        // SAFETY: ptr was just produced by X509_NAME_oneline and is
+        // guaranteed NUL-terminated.
+        let owned = unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned();
+        // SAFETY: ptr came from OPENSSL_malloc inside libcrypto;
+        // OPENSSL_free is the matching deallocator.
+        unsafe { OPENSSL_free(ptr.cast::<c_void>()) };
+        owned
     }
 
     /// SHA-256 hash of the SubjectPublicKeyInfo (the canonical
@@ -1005,6 +1030,153 @@ impl PeerCertificate {
         })?;
         Ok(out)
     }
+
+    /// Identity-match `expected` against the leaf certificate using
+    /// the RFC 6125 §6 / RFC 6614 §2.3 rules `radsecproxy`'s
+    /// `certnamecheck` enforces.
+    ///
+    /// `expected` is interpreted as either a literal IP address
+    /// (matched against `iPAddress` SAN entries) or a DNS hostname
+    /// (matched against `dNSName` SAN entries, including a single
+    /// leftmost `*` wildcard label).
+    ///
+    /// **CN gating.** Per RFC 6125 §6.4.4, when *any* SAN of the
+    /// matching type (DNS or IP) is present, the Common Name MUST
+    /// NOT be considered. CN is consulted only as a fallback for
+    /// DNS hostnames on certificates that carry no DNS SANs at
+    /// all, and only when `allow_common_name` is `true`. New
+    /// deployments should pass `false`; existing deployments that
+    /// need radsecproxy's `certcncheck` legacy behaviour pass
+    /// `true`.
+    ///
+    /// Comparisons are ASCII case-insensitive (DNS labels are
+    /// case-insensitive per RFC 1035 §2.3.3); IDNA / Unicode
+    /// normalisation is *not* performed. Wildcard rules:
+    ///
+    /// * Wildcard appears only as the leftmost label and only as
+    ///   the entire label (`*.example.com`, not `*foo.example.com`).
+    /// * Wildcard matches exactly one label (`*.example.com` matches
+    ///   `host.example.com` but not `host.sub.example.com`).
+    /// * No wildcard is allowed in CN-fallback matching.
+    ///
+    /// Returns `true` iff `expected` matches at least one acceptable
+    /// identifier on the certificate.
+    #[must_use]
+    pub fn matches_hostname(&self, expected: &str, allow_common_name: bool) -> bool {
+        // Literal IP form: match SAN iPAddress only, regardless of
+        // CN. Both v4 and v6.
+        if let Ok(ip) = expected.parse::<IpAddr>() {
+            let mut hit = false;
+            // walk_sans short-circuits when the closure returns
+            // `false`; once we find a match we stop.
+            let _ = self.cert.walk_sans(|san| {
+                if let SubjectAltName::Ip(san_ip) = san {
+                    if san_ip == ip {
+                        hit = true;
+                        return false;
+                    }
+                }
+                true
+            });
+            return hit;
+        }
+
+        // DNS form: match SAN dNSName entries (case-insensitive,
+        // wildcard-aware). If *any* dNSName is present and none
+        // matched, fail closed — RFC 6125 §6.4.4 forbids the CN
+        // fallback.
+        let mut any_dns = false;
+        let mut hit = false;
+        let _ = self.cert.walk_sans(|san| {
+            if let SubjectAltName::Dns(name) = san {
+                any_dns = true;
+                if dns_name_matches(&name, expected) {
+                    hit = true;
+                    return false;
+                }
+            }
+            true
+        });
+        if hit {
+            return true;
+        }
+        if any_dns || !allow_common_name {
+            return false;
+        }
+
+        // Legacy CN fallback. Exact case-insensitive match only;
+        // no wildcard support — radsecproxy's `certcncheck` does
+        // not treat CN values as wildcard-bearing patterns.
+        let mut cn_hit = false;
+        self.cert.walk_common_names(|cn| {
+            if cn.eq_ignore_ascii_case(expected) {
+                cn_hit = true;
+                return false;
+            }
+            true
+        });
+        cn_hit
+    }
+}
+
+/// Match a `dNSName` SAN value `presented` against the requested
+/// hostname `expected` per RFC 6125 §6.4.3. Both inputs are
+/// compared label-wise, case-insensitive ASCII; IDNA / U-label
+/// processing is the caller's responsibility (consumers that need
+/// it should normalize both sides before calling
+/// [`PeerCertificate::matches_hostname`]).
+fn dns_name_matches(presented: &str, expected: &str) -> bool {
+    // Reject empty inputs and any presented value containing an
+    // embedded NUL — both indicate a malformed certificate (or
+    // a cert smuggling extra labels past a naive parser) and the
+    // RFC 6125 algorithm only defines behaviour for well-formed
+    // DNS names.
+    if presented.is_empty() || expected.is_empty() {
+        return false;
+    }
+    if presented.as_bytes().contains(&0) {
+        return false;
+    }
+
+    // Strip a single trailing dot from each so "host.example.com"
+    // and "host.example.com." compare equal.
+    let presented = presented.strip_suffix('.').unwrap_or(presented);
+    let expected = expected.strip_suffix('.').unwrap_or(expected);
+
+    let p_labels: Vec<&str> = presented.split('.').collect();
+    let e_labels: Vec<&str> = expected.split('.').collect();
+    if p_labels.len() != e_labels.len() {
+        return false;
+    }
+    // No empty labels (catches leading dots and ".." sequences).
+    if p_labels.iter().any(|l| l.is_empty()) || e_labels.iter().any(|l| l.is_empty()) {
+        return false;
+    }
+
+    for (i, (p, e)) in p_labels.iter().zip(e_labels.iter()).enumerate() {
+        if i == 0 && *p == "*" {
+            // Leftmost-only, full-label wildcard. Per RFC 6125
+            // §6.4.3 we additionally require the expected name
+            // to have at least three labels — a wildcard cert for
+            // `*.com` is rejected.
+            if e_labels.len() < 3 {
+                return false;
+            }
+            // `*` matches exactly one label of any value (the
+            // length check already guaranteed there *is* a label).
+            continue;
+        }
+        // Reject partial-label wildcards (`f*o`, `*foo`, `foo*`)
+        // outright — RFC 6125 §6.4.3 deprecates them and
+        // radsecproxy treats them as no-match.
+        if p.contains('*') {
+            return false;
+        }
+        if !p.eq_ignore_ascii_case(e) {
+            return false;
+        }
+    }
+    true
 }
 
 // ============================================================================

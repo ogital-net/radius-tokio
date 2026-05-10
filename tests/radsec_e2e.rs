@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use radius_tokio::server::{Client, ClientStore, Handler, HandlerResult, Request, Server};
-use radius_tokio::tls::{PeerCertificate, SubjectAltName, TlsContext};
+use radius_tokio::tls::{PeerCertificate, TlsContext};
 use radius_tokio::Code;
 
 struct AcceptAll;
@@ -55,14 +55,17 @@ impl Handler for AcceptAll {
     }
 }
 
-/// Cert-keyed `ClientStore`: maps a peer's `dNSName` SAN to a
-/// pre-registered [`Client`]. RFC 6614 §2.3 mandates a SAN on
-/// RadSec leaves and RFC 6125 §6.4.4 deprecates Common Name
-/// matching, so SAN is the right hook here. Real deployments
-/// would back this with a database; the test uses a frozen
-/// in-memory map.
+/// Cert-keyed `ClientStore`: maps a peer's hostname to a
+/// pre-registered [`Client`] via
+/// [`PeerCertificate::matches_hostname`], which implements RFC
+/// 6125 §6.4.3 (SAN dNSName preferred, leftmost-label wildcards,
+/// IP-literal expectations matched against iPAddress SANs). RFC
+/// 6614 §2.3 mandates a SAN on RadSec leaves and RFC 6125 §6.4.4
+/// deprecates Common Name matching, so we pass
+/// `allow_common_name = false`. Real deployments would back this
+/// with a database; the test uses a frozen in-memory map.
 struct SanStore {
-    by_dns_san: HashMap<String, Arc<Client>>,
+    clients_by_name: HashMap<String, Arc<Client>>,
 }
 
 impl ClientStore for SanStore {
@@ -86,18 +89,13 @@ impl ClientStore for SanStore {
         _src: SocketAddr,
         peer: &PeerCertificate,
     ) -> impl Future<Output = Option<Arc<Client>>> + Send {
-        // Walk the leaf's SAN list and return the first registered
-        // `dNSName` match. `iPAddress` and other types aren't used
-        // by the test PKI builder so they fall through.
-        let hit = peer.subject_alt_names().ok().and_then(|sans| {
-            sans.into_iter().find_map(|san| match san {
-                SubjectAltName::Dns(name) => self.by_dns_san.get(&name).cloned(),
-                SubjectAltName::Ip(_)
-                | SubjectAltName::Uri(_)
-                | SubjectAltName::RegisteredId(_)
-                | SubjectAltName::OtherName(_) => None,
-            })
-        });
+        // Iterate the registry and let `matches_hostname` do the
+        // RFC 6125 §6.4.3 SAN walk for us; CN fallback disabled.
+        let hit = self
+            .clients_by_name
+            .iter()
+            .find(|(name, _)| peer.matches_hostname(name, false))
+            .map(|(_, client)| Arc::clone(client));
         async move { hit }
     }
 }
@@ -225,10 +223,10 @@ async fn radsec_cert_keyed_dispatches_to_correct_client() {
     let bob_client = Arc::new(Client::new(bob_secret.as_bytes()));
     let alice_id = alice_client.id();
     let bob_id = bob_client.id();
-    let mut by_dns_san = HashMap::new();
-    by_dns_san.insert("alice".to_string(), Arc::clone(&alice_client));
-    by_dns_san.insert("bob".to_string(), Arc::clone(&bob_client));
-    let store = SanStore { by_dns_san };
+    let mut clients_by_name = HashMap::new();
+    clients_by_name.insert("alice".to_string(), Arc::clone(&alice_client));
+    clients_by_name.insert("bob".to_string(), Arc::clone(&bob_client));
+    let store = SanStore { clients_by_name };
 
     let server = Server::builder()
         .clients(store)

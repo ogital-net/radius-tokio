@@ -3,33 +3,41 @@
 //! # Pipeline
 //!
 //! ```text
-//!   accept(TCP) ─▶ admit_radsec(src):bool ─▶ TLS handshake
-//!                       │ false: drop           │ fail: drop
-//!                       ▼                       ▼
-//!                  no TLS state             no further work
-//!                                               │
-//!                                               ▼
-//!                                 lookup_radsec_by_cert(src, peer)
-//!                                       │ None: shutdown + drop
-//!                                       ▼
-//!                                   frame loop
+//!   accept(TCP) ─▶ admit_radsec(src):bool ─▶ spawn ─▶ TLS handshake
+//!                       │ false: drop                    │ fail: drop
+//!                       ▼                                ▼
+//!                  no spawn, no TLS                  no further work
+//!                                                        │
+//!                                                        ▼
+//!                                          lookup_radsec_by_cert(src, peer)
+//!                                                │ None: shutdown + drop
+//!                                                ▼
+//!                                            frame loop
 //! ```
 //!
-//! Each accepted connection owns one Tokio task. The task:
+//! Each accepted connection is gated on the accept loop's task
+//! (no spawn for denied peers). Once admitted, a per-connection
+//! task:
 //!
-//! 1. Calls [`ClientStore::admit_radsec`] before any TLS bytes are
-//!    read — a cheap pre-handshake `DoS` gate. Default `true`.
-//! 2. Runs a server-side mTLS handshake using the listener-wide
+//! 1. Runs a server-side mTLS handshake using the listener-wide
 //!    [`TlsContext`]. libssl performs chain validation; a failure
 //!    closes the connection.
-//! 3. Maps the peer's leaf certificate to a registered [`Client`]
+//! 2. Maps the peer's leaf certificate to a registered [`Client`]
 //!    via [`ClientStore::lookup_radsec_by_cert`]. The store may
 //!    consult either the cert (Subject / SAN / SPKI) or the source
 //!    address, or both — `radsecproxy`'s `verifyconfcert` policy.
-//! 4. Loops reading whole RADIUS frames out of the TLS stream and
+//! 3. Loops reading whole RADIUS frames out of the TLS stream and
 //!    dispatching them through the same authenticator-validation +
 //!    dedup + handler pipeline as UDP. The reply is sealed and
 //!    written back over the same TLS session.
+//!
+//! [`ClientStore::admit_radsec`] is awaited inline on the accept
+//! loop so that a denied peer costs no more than the `accept()`
+//! plus the store lookup — no spawn, no `TcpStream` handed off,
+//! no per-task buffer. Implementations are expected to keep the
+//! check cheap (CIDR match, in-memory rate limiter); a slow
+//! backend should front itself with `CachedStore` or do its own
+//! work asynchronously.
 //!
 //! [`ClientStore::admit_radsec`]:
 //!     super::store::ClientStore::admit_radsec
@@ -282,6 +290,25 @@ where
             }
             res = listener.accept() => {
                 let (stream, peer) = res?;
+                // Pre-handshake DoS gate. Run *before* we touch
+                // the socket further or spawn a task: a denied
+                // peer must cost no more than the accept() and
+                // a `ClientStore` lookup. Pushing this past the
+                // spawn would let a SYN-flood balloon Tokio's
+                // task table even for an explicit-deny policy.
+                //
+                // The await briefly serializes the accept loop;
+                // implementations are expected to keep `admit_radsec`
+                // cheap (CIDR check, in-memory rate limiter). A
+                // store with an inherently slow admission policy
+                // should front it with `CachedStore` or spawn its
+                // own work internally.
+                if !store.admit_radsec(peer).await {
+                    debug!(event = "radsec_admit_reject", %peer);
+                    count!("radius_tokio.radsec_admit_rejects");
+                    drop(stream);
+                    continue;
+                }
                 // Disable Nagle: RADIUS replies are small and
                 // request/response is naturally serialized, so any
                 // coalescing buys nothing and just adds latency.
@@ -307,7 +334,9 @@ where
     }
 }
 
-/// Per-connection driver: admission → handshake → frame loop.
+/// Per-connection driver: handshake → frame loop. Admission has
+/// already been gated by [`serve_radsec`] before this task is
+/// spawned.
 #[allow(clippy::too_many_arguments, clippy::used_underscore_binding)]
 async fn handle_connection<S, H>(
     stream: TcpStream,
@@ -322,15 +351,6 @@ where
     S: ClientStore,
     H: Handler,
 {
-    // Step 1: pre-handshake DoS gate. No TLS state is allocated
-    // yet, so peers the consumer doesn't want to talk to cost us
-    // nothing beyond the accept().
-    if !store.admit_radsec(peer).await {
-        debug!(event = "radsec_admit_reject", %peer);
-        count!("radius_tokio.radsec_admit_rejects");
-        return Ok(());
-    }
-
     // Step 2: server-side mTLS handshake against the listener-wide
     // trust store from `TlsContext::server`.
     let tls = TlsConnection::accept(&tls_ctx).map_err(tls_to_io)?;
@@ -1087,14 +1107,14 @@ mod tests {
 
     // -----------------------------------------------------------
     // Cert-keyed mode: post-handshake authorization via a custom
-    // ClientStore that maps the leaf cert's Subject DN to a Client.
+    // ClientStore that maps the leaf cert's identifier to a Client.
     // -----------------------------------------------------------
 
     /// Cert-keyed `ClientStore` for tests: a flat list of
-    /// `(subject-substring -> Client)` pairs. Returns `None` from
-    /// `lookup_udp`, admits every `RadSec` peer (default), and
-    /// matches `lookup_radsec_by_cert` against the cert's Subject
-    /// DN string.
+    /// `(hostname -> Client)` pairs. Returns `None` from
+    /// `lookup_udp`, admits every `RadSec` peer, and runs a
+    /// proper RFC 6125 hostname match (SAN dNSName preferred,
+    /// CN fallback allowed) via [`PeerCertificate::matches_hostname`].
     struct CertKeyedStore {
         entries: Vec<(String, Arc<Client>)>,
     }
@@ -1122,11 +1142,16 @@ mod tests {
             _src: SocketAddr,
             peer: &crate::tls::PeerCertificate,
         ) -> impl std::future::Future<Output = Option<Arc<Client>>> + Send {
-            let subject = peer.subject_display();
+            // RFC 6125 §6.4.4: prefer SAN, fall back to CN only
+            // when no SAN of the matching type exists. Our test
+            // PKI's client leaves carry both CN=nas-1 and
+            // SAN dNSName=nas-1, so SAN always wins; we still pass
+            // `allow_common_name = true` to mirror radsecproxy's
+            // `certcncheck` legacy posture.
             let hit = self
                 .entries
                 .iter()
-                .find(|(needle, _)| subject.contains(needle.as_str()))
+                .find(|(needle, _)| peer.matches_hostname(needle, true))
                 .map(|(_, c)| Arc::clone(c));
             async move { hit }
         }
