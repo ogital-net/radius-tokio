@@ -73,6 +73,13 @@ It deliberately does **not** impose:
    imposed on consumers — gate it behind a feature). Cryptography is built
    on `aws-lc-sys` directly (FIPS-validatable, audited C) rather than a
    higher-level Rust TLS stack — see the Cryptography section.
+
+   **Always pin to the latest released version of every dependency.** When
+   adding or updating a crate, start from the newest version on crates.io
+   and only walk backward if it forces an MSRV bump or otherwise violates a
+   project constraint. Don't leave dependencies on stale majors "because
+   the old one still compiles" — newer releases carry the security fixes,
+   sanitizer coverage, and upstream bug fixes we want.
 5. **Strict, typed attribute model.** RFC and vendor attributes are exposed
    as strongly-typed Rust items generated at build time from FreeRADIUS
    dictionaries vendored in-tree.
@@ -149,28 +156,34 @@ pub trait ClientStore: Send + Sync + 'static {
         src: SocketAddr,
     ) -> impl Future<Output = Option<Arc<Client>>> + Send;
 
-    /// Pre-TLS-handshake admission for RadSec. Called immediately after
-    /// `accept()` with the peer's source address. Returning `None` causes
-    /// the connection to be closed before any TLS state is allocated.
-    /// The returned `Client` carries the trust material (CA set, pinned
-    /// SPKI, allowed Subject/SAN) used to configure the per-connection
-    /// `SSL` object for the mTLS handshake.
+    /// Pre-handshake DoS gate for RadSec. Called immediately after
+    /// `accept()` on the TCP listener, **before** any TLS bytes are
+    /// read. Returning `false` closes the connection with no TLS
+    /// state allocated. Default impl returns `false` (deny) so
+    /// consumers must explicitly opt in to a DoS-exposure policy;
+    /// override to add a CIDR allow-list or per-IP rate limit.
     fn admit_radsec(
         &self,
         src: SocketAddr,
-        sni: Option<&str>,
-    ) -> impl Future<Output = Option<Arc<Client>>> + Send;
+    ) -> impl Future<Output = bool> + Send {
+        let _ = src;
+        async { false }
+    }
 
-    /// Cert-keyed RadSec mode (the default). Called from the TLS
-    /// verify callback once the peer presents a chain. Default impl
-    /// returns `None`, which means a cert-keyed listener will reject
-    /// any peer the consumer hasn't taught it about; listeners whose
-    /// peers are identifiable by IP can switch to IP-gated mode
-    /// instead.
+    /// Post-handshake authorization for RadSec. Called once the
+    /// mTLS handshake succeeds, with the peer's source address and
+    /// the leaf certificate it presented. Returning `None` tears
+    /// the connection down before any RADIUS frame is exchanged.
+    /// Default impl returns `None` — a `RadSec` listener bound
+    /// against a store that does not override this method is a
+    /// no-op listener. The store may key off Subject DN, SAN,
+    /// SPKI fingerprint, source IP, or any combination.
     fn lookup_radsec_by_cert(
         &self,
+        src: SocketAddr,
         peer: &PeerCertificate<'_>,
     ) -> impl Future<Output = Option<Arc<Client>>> + Send {
+        let _ = (src, peer);
         async { None }
     }
 }
@@ -216,12 +229,12 @@ Server::builder()
     .await?;
 ```
 
-RadSec is purely additive: call `.listen_radsec(addr, tls_config)` on the
-builder (cert-keyed by default; `.listen_radsec_ip_gated(...)` for the
-IP-keyed variant). Consumers that need DB-backed lookups implement
-`ClientStore`
-themselves; the same `Server` machinery transparently switches from the
-built-in static table to the custom store.
+RadSec is purely additive: call `.listen_radsec(addr, tls_config)` on
+the builder. The listener pipeline is `accept → admit_radsec(src):bool
+→ mTLS handshake → lookup_radsec_by_cert(src, peer)`. Consumers that
+need DB-backed lookups implement `ClientStore` themselves; the same
+`Server` machinery transparently switches from the built-in static
+table to the custom store.
 
 ## Dictionary & codegen
 
@@ -245,30 +258,33 @@ built-in static table to the custom store.
   TLS is provided by the `crypto` module wrapping `aws-lc-sys`'s libssl
   surface. Mutual TLS required by spec.
 
-  Two admission modes are supported per listener:
+  Single-mode pipeline per accepted connection:
 
-  1. **Cert-keyed (default).** The listener accepts every TCP
-     connection and starts the handshake against a listener-wide
-     trust store; the verify callback invokes
-     `lookup_radsec_by_cert(peer)` to map the presented chain to a
-     `Client`. Unknown chains fail the handshake. This is the RFC
-     6614 §2.5 model and works for every deployment shape — NAT'd
-     peers, RFC 7585 dynamic discovery, consortium proxies.
-  2. **IP-gated.** After `accept()`, the server calls
-     `ClientStore::admit_radsec(src, sni)` *before* starting the TLS
-     handshake. Unknown peers are dropped with no TLS state allocated
-     (cheap DoS-resistance). The returned `Client`'s trust material
-     narrows the per-connection `SSL` (`SSL_set1_verify_cert_store`,
-     `SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT`, plus a custom
-     verify callback for SPKI pin / Subject / SAN checks). A successful
-     handshake therefore *is* the authorization decision — a failure
-     means the peer at that IP did not present the cert it was supposed
-     to, and the connection is dropped. Use this when source addresses
-     uniquely identify peers and you want pre-handshake DoS resistance.
+  1. **Pre-handshake DoS gate.** `ClientStore::admit_radsec(src) ->
+     bool` is called immediately after `accept()`, before any TLS
+     state is allocated. Returning `false` drops the connection
+     cheaply. Default `false` (deny) — consumers must override to
+     admit peers, typically with a CIDR allow-list or per-IP
+     rate limit. The conservative default forces every deployment
+     to think about its DoS exposure before the listener accepts
+     a single handshake.
+  2. **mTLS handshake** against the listener-wide trust store
+     installed by `TlsContext::server` (`SSL_VERIFY_PEER |
+     SSL_VERIFY_FAIL_IF_NO_PEER_CERT`, `verify_depth = 5`,
+     `SSL_OP_NO_TICKET`, advertised CA name list). libssl performs
+     chain validation; failure closes the connection.
+  3. **Post-handshake authorization.**
+     `ClientStore::lookup_radsec_by_cert(src, peer) ->
+     Option<Arc<Client>>` maps the peer's leaf certificate (and
+     source address) to a registered client. The store may key off
+     Subject DN, SAN, SPKI fingerprint, source IP, or any
+     combination — `radsecproxy`'s `verifyconfcert` policy.
+     Returning `None` tears the connection down before any RADIUS
+     frame is exchanged.
 
-  Connections are long-lived TCP; the IP→client (or cert→client) binding
-  is fixed for the life of the connection. Revocation tears the
-  connection down via a `Server::close_connections_for(client_id)` hook.
+  Connections are long-lived TCP; the cert→client binding is fixed
+  for the life of the connection. Revocation tears the connection
+  down via a `Server::close_connections_for(client_id)` hook.
 - **RADIUS-over-DTLS** (RFC 7360): out of scope for v0; revisit later.
 
 ## Client authentication
@@ -281,21 +297,21 @@ Client identification and trust material are pluggable via the
   without a reply (per RFC 2865 §3; no allocation beyond the receive
   buffer). The returned `Client` carries the shared secret used to verify
   the Request Authenticator and Message-Authenticator.
-- **RadSec:** by default the listener runs in **cert-keyed** mode —
-  every accepted TCP connection enters a TLS handshake against the
-  listener-wide trust store, and the verify callback consults
-  `lookup_radsec_by_cert(peer)` to map the presented chain to a
-  `Client`. Unknown chains fail the handshake. This is the RFC
-  6614 §2.5 model and works for every deployment shape, including
-  NAT'd peers and RFC 7585 dynamic discovery. Listeners whose peers
-  are uniquely identifiable by source IP can opt into **IP-gated**
-  mode instead, where `admit_radsec(src, sni)` is called immediately
-  after `accept()` and unknown peers are dropped before any TLS
-  state is allocated; the returned `Client`'s trust material (CA
-  store, pinned SPKI, expected Subject/SAN) is installed on the
-  per-connection `SSL` so a successful mTLS handshake *is* the
-  authorization. A failed handshake means an authorized IP
-  presented the wrong cert — dropped.
+- **RadSec:** every accepted TCP connection runs through three
+  steps. (1) `admit_radsec(src) -> bool` is consulted before any
+  TLS state is allocated — a cheap pre-handshake DoS gate. Default
+  `false` (deny); consumers must override to add a CIDR allow-list,
+  per-IP rate limit, or other admission policy before any peer
+  can connect. (2) The mTLS handshake runs against the listener-wide
+  trust store from `TlsContext::server`. (3) `lookup_radsec_by_cert(
+  src, peer)` maps the validated leaf certificate (combined with
+  the source address) to a registered `Client`; returning `None`
+  drops the connection. The store may key off Subject DN, SAN,
+  SPKI fingerprint, source IP, or any combination —
+  `radsecproxy`'s `verifyconfcert` policy. `StaticClients`
+  provides a default override that admits and identifies purely
+  by source IP, suitable for deployments where every NAS source
+  IP is provisioned.
 - **Dynamic by construction:** because every lookup goes through the
   store, adding, updating, or revoking a client is whatever the store's
   backend supports — no server reload, no restart, no signal. A
@@ -530,18 +546,22 @@ Order within a phase is a suggestion, not a contract; expect iteration.
 - [x] `crypto::Tls{Context,Connection}` server-side, mTLS, peer-cert
       bytes exposed.
 - [x] TCP accept loop on 2083 (configurable).
-- [x] **IP-gated mode**: pre-handshake `admit_radsec(src, sni)`, narrow
-      per-connection `SSL` with the returned client's CA store + verify
-      callback (SPKI pin / Subject / SAN).
-- [x] **Cert-keyed mode**: listener-wide trust store; verify callback
-      consults `lookup_radsec_by_cert(peer)`.
+- [x] **Pre-handshake admission**: `admit_radsec(src) -> bool`
+      gate consulted before any TLS state is allocated. Default
+      `false` (deny); consumers must override to admit peers
+      (CIDR allow-list, per-IP rate limit, …).
+- [x] **Post-handshake authorization**: listener-wide trust store
+      from `TlsContext::server`, then
+      `lookup_radsec_by_cert(src, peer)` maps the validated leaf
+      to a `Client`.
 - [x] Long-lived connection management: per-connection task, framed
       reader, write half guarded by a mutex or mpsc.
       *Sequential per connection (read → dispatch → write); no
       pipelining means no mutex/mpsc is needed on the write half.
       Pipelining is a post-0.1 enhancement.*
 - [x] `Server::close_connections_for(client_id)` revocation hook.
-- [x] Integration tests for both modes (happy path + handshake failure).
+- [x] Integration tests (happy path + handshake failure +
+      unknown-cert rejection).
 - [x] PKI helpers (`crypto::pki`) for consumers who don't already
       run a private CA: ECDSA P-256 keygen, self-signed CA, server /
       client leaf issuance with RFC 6614 §2.3 EKUs and SAN. Drops

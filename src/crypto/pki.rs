@@ -764,6 +764,14 @@ fn encode_sans(sans: &[SubjectAltName]) -> String {
         match san {
             SubjectAltName::Dns(d) => parts.push(format!("DNS:{d}")),
             SubjectAltName::Ip(ip) => parts.push(format!("IP:{ip}")),
+            SubjectAltName::Uri(u) => parts.push(format!("URI:{u}")),
+            SubjectAltName::RegisteredId(oid) => parts.push(format!("RID:{oid}")),
+            // `otherName` issuance is not supported via the
+            // openssl conf-string codepath used here; it requires
+            // hand-rolling the GeneralName ASN.1. The variant is
+            // still useful on the *consumption* side (matching
+            // peer certificates issued by external CAs).
+            SubjectAltName::OtherName(_) => {}
         }
     }
     parts.join(",")

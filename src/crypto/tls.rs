@@ -69,24 +69,30 @@
     clippy::match_same_arms
 )]
 
-use std::ffi::{c_int, c_void, CStr};
+use std::ffi::{c_char, c_int, c_void, CStr};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use aws_lc_sys::{
-    ASN1_STRING_get0_data, ASN1_STRING_length, BIO_free, BIO_new, BIO_new_mem_buf, BIO_read,
-    BIO_s_mem, BIO_write, ERR_error_string_n, ERR_get_error, EVP_PKEY_free, GENERAL_NAMES_free,
-    NID_subject_alt_name, OPENSSL_sk_num, OPENSSL_sk_value, PEM_read_bio_PrivateKey,
-    PEM_read_bio_X509, SSL_CTX_check_private_key, SSL_CTX_free, SSL_CTX_new,
-    SSL_CTX_set1_cert_store, SSL_CTX_set_min_proto_version, SSL_CTX_set_verify,
-    SSL_CTX_use_PrivateKey, SSL_CTX_use_certificate, SSL_accept, SSL_free, SSL_get_error,
-    SSL_get_peer_certificate, SSL_new, SSL_pending, SSL_read, SSL_set1_verify_cert_store,
-    SSL_set_bio, SSL_write, TLS_server_method, X509_NAME_oneline, X509_STORE_add_cert,
-    X509_STORE_new, X509_free, X509_get_ext_d2i, X509_get_subject_name, BIO, EVP_PKEY,
-    GENERAL_NAME, GEN_DNS, GEN_IPADD, SSL, SSL_CTX, SSL_ERROR_NONE, SSL_ERROR_WANT_READ,
-    SSL_ERROR_WANT_WRITE, SSL_ERROR_ZERO_RETURN, SSL_VERIFY_FAIL_IF_NO_PEER_CERT, SSL_VERIFY_PEER,
-    TLS1_2_VERSION, X509, X509_STORE,
+    i2d_ASN1_TYPE, ASN1_STRING_get0_data, ASN1_STRING_length, BIO_free, BIO_mem_contents, BIO_new,
+    BIO_new_mem_buf, BIO_read, BIO_reset, BIO_s_mem, BIO_write, ERR_error_string_n, ERR_get_error,
+    EVP_PKEY_free, GENERAL_NAMES_free, NID_commonName, NID_subject_alt_name, OBJ_obj2txt,
+    OPENSSL_sk_new_null, OPENSSL_sk_num, OPENSSL_sk_push, OPENSSL_sk_value,
+    PEM_read_bio_PrivateKey, PEM_read_bio_X509, SSL_CTX_check_private_key, SSL_CTX_free,
+    SSL_CTX_new, SSL_CTX_set1_cert_store, SSL_CTX_set_client_CA_list,
+    SSL_CTX_set_min_proto_version, SSL_CTX_set_num_tickets, SSL_CTX_set_options,
+    SSL_CTX_set_verify, SSL_CTX_set_verify_depth, SSL_CTX_use_PrivateKey, SSL_CTX_use_certificate,
+    SSL_accept, SSL_free, SSL_get_error, SSL_get_key_update_type, SSL_get_peer_certificate,
+    SSL_key_update, SSL_new, SSL_pending, SSL_read, SSL_set_bio, SSL_shutdown, SSL_version,
+    SSL_write, TLS_server_method, X509_NAME_ENTRY_get_data, X509_NAME_dup, X509_NAME_free,
+    X509_NAME_get_entry, X509_NAME_get_index_by_NID, X509_NAME_oneline, X509_STORE_add_cert,
+    X509_STORE_new, X509_free, X509_get_ext_d2i, X509_get_subject_name, ASN1_OBJECT, ASN1_TYPE,
+    BIO, EVP_PKEY, GENERAL_NAME, GEN_DNS, GEN_IPADD, GEN_OTHERNAME, GEN_RID, GEN_URI, OTHERNAME,
+    SSL, SSL_CTX, SSL_ERROR_NONE, SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE, SSL_ERROR_ZERO_RETURN,
+    SSL_KEY_UPDATE_NONE, SSL_KEY_UPDATE_REQUESTED, SSL_OP_NO_TICKET,
+    SSL_VERIFY_FAIL_IF_NO_PEER_CERT, SSL_VERIFY_PEER, TLS1_2_VERSION, TLS1_3_VERSION, X509,
+    X509_STORE,
 };
 
 // ============================================================================
@@ -348,11 +354,28 @@ impl X509Owned {
 
     /// Decode the certificate's `subjectAltName` extension into a
     /// list of [`SubjectAltName`] entries. Returns an empty vector
-    /// if the extension is absent. Entries with types other than
-    /// `dNSName` and `iPAddress` are silently skipped — those are
-    /// the only types RFC 6614 §2.3 mandates support for and the
-    /// only ones the SAN matchers in `radius-tokio` consume.
+    /// if the extension is absent. Recognises every GeneralName
+    /// choice that RFC 5280 §4.2.1.6 defines and `radsecproxy`'s
+    /// `MatchCertificateAttribute` policy supports — `dNSName`,
+    /// `iPAddress`, `uniformResourceIdentifier`, `registeredID`,
+    /// `otherName`. Other choices are silently skipped.
     pub(super) fn subject_alt_names(&self) -> Result<Vec<SubjectAltName>, TlsError> {
+        let mut out = Vec::new();
+        self.walk_sans(|san| {
+            out.push(san);
+            true
+        })?;
+        Ok(out)
+    }
+
+    /// Walk the SAN extension, invoking `f` for each decoded
+    /// entry. Returning `false` from `f` short-circuits the walk.
+    /// Used by the per-field accessors on [`PeerCertificate`] so
+    /// each only allocates for the entries it cares about.
+    pub(super) fn walk_sans<F>(&self, mut f: F) -> Result<(), TlsError>
+    where
+        F: FnMut(SubjectAltName) -> bool,
+    {
         // SAFETY: cert valid; `X509_get_ext_d2i` returns a
         // freshly-decoded `GENERAL_NAMES*` (caller-owned) when the
         // extension exists, NULL otherwise. We pass NULL for the
@@ -366,42 +389,171 @@ impl X509Owned {
             )
         };
         let Some(stack) = NonNull::new(raw.cast::<aws_lc_sys::stack_st_GENERAL_NAME>()) else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         let _guard = GeneralNamesGuard(stack);
         // SAFETY: stack is a valid `GENERAL_NAMES*`; the cast to
         // `OPENSSL_STACK*` matches BoringSSL's stack ABI.
         let count = unsafe { OPENSSL_sk_num(stack.as_ptr().cast()) };
-        let mut out = Vec::with_capacity(count);
         for i in 0..count {
             // SAFETY: 0 <= i < count; the returned `GENERAL_NAME*`
             // is borrowed from the stack and remains valid until
             // `GENERAL_NAMES_free` runs (via the guard).
             let gn = unsafe { OPENSSL_sk_value(stack.as_ptr().cast(), i) }.cast::<GENERAL_NAME>();
             let Some(gn) = NonNull::new(gn) else { continue };
-            // SAFETY: gn valid; reading the discriminant before the
-            // matching union arm.
-            let ty = unsafe { (*gn.as_ptr()).type_ };
-            if ty == GEN_DNS {
-                // SAFETY: when `type_ == GEN_DNS`, `d.dNSName` is
-                // the active union arm and points at an
-                // `ASN1_IA5STRING` owned by the stack.
-                let s = unsafe { (*gn.as_ptr()).d.dNSName };
-                if let Some(name) = read_asn1_string_utf8(s) {
-                    out.push(SubjectAltName::Dns(name));
-                }
-            } else if ty == GEN_IPADD {
-                // SAFETY: when `type_ == GEN_IPADD`, `d.iPAddress`
-                // is the active union arm and points at an
-                // `ASN1_OCTET_STRING` owned by the stack.
-                let s = unsafe { (*gn.as_ptr()).d.iPAddress };
-                if let Some(ip) = read_asn1_ip(s) {
-                    out.push(SubjectAltName::Ip(ip));
-                }
+            let Some(san) = decode_general_name(gn.as_ptr()) else {
+                continue;
+            };
+            if !f(san) {
+                break;
             }
         }
-        Ok(out)
+        Ok(())
     }
+
+    /// Walk the Subject DN, invoking `f` for each value of the
+    /// `commonName` (NID 13) RDN. Returning `false` short-
+    /// circuits. Useful for `radsecproxy`-style `CN:/regex/`
+    /// matching even though RFC 6125 §6.4.4 deprecates CN-based
+    /// identity for new deployments.
+    pub(super) fn walk_common_names<F>(&self, mut f: F)
+    where
+        F: FnMut(String) -> bool,
+    {
+        // SAFETY: cert valid; X509_get_subject_name returns an
+        // interior pointer that lives as long as the X509.
+        let name = unsafe { X509_get_subject_name(self.0.as_ptr()) };
+        if name.is_null() {
+            return;
+        }
+        let mut loc: c_int = -1;
+        loop {
+            // SAFETY: `name` valid; -1 starts the search; the
+            // function returns -1 when no further entries match.
+            loc = unsafe { X509_NAME_get_index_by_NID(name, NID_commonName, loc) };
+            if loc < 0 {
+                break;
+            }
+            // SAFETY: `loc >= 0`; returned entry is interior to
+            // the X509_NAME and lives as long as it does.
+            let entry = unsafe { X509_NAME_get_entry(name, loc) };
+            if entry.is_null() {
+                continue;
+            }
+            // SAFETY: `entry` valid; returned ASN1_STRING is
+            // interior and lives with the entry.
+            let s = unsafe { X509_NAME_ENTRY_get_data(entry) };
+            let Some(value) = read_asn1_string_utf8(s) else {
+                continue;
+            };
+            if !f(value) {
+                break;
+            }
+        }
+    }
+}
+
+/// Decode a single `GENERAL_NAME*` into a [`SubjectAltName`].
+/// Returns `None` for choices we don't model or for malformed
+/// entries.
+fn decode_general_name(gn: *const GENERAL_NAME) -> Option<SubjectAltName> {
+    // SAFETY: caller passes a valid `GENERAL_NAME*` borrowed from
+    // a live `GENERAL_NAMES` stack; we read `type_` before
+    // touching the matching union arm.
+    let ty = unsafe { (*gn).type_ };
+    if ty == GEN_DNS {
+        // SAFETY: type_ == GEN_DNS ⇒ d.dNSName is active.
+        let s = unsafe { (*gn).d.dNSName };
+        read_asn1_string_utf8(s).map(SubjectAltName::Dns)
+    } else if ty == GEN_IPADD {
+        // SAFETY: type_ == GEN_IPADD ⇒ d.iPAddress is active.
+        let s = unsafe { (*gn).d.iPAddress };
+        read_asn1_ip(s).map(SubjectAltName::Ip)
+    } else if ty == GEN_URI {
+        // SAFETY: type_ == GEN_URI ⇒ d.uniformResourceIdentifier
+        // is active and points at an ASN1_IA5STRING.
+        let s = unsafe { (*gn).d.uniformResourceIdentifier };
+        read_asn1_string_utf8(s).map(SubjectAltName::Uri)
+    } else if ty == GEN_RID {
+        // SAFETY: type_ == GEN_RID ⇒ d.registeredID is active.
+        let oid = unsafe { (*gn).d.registeredID };
+        oid_to_dotted(oid).map(SubjectAltName::RegisteredId)
+    } else if ty == GEN_OTHERNAME {
+        // SAFETY: type_ == GEN_OTHERNAME ⇒ d.otherName is
+        // active and points at an OTHERNAME { type_id, value }.
+        let on = unsafe { (*gn).d.otherName };
+        decode_other_name(on).map(SubjectAltName::OtherName)
+    } else {
+        None
+    }
+}
+
+/// Format an `ASN1_OBJECT*` as a dotted-decimal OID string.
+fn oid_to_dotted(oid: *const ASN1_OBJECT) -> Option<String> {
+    if oid.is_null() {
+        return None;
+    }
+    // OIDs in the wild rarely exceed ~80 characters; size the
+    // buffer generously and bail if aws-lc reports a longer
+    // representation than fits.
+    let mut buf = [0u8; 256];
+    // SAFETY: `oid` non-null and valid; `buf` is writable for
+    // 256 bytes; `always_return_oid = 1` forces the dotted form
+    // (so OID lookup tables don't render shortnames).
+    let n = unsafe {
+        OBJ_obj2txt(
+            buf.as_mut_ptr().cast::<c_char>(),
+            c_int::try_from(buf.len()).unwrap_or(c_int::MAX),
+            oid,
+            1,
+        )
+    };
+    if n <= 0 {
+        return None;
+    }
+    let n = usize::try_from(n).ok()?;
+    if n >= buf.len() {
+        return None;
+    }
+    std::str::from_utf8(&buf[..n]).ok().map(str::to_owned)
+}
+
+/// Decode an `OTHERNAME*` into the corresponding [`OtherNameSan`].
+fn decode_other_name(on: *const OTHERNAME) -> Option<OtherNameSan> {
+    if on.is_null() {
+        return None;
+    }
+    // SAFETY: `on` non-null and valid for the lifetime of the
+    // owning GENERAL_NAMES stack.
+    let type_id = unsafe { (*on).type_id };
+    let value = unsafe { (*on).value };
+    let oid = oid_to_dotted(type_id)?;
+    let der = i2d_asn1_type(value)?;
+    Some(OtherNameSan { oid, value: der })
+}
+
+/// DER-encode an `ASN1_TYPE*` into an owned `Vec<u8>`.
+fn i2d_asn1_type(value: *const ASN1_TYPE) -> Option<Vec<u8>> {
+    if value.is_null() {
+        return None;
+    }
+    // SAFETY: `value` non-null. Calling i2d with a NULL `outp`
+    // returns the encoded length without writing.
+    let len = unsafe { i2d_ASN1_TYPE(value, std::ptr::null_mut()) };
+    if len <= 0 {
+        return None;
+    }
+    let len_usize = usize::try_from(len).ok()?;
+    let mut out = vec![0u8; len_usize];
+    let mut p = out.as_mut_ptr();
+    // SAFETY: `&mut p` points to a writable `*mut u8`; aws-lc
+    // advances the pointer by `len` bytes which we sized exactly
+    // from the previous call.
+    let written = unsafe { i2d_ASN1_TYPE(value, &mut p) };
+    if written != len {
+        return None;
+    }
+    Some(out)
 }
 
 /// RAII guard that frees a `GENERAL_NAMES*` (a `STACK_OF(GENERAL_NAME)`)
@@ -613,6 +765,14 @@ pub(super) fn new_mem_bio_readonly(data: &[u8]) -> Result<BioOwned, TlsError> {
 /// Per RFC 6125 §6.4.4 the Common Name in the Subject DN is
 /// deprecated for identity matching — consumers should always key
 /// off SAN entries.
+///
+/// The variants mirror the [GeneralName] choices that
+/// `radsecproxy`'s `MatchCertificateAttribute` policy supports
+/// (`SubjectAltName:DNS|IP|URI|rID|otherName:…`); the `radius-
+/// tokio` library exposes raw values and leaves the matching
+/// strategy (regex, wildcard, exact, …) to consumer code.
+///
+/// [GeneralName]: https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.6
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubjectAltName {
     /// `dNSName` SAN entry. The contained string is the literal
@@ -622,6 +782,32 @@ pub enum SubjectAltName {
     /// `iPAddress` SAN entry. RFC 5280 fixes the wire encoding at
     /// 4 octets (IPv4) or 16 octets (IPv6).
     Ip(IpAddr),
+    /// `uniformResourceIdentifier` SAN entry. The contained
+    /// string is the literal IA5 value; no URI parsing or
+    /// normalisation is performed.
+    Uri(String),
+    /// `registeredID` SAN entry, formatted as a dotted-decimal
+    /// OID (e.g. `"1.3.6.1.4.1.311.20.2.3"`).
+    RegisteredId(String),
+    /// `otherName` SAN entry. Carries the type-id OID together
+    /// with the DER encoding of the wrapped `ANY` value. The
+    /// most common shape in the wild is the Microsoft UPN
+    /// (`1.3.6.1.4.1.311.20.2.3`) wrapping a `UTF8String`;
+    /// consumers that need the inner value should DER-decode
+    /// `value` themselves.
+    OtherName(OtherNameSan),
+}
+
+/// Payload of a [`SubjectAltName::OtherName`] entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtherNameSan {
+    /// Dotted-decimal OID identifying the value's type
+    /// (e.g. `"1.3.6.1.4.1.311.20.2.3"` for the Microsoft UPN).
+    pub oid: String,
+    /// DER encoding of the wrapped `ANY` value (an `ASN1_TYPE`).
+    /// Lossless: consumers can decode whichever inner type the
+    /// OID dictates without information loss.
+    pub value: Vec<u8>,
 }
 
 /// Owned view of the peer's leaf certificate.
@@ -692,14 +878,132 @@ impl PeerCertificate {
     /// deprecates Common Name matching).
     ///
     /// Returns an empty vector when the certificate has no SAN
-    /// extension. Entries with types other than `dNSName` and
-    /// `iPAddress` are silently skipped.
+    /// extension. Recognises every GeneralName choice
+    /// `radsecproxy`'s `MatchCertificateAttribute` policy
+    /// supports — `dNSName`, `iPAddress`,
+    /// `uniformResourceIdentifier`, `registeredID`, `otherName`.
+    /// Choices outside that set are silently skipped.
+    ///
+    /// Consumers that only care about a single SAN type can
+    /// avoid allocating the rejected entries by calling the
+    /// per-type accessor instead — [`dns_names`](Self::dns_names),
+    /// [`ip_addresses`](Self::ip_addresses), [`uris`](Self::uris),
+    /// [`registered_ids`](Self::registered_ids), or
+    /// [`other_names`](Self::other_names).
     ///
     /// # Errors
     ///
     /// Returns [`TlsError::Ssl`] if the underlying decode fails.
     pub fn subject_alt_names(&self) -> Result<Vec<SubjectAltName>, TlsError> {
         self.cert.subject_alt_names()
+    }
+
+    /// Common Name (CN) values from the leaf's Subject DN.
+    ///
+    /// A DN may contain zero or more `commonName` RDNs; this
+    /// returns them in the order they appear. RFC 6125 §6.4.4
+    /// deprecates CN-based identity for new deployments, but
+    /// `radsecproxy`'s `CN:/regex/` match-type still relies on
+    /// it and many enterprise PKIs continue to issue leaves whose
+    /// only stable identifier is the CN.
+    ///
+    /// Independent of [`subject_alt_names`](Self::subject_alt_names):
+    /// reads the Subject DN, not the SAN extension.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible; returns [`Result`] for forward
+    /// compatibility.
+    pub fn common_names(&self) -> Result<Vec<String>, TlsError> {
+        let mut out = Vec::new();
+        self.cert.walk_common_names(|cn| {
+            out.push(cn);
+            true
+        });
+        Ok(out)
+    }
+
+    /// `dNSName` SAN entries only. Equivalent to
+    /// [`subject_alt_names`](Self::subject_alt_names) followed
+    /// by a filter, but skips allocation for non-DNS entries.
+    ///
+    /// # Errors
+    ///
+    /// See [`subject_alt_names`](Self::subject_alt_names).
+    pub fn dns_names(&self) -> Result<Vec<String>, TlsError> {
+        let mut out = Vec::new();
+        self.cert.walk_sans(|san| {
+            if let SubjectAltName::Dns(d) = san {
+                out.push(d);
+            }
+            true
+        })?;
+        Ok(out)
+    }
+
+    /// `iPAddress` SAN entries only.
+    ///
+    /// # Errors
+    ///
+    /// See [`subject_alt_names`](Self::subject_alt_names).
+    pub fn ip_addresses(&self) -> Result<Vec<IpAddr>, TlsError> {
+        let mut out = Vec::new();
+        self.cert.walk_sans(|san| {
+            if let SubjectAltName::Ip(ip) = san {
+                out.push(ip);
+            }
+            true
+        })?;
+        Ok(out)
+    }
+
+    /// `uniformResourceIdentifier` SAN entries only.
+    ///
+    /// # Errors
+    ///
+    /// See [`subject_alt_names`](Self::subject_alt_names).
+    pub fn uris(&self) -> Result<Vec<String>, TlsError> {
+        let mut out = Vec::new();
+        self.cert.walk_sans(|san| {
+            if let SubjectAltName::Uri(u) = san {
+                out.push(u);
+            }
+            true
+        })?;
+        Ok(out)
+    }
+
+    /// `registeredID` SAN entries (formatted as dotted-decimal
+    /// OIDs).
+    ///
+    /// # Errors
+    ///
+    /// See [`subject_alt_names`](Self::subject_alt_names).
+    pub fn registered_ids(&self) -> Result<Vec<String>, TlsError> {
+        let mut out = Vec::new();
+        self.cert.walk_sans(|san| {
+            if let SubjectAltName::RegisteredId(o) = san {
+                out.push(o);
+            }
+            true
+        })?;
+        Ok(out)
+    }
+
+    /// `otherName` SAN entries.
+    ///
+    /// # Errors
+    ///
+    /// See [`subject_alt_names`](Self::subject_alt_names).
+    pub fn other_names(&self) -> Result<Vec<OtherNameSan>, TlsError> {
+        let mut out = Vec::new();
+        self.cert.walk_sans(|san| {
+            if let SubjectAltName::OtherName(o) = san {
+                out.push(o);
+            }
+            true
+        })?;
+        Ok(out)
     }
 }
 
@@ -822,6 +1126,32 @@ impl TlsContext {
                 None,
             );
         }
+        // Cap the accepted chain depth. RFC 5280 doesn't fix a
+        // ceiling; `radsecproxy` uses 5 + 1 (leaf + 5 intermediates),
+        // which covers every realistic RadSec PKI and rejects
+        // pathologically long cross-signed chains predictably.
+        // SAFETY: ctx valid; depth fits trivially in c_int.
+        unsafe { SSL_CTX_set_verify_depth(ctx.0.as_ptr(), MAX_CERT_DEPTH) };
+
+        // Disable session resumption. RadSec connections are
+        // long-lived (one per NAS, kept open for the device's
+        // lifetime), so neither TLS 1.2 session tickets nor TLS 1.3
+        // PSK resumption tickets buy anything — they only widen the
+        // attack surface (ticket-key compromise → offline
+        // decryption of recorded sessions). Match `radsecproxy`'s
+        // posture.
+        // SAFETY: ctx valid; SSL_CTX_set_options OR-merges the new
+        // flags with the existing option mask and returns the new
+        // value. The cast widens i32 to u32 — `SSL_OP_NO_TICKET` is
+        // a positive bitflag (16384 today) and stays in range.
+        #[allow(clippy::cast_sign_loss)]
+        unsafe {
+            SSL_CTX_set_options(ctx.0.as_ptr(), SSL_OP_NO_TICKET as u32);
+        }
+        // TLS 1.3: zero NewSessionTicket messages. Has no effect
+        // pre-1.3, where `SSL_OP_NO_TICKET` already wins.
+        // SAFETY: ctx valid.
+        let _ = unsafe { SSL_CTX_set_num_tickets(ctx.0.as_ptr(), 0) };
 
         Ok(Self {
             inner: Arc::new(ctx),
@@ -829,20 +1159,104 @@ impl TlsContext {
     }
 }
 
-/// Parse a chain of PEM-encoded CA certificates into a fresh
-/// `X509_STORE`. Used for both listener-wide trust (installed on
-/// the [`SslCtx`]) and per-connection trust narrowing (installed
-/// on the [`SslHandle`] via [`ClientTrust`]).
-fn parse_pem_to_store(pem: &[u8]) -> Result<X509StoreOwned, TlsError> {
+/// Maximum certificate-chain depth accepted by RadSec listeners
+/// (counted as the number of intermediates between the leaf and the
+/// trust anchor). 5 matches `radsecproxy` and is comfortably above
+/// every realistic RadSec PKI.
+const MAX_CERT_DEPTH: c_int = 5;
+
+/// RAII wrapper around a `STACK_OF(X509_NAME)*` that owns each entry
+/// (i.e. `sk_pop_free(stack, X509_NAME_free)` semantics on Drop).
+///
+/// Used to build the CA distinguished-name list advertised to peers
+/// in the TLS `CertificateRequest`. `SSL_CTX_set_client_CA_list`
+/// takes ownership of the stack on success; on the success path we
+/// surrender ownership via [`forget_into_ssl`] to suppress this
+/// Drop.
+struct X509NameStack(NonNull<aws_lc_sys::stack_st_X509_NAME>);
+
+impl X509NameStack {
+    fn new() -> Result<Self, TlsError> {
+        // SAFETY: OPENSSL_sk_new_null allocates an empty stack;
+        // NULL on OOM.
+        let raw = unsafe { OPENSSL_sk_new_null() };
+        NonNull::new(raw.cast::<aws_lc_sys::stack_st_X509_NAME>())
+            .map(X509NameStack)
+            .ok_or(TlsError::Init("OPENSSL_sk_new_null(X509_NAME)"))
+    }
+
+    /// Push a duplicated `X509_NAME` (the stack takes ownership of
+    /// the duplicate; the caller's original is unaffected).
+    fn push_dup(&mut self, name: *mut aws_lc_sys::X509_NAME) -> Result<(), TlsError> {
+        // SAFETY: name is borrowed from a live X509; X509_NAME_dup
+        // returns a freshly-allocated copy or NULL on OOM.
+        let dup = unsafe { X509_NAME_dup(name) };
+        if dup.is_null() {
+            return Err(TlsError::Ssl(pop_err("X509_NAME_dup")));
+        }
+        // SAFETY: stack and dup both valid; OPENSSL_sk_push returns
+        // 0 on failure, in which case we own `dup` and must free.
+        let pushed = unsafe { OPENSSL_sk_push(self.0.as_ptr().cast(), dup.cast()) };
+        if pushed == 0 {
+            // SAFETY: dup is a freshly-allocated X509_NAME we own.
+            unsafe { X509_NAME_free(dup) };
+            return Err(TlsError::Ssl(pop_err("OPENSSL_sk_push(X509_NAME)")));
+        }
+        Ok(())
+    }
+
+    /// Surrender ownership to libssl. Returns the raw pointer and
+    /// suppresses Drop.
+    fn forget_into_ssl(self) -> *mut aws_lc_sys::stack_st_X509_NAME {
+        let p = self.0.as_ptr();
+        std::mem::forget(self);
+        p
+    }
+}
+
+impl Drop for X509NameStack {
+    fn drop(&mut self) {
+        // SAFETY: free each X509_NAME in the stack and the stack
+        // itself. `sk_pop_free` is the documented matching free for
+        // a stack we built with `OPENSSL_sk_new_null` + `sk_push`
+        // when each entry needs an element-specific free function.
+        unsafe {
+            aws_lc_sys::sk_pop_free(self.0.as_ptr().cast(), Some(name_free_thunk));
+        }
+    }
+}
+
+// SAFETY: A FFI thunk that adapts `X509_NAME_free`'s signature to
+// the `OPENSSL_sk_free_func` ABI (raw `*mut c_void`). The pointer
+// `p` was pushed by `X509NameStack::push_dup` as an `X509_NAME*`
+// allocated by `X509_NAME_dup`, so casting it back and calling
+// `X509_NAME_free` is sound.
+unsafe extern "C" fn name_free_thunk(p: *mut c_void) {
+    if !p.is_null() {
+        // SAFETY: see thunk-level comment above.
+        unsafe { X509_NAME_free(p.cast()) };
+    }
+}
+
+/// Install a chain of PEM-encoded client CAs as the `SSL_CTX`'s
+/// trust store **and** as the CA distinguished-name list advertised
+/// in the TLS `CertificateRequest`.
+///
+/// The DN list lets a NAS holding multiple client certificates pick
+/// the one that chains to a trusted CA without guessing — a soft
+/// interop requirement for RadSec deployments where peers may have
+/// certs from several issuers.
+fn install_client_cas(ctx: &SslCtx, pem: &[u8]) -> Result<(), TlsError> {
     // SAFETY: X509_STORE_new allocates an empty store; NULL on OOM.
     let store_raw = unsafe { X509_STORE_new() };
     let store = X509StoreOwned(NonNull::new(store_raw).ok_or(TlsError::Init("X509_STORE_new"))?);
+    let mut name_stack = X509NameStack::new()?;
 
     let bio = new_mem_bio_readonly(pem)?;
     let mut found = false;
     loop {
         // SAFETY: bio valid; PEM_read_bio_X509 returns NULL when
-        // there are no more cert blocks in the BIO (or on error).
+        // there are no more cert blocks.
         let raw = unsafe {
             PEM_read_bio_X509(
                 bio.0.as_ptr(),
@@ -855,11 +1269,17 @@ fn parse_pem_to_store(pem: &[u8]) -> Result<X509StoreOwned, TlsError> {
             break;
         }
         let cert = X509Owned(NonNull::new(raw).expect("checked above"));
-        // SAFETY: store and cert valid; X509_STORE_add_cert bumps
-        // the X509 refcount on success.
+        // SAFETY: store + cert valid; bumps cert refcount on success.
         let r = unsafe { X509_STORE_add_cert(store.0.as_ptr(), cert.0.as_ptr()) };
         if r != 1 {
             return Err(TlsError::Ssl(pop_err("X509_STORE_add_cert")));
+        }
+        // SAFETY: cert valid; X509_get_subject_name returns an
+        // interior pointer borrowed from cert. `push_dup` calls
+        // X509_NAME_dup so the stack does not alias cert.
+        let subject = unsafe { X509_get_subject_name(cert.0.as_ptr()) };
+        if !subject.is_null() {
+            name_stack.push_dup(subject)?;
         }
         found = true;
         drop(cert);
@@ -868,81 +1288,19 @@ fn parse_pem_to_store(pem: &[u8]) -> Result<X509StoreOwned, TlsError> {
     if !found {
         return Err(TlsError::Pem("no CA certificates"));
     }
-    Ok(store)
-}
 
-/// Install a chain of PEM-encoded client CAs as the SSL_CTX's trust
-/// store.
-fn install_client_cas(ctx: &SslCtx, pem: &[u8]) -> Result<(), TlsError> {
-    let store = parse_pem_to_store(pem)?;
-    // Hand the store to the SSL_CTX. `set1_` bumps the refcount, so
-    // we keep our ownership and Drop our copy.
-    // SAFETY: ctx + store valid; SSL_CTX_set1_cert_store doesn't
-    // take ownership.
+    // Hand the trust store to the SSL_CTX. `set1_` bumps the
+    // refcount so we keep our ownership and Drop our copy.
+    // SAFETY: ctx + store valid.
     unsafe { SSL_CTX_set1_cert_store(ctx.0.as_ptr(), store.0.as_ptr()) };
     drop(store);
+
+    // Hand the DN list to the SSL_CTX. This call **takes ownership**
+    // of the stack on success, so we surrender via `forget_into_ssl`.
+    let stack_ptr = name_stack.forget_into_ssl();
+    // SAFETY: ctx + stack valid; ownership transfer documented above.
+    unsafe { SSL_CTX_set_client_CA_list(ctx.0.as_ptr(), stack_ptr) };
     Ok(())
-}
-
-// ============================================================================
-// ClientTrust
-// ============================================================================
-
-/// Per-client trust material for narrowing a [`TlsConnection`] to
-/// the CA(s) that *this specific* RadSec peer is allowed to chain
-/// to.
-///
-/// Without this narrowing every connection accepted by a listener
-/// is validated against the listener-wide trust store passed to
-/// [`TlsContext::server`]. That store is the union of every
-/// allowed peer's CA — fine for a homogeneous deployment, too loose
-/// for the IP-gated mode described in the project README, where a
-/// successful handshake should mean *"the peer at this IP presented
-/// the cert it was supposed to"*.
-///
-/// With per-client trust installed, libssl's chain validation is
-/// the gate: peer-A presenting a cert chained to peer-B's CA fails
-/// the handshake and the connection is dropped. No application
-/// callback required.
-///
-/// # Cost
-///
-/// Parsing is one-time (typically at `Client` construction). The
-/// resulting store is reference-counted via `Arc`, so cloning a
-/// `ClientTrust` is cheap and sharing it between many `Client`
-/// records is fine.
-#[derive(Clone)]
-pub struct ClientTrust {
-    store: Arc<X509StoreOwned>,
-}
-
-// SAFETY: After construction the X509_STORE is read-only;
-// BoringSSL / aws-lc validates concurrent reads against the same
-// store. We never mutate the store after handing it to libssl.
-unsafe impl Send for ClientTrust {}
-// SAFETY: see above.
-unsafe impl Sync for ClientTrust {}
-
-impl ClientTrust {
-    /// Build a trust set from a PEM bundle of one or more CA
-    /// certificates.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TlsError::Pem`] if the input contains no
-    /// `BEGIN CERTIFICATE` blocks, or [`TlsError::Ssl`] if libssl
-    /// rejects an individual cert.
-    pub fn from_pem(ca_pem: &[u8]) -> Result<Self, TlsError> {
-        Ok(Self {
-            store: Arc::new(parse_pem_to_store(ca_pem)?),
-        })
-    }
-}
-
-impl std::fmt::Debug for ClientTrust {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientTrust").finish_non_exhaustive()
-    }
 }
 
 // ============================================================================
@@ -1009,32 +1367,6 @@ impl TlsConnection {
         })
     }
 
-    /// Narrow this connection's chain validation to `trust`,
-    /// overriding the listener-wide trust store from
-    /// [`TlsContext::server`].
-    ///
-    /// Call **before** driving the handshake (i.e. before the first
-    /// [`process`](Self::process)). Used by RadSec's IP-gated
-    /// admission flow: once `admit_radsec` resolves the source IP
-    /// to a `Client`, the client's per-connection trust is
-    /// installed so a successful handshake means *"this peer
-    /// presented the cert it was supposed to"*.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TlsError::Ssl`] if libssl rejects the store
-    /// (shouldn't happen for a well-formed [`ClientTrust`]).
-    pub fn set_client_trust(&mut self, trust: &ClientTrust) -> Result<(), TlsError> {
-        // SAFETY: ssl + store both valid; SSL_set1_verify_cert_store
-        // bumps the store's refcount, so the `Arc<X509StoreOwned>`
-        // in `trust` retains its own reference.
-        let r = unsafe { SSL_set1_verify_cert_store(self.ssl.0.as_ptr(), trust.store.0.as_ptr()) };
-        if r != 1 {
-            return Err(TlsError::Ssl(pop_err("SSL_set1_verify_cert_store")));
-        }
-        Ok(())
-    }
-
     /// Push ciphertext bytes from the network into the input BIO.
     ///
     /// # Errors
@@ -1090,6 +1422,58 @@ impl TlsConnection {
             return Ok(0);
         }
         Ok(usize::try_from(n).expect("n >= 0"))
+    }
+
+    /// Borrow the ciphertext currently queued in the output BIO,
+    /// without copying. The returned slice points directly at the
+    /// BIO's internal buffer; it is valid until the next mutating
+    /// call on this connection (write / process / consume_output /
+    /// drop), which the borrow checker enforces via `&mut self`.
+    ///
+    /// Returns an empty slice if the BIO is empty.
+    ///
+    /// Pair with [`consume_output`](Self::consume_output) once the
+    /// bytes have been pushed to the network — otherwise the next
+    /// call returns the same bytes again.
+    ///
+    /// This is the zero-copy alternative to
+    /// [`take_output`](Self::take_output) and is what the async
+    /// transport adapter uses to avoid an extra `memcpy` per
+    /// outbound TLS record.
+    #[must_use]
+    pub fn pending_output(&mut self) -> &[u8] {
+        let mut ptr: *const u8 = std::ptr::null();
+        let mut len: usize = 0;
+        // SAFETY: wbio is the memory BIO created in `accept`; the
+        // out-pointers are stack slots we own. BIO_mem_contents
+        // returns 1 on success and populates them with the BIO's
+        // internal buffer pointer + length without consuming.
+        let r = unsafe { BIO_mem_contents(self.wbio.as_ptr(), &mut ptr, &mut len) };
+        if r != 1 || ptr.is_null() || len == 0 {
+            return &[];
+        }
+        // SAFETY: BIO_mem_contents handed us a non-NULL pointer to
+        // `len` initialized bytes inside the BIO's own buffer. The
+        // buffer is owned by the BIO and lives until the next
+        // mutating BIO call. We tie the slice's lifetime to
+        // `&mut self`, so the borrow checker forbids any such call
+        // while the slice is live.
+        unsafe { std::slice::from_raw_parts(ptr, len) }
+    }
+
+    /// Discard everything currently queued in the output BIO.
+    /// Call after a successful `pending_output` + network write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsError::Io`] if `BIO_reset` fails (should not
+    /// happen for a memory BIO).
+    pub fn consume_output(&mut self) -> Result<(), TlsError> {
+        // SAFETY: wbio valid for the lifetime of `self`.
+        if unsafe { BIO_reset(self.wbio.as_ptr()) } != 1 {
+            return Err(TlsError::Io(pop_err("BIO_reset(wbio)")));
+        }
+        Ok(())
     }
 
     /// Drive the handshake state machine forward as far as it can
@@ -1216,6 +1600,74 @@ impl TlsConnection {
         // PeerCertificate, whose Drop calls X509_free.
         let raw = unsafe { SSL_get_peer_certificate(self.ssl.0.as_ptr()) };
         NonNull::new(raw).map(PeerCertificate::from_owned)
+    }
+
+    /// Send a TLS `close_notify` alert.
+    ///
+    /// `SSL_shutdown` is the proper way to terminate a TLS session:
+    /// without it the peer logs a truncation / abrupt-close and may
+    /// (legitimately) treat the connection as suspect. We perform
+    /// the *first half* of the bidirectional shutdown here — the
+    /// caller is expected to drain any produced ciphertext via
+    /// [`pending_output`](Self::pending_output) /
+    /// [`take_output`](Self::take_output) and write it to the
+    /// network, then close the socket. Waiting for the peer's
+    /// reciprocal `close_notify` would block the connection task on
+    /// teardown for no real benefit on RadSec, where the upper
+    /// layer is already done.
+    ///
+    /// Returns `true` if the shutdown was initiated (or was already
+    /// complete); `false` if libssl reported a non-recoverable
+    /// error. Either way the caller should drop the connection
+    /// after attempting to flush the output BIO.
+    pub fn shutdown(&mut self) -> bool {
+        // SAFETY: ssl valid. `SSL_shutdown` returns:
+        //   1  — bidirectional shutdown complete
+        //   0  — close_notify sent, peer's not yet received
+        //  <0  — error (or WANT_READ/WANT_WRITE)
+        let r = unsafe { SSL_shutdown(self.ssl.0.as_ptr()) };
+        if r >= 0 {
+            return true;
+        }
+        // SAFETY: ssl valid.
+        let err = unsafe { SSL_get_error(self.ssl.0.as_ptr(), r) };
+        matches!(err, SSL_ERROR_WANT_READ | SSL_ERROR_WANT_WRITE)
+    }
+
+    /// Request a TLS 1.3 traffic-key update (RFC 8446 §4.6.3).
+    ///
+    /// Used by the RadSec connection driver to bound the data
+    /// volume protected by a single set of traffic keys on
+    /// long-lived sessions. No-op (returns `Ok(false)`) if the
+    /// negotiated protocol is below TLS 1.3 or if a key update is
+    /// already in flight. The produced ciphertext is queued in the
+    /// output BIO and must be drained by the caller in the usual
+    /// way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsError::Ssl`] if libssl rejects the request
+    /// (shouldn't happen for a healthy session).
+    pub fn request_key_update(&mut self) -> Result<bool, TlsError> {
+        // SAFETY: ssl valid; SSL_version returns the negotiated
+        // protocol number once the handshake has completed.
+        let version = unsafe { SSL_version(self.ssl.0.as_ptr()) };
+        if version < TLS1_3_VERSION {
+            return Ok(false);
+        }
+        // SAFETY: ssl valid; returns SSL_KEY_UPDATE_NONE if no
+        // update is queued, otherwise the in-flight type.
+        let pending = unsafe { SSL_get_key_update_type(self.ssl.0.as_ptr()) };
+        if pending != SSL_KEY_UPDATE_NONE {
+            return Ok(false);
+        }
+        // SAFETY: ssl valid; the constant comes from aws-lc's
+        // bindings. Returns 1 on success, 0 on failure.
+        let r = unsafe { SSL_key_update(self.ssl.0.as_ptr(), SSL_KEY_UPDATE_REQUESTED) };
+        if r != 1 {
+            return Err(TlsError::Ssl(pop_err("SSL_key_update")));
+        }
+        Ok(true)
     }
 }
 

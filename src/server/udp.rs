@@ -535,50 +535,97 @@ mod tests {
         server.await.unwrap().unwrap();
     }
 
+    /// Captures `event = "…"` fields from `tracing` events into a
+    /// shared vector, and notifies waiters whenever the vector
+    /// grows. Lets tests wait deterministically for an expected
+    /// event instead of sleeping.
+    #[cfg(feature = "tracing")]
+    #[derive(Default)]
+    struct EventSink {
+        events: std::sync::Mutex<Vec<(tracing::Level, String)>>,
+        notify: tokio::sync::Notify,
+    }
+
+    #[cfg(feature = "tracing")]
+    impl EventSink {
+        fn snapshot(&self) -> Vec<(tracing::Level, String)> {
+            self.events.lock().unwrap().clone()
+        }
+
+        /// Block (async) until `pred` is satisfied by the captured
+        /// event list, or `timeout` elapses. Polls only on each
+        /// `notify` wakeup, so it never spins.
+        async fn wait_for<F>(&self, timeout: Duration, mut pred: F) -> bool
+        where
+            F: FnMut(&[(tracing::Level, String)]) -> bool,
+        {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if pred(&self.events.lock().unwrap()) {
+                    return true;
+                }
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return false;
+                }
+                let notified = self.notify.notified();
+                tokio::pin!(notified);
+                if tokio::time::timeout_at(deadline, &mut notified)
+                    .await
+                    .is_err()
+                {
+                    return pred(&self.events.lock().unwrap());
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "tracing")]
+    impl tracing::Subscriber for EventSink {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            use std::fmt::Debug;
+            use tracing::field::{Field, Visit};
+
+            struct V<'a> {
+                level: tracing::Level,
+                sink: &'a std::sync::Mutex<Vec<(tracing::Level, String)>>,
+                pushed: bool,
+            }
+            impl Visit for V<'_> {
+                fn record_str(&mut self, field: &Field, value: &str) {
+                    if field.name() == "event" {
+                        self.sink.lock().unwrap().push((self.level, value.into()));
+                        self.pushed = true;
+                    }
+                }
+                fn record_debug(&mut self, _: &Field, _: &dyn Debug) {}
+            }
+            let m = event.metadata();
+            let mut v = V {
+                level: *m.level(),
+                sink: &self.events,
+                pushed: false,
+            };
+            event.record(&mut v);
+            if v.pushed {
+                self.notify.notify_waiters();
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
     #[cfg(feature = "tracing")]
     #[tokio::test(flavor = "current_thread")]
     async fn tracing_emits_request_and_reply_events() {
-        use std::fmt::Debug;
-        use std::sync::Mutex as StdMutex;
-        use tracing::field::{Field, Visit};
-
-        #[derive(Default)]
-        struct EventSink(StdMutex<Vec<(tracing::Level, String)>>);
-
-        struct V<'a> {
-            level: tracing::Level,
-            sink: &'a StdMutex<Vec<(tracing::Level, String)>>,
-        }
-        impl Visit for V<'_> {
-            fn record_str(&mut self, field: &Field, value: &str) {
-                if field.name() == "event" {
-                    self.sink.lock().unwrap().push((self.level, value.into()));
-                }
-            }
-            fn record_debug(&mut self, _: &Field, _: &dyn Debug) {}
-        }
-
-        impl tracing::Subscriber for EventSink {
-            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-                true
-            }
-            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-                tracing::span::Id::from_u64(1)
-            }
-            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-            fn event(&self, event: &tracing::Event<'_>) {
-                let m = event.metadata();
-                let mut v = V {
-                    level: *m.level(),
-                    sink: &self.0,
-                };
-                event.record(&mut v);
-            }
-            fn enter(&self, _: &tracing::span::Id) {}
-            fn exit(&self, _: &tracing::span::Id) {}
-        }
-
         let sink = Arc::new(EventSink::default());
         let _guard = tracing::subscriber::set_default(Arc::clone(&sink));
 
@@ -612,7 +659,7 @@ mod tests {
         tx.send(true).unwrap();
         server.await.unwrap().unwrap();
 
-        let captured = sink.0.lock().unwrap().clone();
+        let captured = sink.snapshot();
         let names: Vec<&str> = captured.iter().map(|(_, n)| n.as_str()).collect();
         assert!(names.contains(&"request"), "captured: {names:?}");
         assert!(names.contains(&"reply_sent"), "captured: {names:?}");
@@ -621,45 +668,6 @@ mod tests {
     #[cfg(feature = "tracing")]
     #[tokio::test(flavor = "current_thread")]
     async fn tracing_unknown_client_emits_warn_drop() {
-        use std::fmt::Debug;
-        use std::sync::Mutex as StdMutex;
-        use tracing::field::{Field, Visit};
-
-        #[derive(Default)]
-        struct EventSink(StdMutex<Vec<(tracing::Level, String)>>);
-        struct V<'a> {
-            level: tracing::Level,
-            sink: &'a StdMutex<Vec<(tracing::Level, String)>>,
-        }
-        impl Visit for V<'_> {
-            fn record_str(&mut self, field: &Field, value: &str) {
-                if field.name() == "event" {
-                    self.sink.lock().unwrap().push((self.level, value.into()));
-                }
-            }
-            fn record_debug(&mut self, _: &Field, _: &dyn Debug) {}
-        }
-        impl tracing::Subscriber for EventSink {
-            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-                true
-            }
-            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-                tracing::span::Id::from_u64(1)
-            }
-            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-            fn event(&self, event: &tracing::Event<'_>) {
-                let m = event.metadata();
-                let mut v = V {
-                    level: *m.level(),
-                    sink: &self.0,
-                };
-                event.record(&mut v);
-            }
-            fn enter(&self, _: &tracing::span::Id) {}
-            fn exit(&self, _: &tracing::span::Id) {}
-        }
-
         let sink = Arc::new(EventSink::default());
         let _guard = tracing::subscriber::set_default(Arc::clone(&sink));
 
@@ -683,18 +691,25 @@ mod tests {
             )
             .await
             .unwrap();
-        // Give the server task a moment to process.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Wait deterministically for the WARN drop event instead
+        // of sleeping a fixed duration. The 1 s ceiling is a hard
+        // upper bound for an in-process loopback packet; missing
+        // it indicates a real regression, not load-induced jitter.
+        let saw_drop = sink
+            .wait_for(Duration::from_secs(1), |evs| {
+                evs.iter()
+                    .any(|(lvl, name)| *lvl == tracing::Level::WARN && name == "drop")
+            })
+            .await;
 
         tx.send(true).unwrap();
         server.await.unwrap().unwrap();
 
-        let captured = sink.0.lock().unwrap().clone();
         assert!(
-            captured
-                .iter()
-                .any(|(lvl, name)| *lvl == tracing::Level::WARN && name == "drop"),
-            "expected WARN drop event, got {captured:?}",
+            saw_drop,
+            "expected WARN drop event, got {:?}",
+            sink.snapshot(),
         );
     }
 }

@@ -28,57 +28,60 @@ pub trait ClientStore: Send + Sync + 'static {
     /// RFC 2865 §3, before any allocation beyond the receive buffer.
     fn lookup_udp(&self, src: SocketAddr) -> impl Future<Output = Option<Arc<Client>>> + Send;
 
-    /// Pre-handshake admission for a `RadSec` (RFC 6614) connection.
+    /// Pre-handshake admission for a `RadSec` (RFC 6614)
+    /// connection.
     ///
     /// Called immediately after `accept()` on the TCP listener,
-    /// **before** any TLS bytes are read. Returning `None` causes
-    /// the connection to be closed with no TLS state allocated
-    /// — cheap DoS-resistance against unknown peers.
+    /// **before** any TLS bytes are read. Returning `false`
+    /// causes the connection to be closed with no TLS state
+    /// allocated — cheap DoS-resistance against unknown peers.
+    /// Returning `true` lets the mTLS handshake proceed; final
+    /// authorization happens post-handshake via
+    /// [`Self::lookup_radsec_by_cert`].
     ///
-    /// The returned [`Client`] supplies the shared secret used to
-    /// verify Request / Message authenticators on packets carried
-    /// over the connection. The TLS chain validation itself is
-    /// performed by the listener's `TlsContext`; per-connection
-    /// trust-store narrowing is a future enhancement.
-    ///
-    /// The default implementation rejects all `RadSec` peers, which
-    /// matches the library's policy that `RadSec` must be opted into.
+    /// The default implementation returns `false`, i.e. **denies
+    /// every peer**. This is deliberately conservative: a TLS
+    /// handshake costs an asymmetric key operation per attempt,
+    /// and an open admission policy turns every reachable RadSec
+    /// listener into an amplification target. Consumers must
+    /// override this method (typically with a CIDR allow-list,
+    /// per-IP rate limit, or both) before any peer can connect.
+    /// [`StaticClients`] provides an override that admits any
+    /// source IP matching a configured CIDR entry.
     #[cfg(feature = "radsec")]
-    fn admit_radsec(&self, src: SocketAddr) -> impl Future<Output = Option<Arc<Client>>> + Send {
+    fn admit_radsec(&self, src: SocketAddr) -> impl Future<Output = bool> + Send {
         let _ = src;
-        async { None }
+        async { false }
     }
 
-    /// Post-handshake authorization for a `RadSec` listener running
-    /// in **cert-keyed** mode (RFC 6614 §2.5 / RFC 7585).
+    /// Post-handshake authorization for a `RadSec` connection.
     ///
     /// Called *after* a successful mTLS handshake against the
-    /// listener's listener-wide trust store, with the leaf
-    /// certificate the peer presented. Returning `None` causes the
-    /// connection to be torn down before any RADIUS frames are
+    /// listener's trust store, with the peer's source address and
+    /// the leaf certificate it presented. Returning `None` causes
+    /// the connection to be torn down before any RADIUS frames are
     /// exchanged.
     ///
     /// The returned [`Client`] supplies the shared secret used to
     /// verify Request / Message authenticators on packets carried
     /// over the connection. Implementations typically map the
     /// peer's Subject DN, SAN, or SPKI fingerprint to a registered
-    /// client record. NAT'd / shared-IP / dynamic-discovery
-    /// deployments where the source address can't identify the
-    /// peer use this hook instead of [`Self::admit_radsec`].
+    /// client record — optionally cross-checked against the source
+    /// address (matching `radsecproxy`'s `verifyconfcert` policy).
     ///
     /// The default implementation rejects every peer, which means
-    /// a listener bound via `listen_radsec` (cert-keyed by default)
-    /// against a store that does not override this method will
-    /// close every connection after the handshake completes — i.e.
-    /// it is a no-op listener. Override this method to enable
-    /// cert-keyed authorization, or use `listen_radsec_ip_gated`
-    /// if your deployment wants the IP-keyed model instead.
+    /// a `RadSec` listener bound against a store that does not
+    /// override this method will close every connection after the
+    /// handshake completes — i.e. it is a no-op listener. Override
+    /// this method to enable authorization. [`StaticClients`]
+    /// provides an IP-only override that ignores the cert content.
     #[cfg(feature = "radsec")]
     fn lookup_radsec_by_cert(
         &self,
+        src: SocketAddr,
         peer: &crate::tls::PeerCertificate,
     ) -> impl Future<Output = Option<Arc<Client>>> + Send {
-        let _ = peer;
+        let _ = (src, peer);
         async { None }
     }
 }
@@ -235,13 +238,29 @@ impl ClientStore for StaticClients {
     }
 
     /// `StaticClients` admits a `RadSec` peer iff its source IP
-    /// matches a configured CIDR entry. The same client record (and
-    /// its shared secret) is returned for both transports.
+    /// matches a configured CIDR entry — a cheap pre-handshake
+    /// `DoS` filter for deployments where every NAS source IP is
+    /// known up front.
     #[cfg(feature = "radsec")]
-    fn admit_radsec(&self, src: SocketAddr) -> impl Future<Output = Option<Arc<Client>>> + Send {
-        // Identical to the UDP path: the lookup key is the peer IP.
-        // RadSec listeners that need a different policy plug in
-        // their own `ClientStore` impl.
+    fn admit_radsec(&self, src: SocketAddr) -> impl Future<Output = bool> + Send {
+        let allow = self.entries.iter().any(|(cidr, _)| cidr.contains(src.ip()));
+        async move { allow }
+    }
+
+    /// `StaticClients` resolves the post-handshake client by source
+    /// IP, ignoring the cert content beyond what TLS chain
+    /// validation already enforced. Suitable for deployments where
+    /// the source IP uniquely identifies each NAS; consumers who
+    /// want cert-derived identity (NAT'd peers, RFC 7585 dynamic
+    /// discovery, consortium proxies) should plug in their own
+    /// [`ClientStore`].
+    #[cfg(feature = "radsec")]
+    fn lookup_radsec_by_cert(
+        &self,
+        src: SocketAddr,
+        _peer: &crate::tls::PeerCertificate,
+    ) -> impl Future<Output = Option<Arc<Client>>> + Send {
+        // Same key as the UDP path.
         self.lookup_udp(src)
     }
 }

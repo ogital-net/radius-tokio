@@ -72,8 +72,18 @@ impl ClientStore for SanStore {
         async { None }
     }
 
+    // Pre-handshake admission defaults to `false` (deny). The
+    // test runs everything on loopback against an ephemeral CA,
+    // so opening the gate to any source is safe — the mTLS
+    // handshake against the listener's trust store rejects
+    // anyone without the test client cert.
+    async fn admit_radsec(&self, _src: SocketAddr) -> bool {
+        true
+    }
+
     fn lookup_radsec_by_cert(
         &self,
+        _src: SocketAddr,
         peer: &PeerCertificate,
     ) -> impl Future<Output = Option<Arc<Client>>> + Send {
         // Walk the leaf's SAN list and return the first registered
@@ -82,7 +92,10 @@ impl ClientStore for SanStore {
         let hit = peer.subject_alt_names().ok().and_then(|sans| {
             sans.into_iter().find_map(|san| match san {
                 SubjectAltName::Dns(name) => self.by_dns_san.get(&name).cloned(),
-                SubjectAltName::Ip(_) => None,
+                SubjectAltName::Ip(_)
+                | SubjectAltName::Uri(_)
+                | SubjectAltName::RegisteredId(_)
+                | SubjectAltName::OtherName(_) => None,
             })
         });
         async move { hit }

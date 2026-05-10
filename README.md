@@ -144,19 +144,25 @@ The `radsec` feature pulls in `aws-lc-sys`'s `ssl` build, which runs
 ## RadSec (RFC 6614)
 
 Enable the `radsec` feature, then add a TLS listener to the builder.
-Two admission modes are supported:
+The pipeline for every accepted connection is:
 
-- **Cert-keyed** (default). The listener uses a shared trust store;
-  the verify callback consults `ClientStore::lookup_radsec_by_cert`
-  to map the presented chain to a `Client`. This is the RFC 6614
-  §2.5 model and works for every deployment shape, including NAT'd
-  peers, RFC 7585 dynamic discovery, and consortium proxies.
-- **IP-gated**. The server calls `ClientStore::admit_radsec`
-  immediately after `accept()`, *before* any TLS state is allocated;
-  unknown peers are dropped cheaply. The returned `Client`'s trust
-  material narrows the per-connection `SSL` so a successful handshake
-  *is* the authorization decision. Use this when source addresses
-  uniquely identify peers and you want pre-handshake DoS resistance.
+1. **Pre-handshake DoS gate.** `ClientStore::admit_radsec(src) -> bool`
+   is called immediately after `accept()`, before any TLS state is
+   allocated. The default returns `false` (deny all) so every
+   deployment makes a deliberate choice about its DoS exposure.
+   Override it to add a CIDR allow-list or per-IP rate limit;
+   `StaticClients` ships an override that admits any source IP
+   matching a configured CIDR entry.
+2. **mTLS handshake** against the listener-wide trust store passed
+   to `TlsContext::server`. libssl performs chain validation against
+   the configured CA(s); failures close the connection.
+3. **Post-handshake authorization.**
+   `ClientStore::lookup_radsec_by_cert(src, peer)` maps the peer's
+   leaf certificate (and source address) to a registered `Client`.
+   The store may key off Subject DN, SAN, SPKI fingerprint, source
+   IP, or any combination — `radsecproxy`'s `verifyconfcert` policy.
+   Returning `None` tears the connection down before any RADIUS
+   frame is exchanged.
 
 Long-lived connections can be torn down on revocation via
 `Server::close_connections_for(client_id)`.

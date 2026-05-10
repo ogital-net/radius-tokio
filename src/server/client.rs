@@ -12,9 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::crypto::cleanse;
 
-#[cfg(feature = "radsec")]
-use crate::tls::ClientTrust;
-
 /// Opaque, process-unique identifier for a [`Client`].
 ///
 /// Used by server-level hooks (revocation, metrics tagging,
@@ -112,8 +109,6 @@ impl fmt::Debug for SecretBytes {
 pub struct Client {
     id: ClientId,
     secret: SecretBytes,
-    #[cfg(feature = "radsec")]
-    radsec_trust: Option<ClientTrust>,
 }
 
 impl Client {
@@ -123,24 +118,7 @@ impl Client {
         Self {
             id: ClientId::new(),
             secret: secret.into(),
-            #[cfg(feature = "radsec")]
-            radsec_trust: None,
         }
-    }
-
-    /// Narrow `RadSec` chain validation for this client to the
-    /// supplied trust set. Without this, the listener-wide trust
-    /// store from [`crate::tls::TlsContext::server`] applies.
-    ///
-    /// Set this when you want a successful mTLS handshake to mean
-    /// *"the peer at this IP presented the specific cert it was
-    /// supposed to"* — the IP-gated admission model. Peer-A
-    /// presenting a cert chained to peer-B's CA fails the handshake.
-    #[cfg(feature = "radsec")]
-    #[must_use]
-    pub fn with_radsec_trust(mut self, trust: ClientTrust) -> Self {
-        self.radsec_trust = Some(trust);
-        self
     }
 
     /// Process-unique handle.
@@ -154,14 +132,6 @@ impl Client {
     #[must_use]
     pub fn secret(&self) -> &[u8] {
         self.secret.as_bytes()
-    }
-
-    /// The per-connection `RadSec` trust set, if one was registered
-    /// via [`Self::with_radsec_trust`].
-    #[cfg(feature = "radsec")]
-    #[must_use]
-    pub fn radsec_trust(&self) -> Option<&ClientTrust> {
-        self.radsec_trust.as_ref()
     }
 }
 

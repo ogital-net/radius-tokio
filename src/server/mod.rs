@@ -22,6 +22,4 @@ pub use runtime::{Server, ServerBuilder, ShutdownHandle};
 pub use store::{CidrError, ClientStore, IpCidr, StaticClients, StaticClientsBuilder};
 
 #[cfg(feature = "radsec")]
-pub use radsec::RadSecMode;
-#[cfg(feature = "radsec")]
 pub use runtime::RadSecRevoker;

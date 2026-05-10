@@ -15,7 +15,7 @@
 )]
 
 use super::test_client::{build_pki, client_side};
-use super::{ClientTrust, HandshakeState, TlsConnection, TlsContext, TlsError};
+use super::{HandshakeState, TlsConnection, TlsContext, TlsError};
 
 fn drive(server: &mut TlsConnection, client: &mut client_side::ClientSsl) -> Result<(), TlsError> {
     let mut buf = [0u8; 16 * 1024];
@@ -168,58 +168,63 @@ fn drop_cleanliness_smoke() {
 }
 
 #[test]
-fn per_connection_trust_accepts_matching_client_cert() {
-    // Listener-wide trust covers BOTH CAs; per-connection trust
-    // narrows to CA-A. Client presents a CA-A cert -> handshake.
-    let pki_a = build_pki();
-    let pki_b = build_pki();
-    let combined_ca: Vec<u8> = [pki_a.ca_pem.as_slice(), pki_b.ca_pem.as_slice()].concat();
-    let server_ctx =
-        TlsContext::server(&pki_a.server_chain_pem, &pki_a.server_key_pem, &combined_ca).unwrap();
-    let mut server = TlsConnection::accept(&server_ctx).unwrap();
-    let trust_a = ClientTrust::from_pem(&pki_a.ca_pem).unwrap();
-    server.set_client_trust(&trust_a).unwrap();
+fn peer_certificate_per_field_san_accessors() {
+    // Build a custom client cert carrying every GeneralName choice
+    // that the in-tree PKI helper can issue (DNS, IP, URI, rID),
+    // and verify each per-field accessor returns just its slice.
+    use crate::crypto::pki::{CertificateAuthority, SubjectAltName};
+    use std::net::IpAddr;
 
-    let mut client = client_side::builder(&pki_a.ca_pem)
+    let ca = CertificateAuthority::new("test-ca").unwrap();
+    let server = ca
+        .issue_server("radsec.test", &[SubjectAltName::Dns("radsec.test".into())])
+        .unwrap();
+    let client = ca
+        .issue_client(
+            "nas-multi",
+            &[
+                SubjectAltName::Dns("nas-multi.example.com".into()),
+                SubjectAltName::Ip("10.0.0.5".parse::<IpAddr>().unwrap()),
+                SubjectAltName::Uri("urn:nas:multi".into()),
+                SubjectAltName::RegisteredId("1.3.6.1.4.1.99999.1".into()),
+            ],
+        )
+        .unwrap();
+    let ca_pem = ca.cert_pem().unwrap();
+
+    let server_ctx = TlsContext::server(&server.chain_pem, &server.key_pem, &ca_pem).unwrap();
+    let mut srv = TlsConnection::accept(&server_ctx).unwrap();
+    let mut cli = client_side::builder(&ca_pem)
         .unwrap()
-        .with_client_cert(&pki_a.client_chain_pem, &pki_a.client_key_pem)
+        .with_client_cert(&client.chain_pem, &client.key_pem)
         .unwrap()
         .build()
         .unwrap();
-    drive(&mut server, &mut client).expect("handshake under narrowed trust");
-}
+    drive(&mut srv, &mut cli).expect("handshake");
 
-#[test]
-fn per_connection_trust_rejects_other_ca_client_cert() {
-    // Listener-wide trust covers BOTH CAs; per-connection trust
-    // narrows to CA-A. Client presents a CA-B cert -> rejected.
-    // This is the IP-gated authorization model: a successful
-    // handshake means the peer presented the cert their `Client`
-    // record was narrowed to.
-    let pki_a = build_pki();
-    let pki_b = build_pki();
-    let combined_ca: Vec<u8> = [pki_a.ca_pem.as_slice(), pki_b.ca_pem.as_slice()].concat();
-    let server_ctx =
-        TlsContext::server(&pki_a.server_chain_pem, &pki_a.server_key_pem, &combined_ca).unwrap();
-    let mut server = TlsConnection::accept(&server_ctx).unwrap();
-    let trust_a = ClientTrust::from_pem(&pki_a.ca_pem).unwrap();
-    server.set_client_trust(&trust_a).unwrap();
+    let peer = srv.peer_certificate().expect("peer cert present");
 
-    // Client presents a cert chained to CA-B; the server's
-    // listener-wide store would accept it but the per-connection
-    // narrowing must not.
-    let mut client = client_side::builder(&pki_a.ca_pem)
-        .unwrap()
-        .with_client_cert(&pki_b.client_chain_pem, &pki_b.client_key_pem)
-        .unwrap()
-        .build()
-        .unwrap();
-    let result = drive(&mut server, &mut client);
-    assert!(matches!(result, Err(TlsError::Handshake(_))));
-}
+    // CN is taken from the Subject DN, not the SAN.
+    let cns = peer.common_names().unwrap();
+    assert_eq!(cns, vec!["nas-multi"], "CNs: {cns:?}");
 
-#[test]
-fn client_trust_from_empty_pem_is_an_error() {
-    let result = ClientTrust::from_pem(b"not a pem");
-    assert!(matches!(result, Err(TlsError::Pem(_))));
+    let dns = peer.dns_names().unwrap();
+    assert_eq!(dns, vec!["nas-multi.example.com"]);
+
+    let ips = peer.ip_addresses().unwrap();
+    assert_eq!(ips, vec!["10.0.0.5".parse::<IpAddr>().unwrap()]);
+
+    let uris = peer.uris().unwrap();
+    assert_eq!(uris, vec!["urn:nas:multi"]);
+
+    let rids = peer.registered_ids().unwrap();
+    assert_eq!(rids, vec!["1.3.6.1.4.1.99999.1"]);
+
+    // No otherName SAN issued, so the accessor returns empty.
+    let others = peer.other_names().unwrap();
+    assert!(others.is_empty(), "unexpected otherName: {others:?}");
+
+    // The aggregate accessor surfaces every entry exactly once.
+    let all = peer.subject_alt_names().unwrap();
+    assert_eq!(all.len(), 4, "all SANs: {all:?}");
 }

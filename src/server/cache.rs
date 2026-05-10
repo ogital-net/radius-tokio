@@ -217,7 +217,7 @@ impl<S: ClientStore> ClientStore for CachedStore<S> {
     /// per-packet UDP path would add overhead without value.
     /// Forward straight through to the inner store.
     #[cfg(feature = "radsec")]
-    fn admit_radsec(&self, src: SocketAddr) -> impl Future<Output = Option<Arc<Client>>> + Send {
+    fn admit_radsec(&self, src: SocketAddr) -> impl Future<Output = bool> + Send {
         self.inner.admit_radsec(src)
     }
 
@@ -226,9 +226,10 @@ impl<S: ClientStore> ClientStore for CachedStore<S> {
     #[cfg(feature = "radsec")]
     fn lookup_radsec_by_cert(
         &self,
+        src: SocketAddr,
         peer: &crate::tls::PeerCertificate,
     ) -> impl Future<Output = Option<Arc<Client>>> + Send {
-        self.inner.lookup_radsec_by_cert(peer)
+        self.inner.lookup_radsec_by_cert(src, peer)
     }
 }
 

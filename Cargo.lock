@@ -655,9 +655,11 @@ dependencies = [
  "aws-lc-sys",
  "criterion",
  "dhat",
+ "libc",
  "metrics",
  "radius-dict",
  "rusqlite",
+ "socket2",
  "tokio",
  "tracing",
 ]

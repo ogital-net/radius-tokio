@@ -89,6 +89,18 @@ tracing = { version = "0.1", default-features = false, features = ["std", "attri
 # build stays dependency-free. With the feature off the macros in
 # `crate::obs` expand to nothing.
 metrics = { version = "0.24", optional = true }
+# Socket option helpers: needed for the UDP listener defaults
+# (PMTUD-off / DF=0 on IPv4, IPV6_V6ONLY on IPv6) and for TCP
+# keepalive on accepted RadSec sockets. `socket2` is already a
+# transitive dependency of `tokio`, so promoting it to a direct
+# dependency adds no new crate to the graph.
+socket2 = { version = "0.6.3", features = ["all"] }
+# Raw `setsockopt` for IP_MTU_DISCOVER (Linux) / IP_DONTFRAG
+# (BSD/macOS) — socket2 doesn't expose either. Already a
+# transitive dependency of `tokio` / `socket2`, so promoting it
+# to a direct dependency adds no new crate to the graph.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }

@@ -93,8 +93,20 @@ impl ClientStore for MixedStore {
         self.udp.lookup_udp(src)
     }
 
+    // Admit any source IP for the pre-handshake gate; the mTLS
+    // handshake against the listener trust store + the
+    // SAN-based `lookup_radsec_by_cert` below provide the real
+    // authorization. Production deployments should narrow this
+    // to a CIDR allow-list or wire it to a per-IP rate limiter
+    // — the default returns `false` precisely so consumers are
+    // forced to make this call deliberately.
+    async fn admit_radsec(&self, _src: SocketAddr) -> bool {
+        true
+    }
+
     fn lookup_radsec_by_cert(
         &self,
+        _src: SocketAddr,
         peer: &PeerCertificate,
     ) -> impl Future<Output = Option<Arc<Client>>> + Send {
         // Walk every SAN entry; return the first registered DNS
@@ -105,7 +117,16 @@ impl ClientStore for MixedStore {
         let hit = peer.subject_alt_names().ok().and_then(|sans| {
             sans.into_iter().find_map(|san| match san {
                 SubjectAltName::Dns(name) => self.by_dns_san.get(&name).cloned(),
-                SubjectAltName::Ip(_) => None,
+                // The other GeneralName choices
+                // (`iPAddress`, `uniformResourceIdentifier`,
+                // `registeredID`, `otherName`) are exposed via
+                // [`PeerCertificate::ip_addresses`] / `uris` /
+                // `registered_ids` / `other_names` for consumers
+                // that key on those fields.
+                SubjectAltName::Ip(_)
+                | SubjectAltName::Uri(_)
+                | SubjectAltName::RegisteredId(_)
+                | SubjectAltName::OtherName(_) => None,
             })
         });
         async move { hit }
@@ -147,8 +168,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = MixedStore { udp, by_dns_san };
 
     // Build the server with three listeners: UDP auth + UDP acct +
-    // RadSec (TCP/TLS). RadSec defaults to cert-keyed mode; switch
-    // to `.listen_radsec_ip_gated(...)` for IP-keyed deployments.
+    // RadSec (TCP/TLS). The store overrides
+    // `lookup_radsec_by_cert` to map the peer's leaf certificate
+    // (DNS SAN) to a registered client; `admit_radsec` keeps the
+    // default (admit all source IPs).
     let server = Server::builder()
         .clients(store)
         .handler(AcceptAll)

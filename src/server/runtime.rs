@@ -22,12 +22,143 @@ use tokio::net::TcpListener;
 use super::dedup::DedupCache;
 use super::handler::Handler;
 #[cfg(feature = "radsec")]
-use super::radsec::{serve_radsec, ConnectionRegistry, RadSecMode};
+use super::radsec::{serve_radsec, ConnectionRegistry};
 use super::store::ClientStore;
 use super::udp::{serve_udp, DEFAULT_DEDUP_TTL};
 
 #[cfg(feature = "radsec")]
 use crate::tls::TlsContext;
+
+/// Bind a UDP listener with the socket options FreeRADIUS has long
+/// considered table stakes for AAA traffic:
+///
+/// * **IPv4: disable Path MTU Discovery** (`IP_MTU_DISCOVER =
+///   IP_PMTUDISC_DONT` on Linux, `IP_DONTFRAG = 0` on BSD/macOS).
+///   The kernel default on modern Linux is `IP_PMTUDISC_WANT`,
+///   which sets `DF=1` on outgoing replies; an Access-Accept that
+///   exceeds the path MTU (common with EAP-Message payloads) is
+///   then dropped with an ICMP "fragmentation needed" instead of
+///   being IP-fragmented end-to-end. RADIUS frames are bounded at
+///   4096 octets (RFC 2865 §3) and fragmentation is the expected
+///   recovery path; PMTUD just turns transient MTU mismatches
+///   into hard delivery failures.
+/// * **IPv6: set `IPV6_V6ONLY`.** The dual-stack default for a
+///   wildcard IPv6 bind is platform-dependent (Linux honours the
+///   `net.ipv6.bindv6only` sysctl, BSD/Windows default to
+///   v6-only, macOS varies). Forcing it on means
+///   `listen_udp(v4_addr).listen_udp(v6_addr)` is two clean
+///   single-family listeners on every platform, with no implicit
+///   `::ffff:0.0.0.0/96` reception on the IPv6 socket.
+///
+/// All other knobs (`SO_RCVBUF`, `SO_BINDTODEVICE`,
+/// `SO_REUSEPORT`, …) stay at kernel defaults; we'll add explicit
+/// builder hooks if and when consumers ask for them.
+fn bind_udp(addr: SocketAddr) -> io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let domain = match addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_nonblocking(true)?;
+
+    if matches!(addr, SocketAddr::V6(_)) {
+        // Match FreeRADIUS: never accept v4-mapped traffic on a
+        // socket the operator asked to bind as IPv6.
+        sock.set_only_v6(true)?;
+    }
+    if matches!(addr, SocketAddr::V4(_)) {
+        // socket2 doesn't expose IP_MTU_DISCOVER / IP_DONTFRAG, so
+        // we drop into raw `setsockopt`. Best-effort: silently
+        // tolerate platforms where neither name resolves.
+        set_v4_dontfrag(&sock);
+    }
+
+    sock.bind(&addr.into())?;
+    UdpSocket::from_std(sock.into())
+}
+
+/// Disable Path MTU Discovery / clear the DF bit on outgoing IPv4
+/// datagrams. Mirrors FreeRADIUS's behaviour in `listen_bind`
+/// (`src/main/listen.c`). Best-effort: any failure is logged via
+/// `tracing` (when enabled) and otherwise silently ignored — the
+/// listener still functions, just with the kernel's PMTUD policy.
+#[cfg(unix)]
+#[allow(unused_variables)]
+fn set_v4_dontfrag(sock: &socket2::Socket) {
+    use std::os::fd::AsRawFd;
+
+    // Linux / Android: IP_MTU_DISCOVER = IP_PMTUDISC_DONT.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // c_int is 4 bytes on every platform we support; the
+        // `as` cast here cannot truncate.
+        #[allow(clippy::cast_possible_truncation)]
+        const OPTLEN: libc::socklen_t = size_of::<libc::c_int>() as libc::socklen_t;
+        let val: libc::c_int = libc::IP_PMTUDISC_DONT;
+        // SAFETY: fd is a valid open IPv4 UDP socket; `&val` is a
+        // 4-byte readable buffer with the matching `optlen`.
+        let rc = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_MTU_DISCOVER,
+                std::ptr::addr_of!(val).cast(),
+                OPTLEN,
+            )
+        };
+        if rc != 0 {
+            warn_!(
+                event = "udp_bind_pmtud_failed",
+                errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            );
+        }
+    }
+
+    // BSD / macOS: IP_DONTFRAG = 0.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "macos",
+        target_os = "ios",
+    ))]
+    {
+        // `IP_DONTFRAG` isn't in every libc target's constants
+        // table, so hard-code the BSD value (67). Matches FR's
+        // `IP_DONTFRAG` use in src/main/listen.c.
+        const IP_DONTFRAG: libc::c_int = 67;
+        // c_int is 4 bytes on every platform we support; the
+        // `as` cast here cannot truncate.
+        #[allow(clippy::cast_possible_truncation)]
+        const OPTLEN: libc::socklen_t = size_of::<libc::c_int>() as libc::socklen_t;
+        let val: libc::c_int = 0;
+        // SAFETY: see Linux branch.
+        let rc = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_IP,
+                IP_DONTFRAG,
+                std::ptr::addr_of!(val).cast(),
+                OPTLEN,
+            )
+        };
+        if rc != 0 {
+            warn_!(
+                event = "udp_bind_pmtud_failed",
+                errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn set_v4_dontfrag(_sock: &socket2::Socket) {
+    // Windows / WASI: no equivalent in this crate's supported
+    // matrix today. Reserved for a future contributor.
+}
 
 /// Cloneable handle to request a graceful shutdown of a running
 /// [`Server`].
@@ -81,7 +212,7 @@ pub struct Server<S, H> {
     handler: Arc<H>,
     udp_binds: Vec<SocketAddr>,
     #[cfg(feature = "radsec")]
-    radsec_binds: Vec<(SocketAddr, TlsContext, RadSecMode)>,
+    radsec_binds: Vec<(SocketAddr, TlsContext)>,
     #[cfg(feature = "radsec")]
     connections: Arc<ConnectionRegistry>,
     dedup_ttl: Duration,
@@ -159,7 +290,7 @@ impl<S: ClientStore, H: Handler> Server<S, H> {
 
         let mut tasks = JoinSet::new();
         for addr in &self.udp_binds {
-            let socket = UdpSocket::bind(addr).await?;
+            let socket = bind_udp(*addr)?;
             info!(event = "udp_bind", %addr);
             tasks.spawn(serve_udp(
                 socket,
@@ -171,13 +302,12 @@ impl<S: ClientStore, H: Handler> Server<S, H> {
         }
 
         #[cfg(feature = "radsec")]
-        for (addr, ctx, mode) in &self.radsec_binds {
+        for (addr, ctx) in &self.radsec_binds {
             let listener = TcpListener::bind(addr).await?;
-            info!(event = "radsec_bind", %addr, mode = ?mode);
+            info!(event = "radsec_bind", %addr);
             tasks.spawn(serve_radsec(
                 listener,
                 ctx.clone(),
-                *mode,
                 Arc::clone(&self.store),
                 Arc::clone(&self.handler),
                 Arc::clone(&cache),
@@ -228,7 +358,7 @@ pub struct ServerBuilder<S, H> {
     handler: Option<Arc<H>>,
     udp_binds: Vec<SocketAddr>,
     #[cfg(feature = "radsec")]
-    radsec_binds: Vec<(SocketAddr, TlsContext, RadSecMode)>,
+    radsec_binds: Vec<(SocketAddr, TlsContext)>,
     dedup_ttl: Duration,
 }
 
@@ -270,52 +400,37 @@ impl<S: ClientStore, H: Handler> ServerBuilder<S, H> {
 
     /// Add a `RadSec` (RFC 6614) TCP listen address with the
     /// per-listener [`TlsContext`] used to terminate mTLS for every
-    /// connection accepted on that address. Defaults to
-    /// [`RadSecMode::CertKeyed`]: the listener-wide trust store
-    /// validates every chain that reaches it, and
-    /// [`ClientStore::lookup_radsec_by_cert`] runs after the
-    /// handshake to map the leaf cert to a registered client. This
-    /// is the RFC 6614 §2.5 model and works for NAT'd, shared-IP,
-    /// and RFC 7585 dynamic-discovery deployments alike.
+    /// connection accepted on that address.
     ///
-    /// Consumers using the IP-gated subset (every NAS source IP is
-    /// known up front, peers are pinned to a per-IP CA / SPKI)
-    /// should call [`listen_radsec_ip_gated`](Self::listen_radsec_ip_gated)
-    /// instead.
+    /// The pipeline is the same for every listener:
+    ///
+    /// 1. After `accept()`, the source address is passed to
+    ///    [`ClientStore::admit_radsec`] — a cheap pre-handshake
+    ///    `DoS` gate. Default `false` (deny all): consumers must
+    ///    override this method (typically with a CIDR allow-list
+    ///    or per-IP rate limit) before any peer can connect.
+    ///    [`StaticClients`] provides an override that admits any
+    ///    source IP matching a configured CIDR entry.
+    /// 2. mTLS handshake against the listener-wide trust store from
+    ///    [`TlsContext::server`].
+    /// 3. The peer's leaf certificate (and source address) is
+    ///    passed to [`ClientStore::lookup_radsec_by_cert`] for
+    ///    final authorization. Returning `None` tears the
+    ///    connection down.
     ///
     /// May be called multiple times to bind several addresses
     /// (dual-stack, multiple ports). Only available with the
     /// `radsec` cargo feature.
     ///
+    /// [`ClientStore::admit_radsec`]:
+    ///     super::store::ClientStore::admit_radsec
     /// [`ClientStore::lookup_radsec_by_cert`]:
     ///     super::store::ClientStore::lookup_radsec_by_cert
+    /// [`StaticClients`]: super::store::StaticClients
     #[cfg(feature = "radsec")]
     #[must_use]
     pub fn listen_radsec(mut self, addr: SocketAddr, tls: TlsContext) -> Self {
-        self.radsec_binds.push((addr, tls, RadSecMode::CertKeyed));
-        self
-    }
-
-    /// Add a `RadSec` listen address running in
-    /// [`RadSecMode::IpGated`] mode: the source IP is the admission
-    /// key (consulted *before* any TLS state is allocated) and the
-    /// admitted client's per-record [`ClientTrust`] narrows libssl's
-    /// chain validation, so a successful mTLS handshake *is* the
-    /// authorization decision.
-    ///
-    /// Use this for enterprise / SP edges where every NAS source
-    /// IP is provisioned, you want a cheap pre-handshake `DoS`
-    /// filter, and "this peer at this IP must present the cert it
-    /// was issued" is the policy. Cannot express NAT'd or
-    /// dynamic-discovery deployments — use [`listen_radsec`] for
-    /// those.
-    ///
-    /// [`ClientTrust`]: crate::tls::ClientTrust
-    /// [`listen_radsec`]: Self::listen_radsec
-    #[cfg(feature = "radsec")]
-    #[must_use]
-    pub fn listen_radsec_ip_gated(mut self, addr: SocketAddr, tls: TlsContext) -> Self {
-        self.radsec_binds.push((addr, tls, RadSecMode::IpGated));
+        self.radsec_binds.push((addr, tls));
         self
     }
 

@@ -3,23 +3,38 @@
 //! # Pipeline
 //!
 //! ```text
-//!   accept(TCP) ─▶ admit_radsec(src) ─▶ TLS handshake ─▶ frame loop
-//!                      │ None: drop          │ fail: drop
-//!                      ▼                     ▼
-//!                  no allocation         no further work
+//!   accept(TCP) ─▶ admit_radsec(src):bool ─▶ TLS handshake
+//!                       │ false: drop           │ fail: drop
+//!                       ▼                       ▼
+//!                  no TLS state             no further work
+//!                                               │
+//!                                               ▼
+//!                                 lookup_radsec_by_cert(src, peer)
+//!                                       │ None: shutdown + drop
+//!                                       ▼
+//!                                   frame loop
 //! ```
 //!
 //! Each accepted connection owns one Tokio task. The task:
 //!
 //! 1. Calls [`ClientStore::admit_radsec`] before any TLS bytes are
-//!    read. Unknown peers are dropped with no TLS state allocated.
+//!    read — a cheap pre-handshake `DoS` gate. Default `true`.
 //! 2. Runs a server-side mTLS handshake using the listener-wide
 //!    [`TlsContext`]. libssl performs chain validation; a failure
 //!    closes the connection.
-//! 3. Loops reading whole RADIUS frames out of the TLS stream and
+//! 3. Maps the peer's leaf certificate to a registered [`Client`]
+//!    via [`ClientStore::lookup_radsec_by_cert`]. The store may
+//!    consult either the cert (Subject / SAN / SPKI) or the source
+//!    address, or both — `radsecproxy`'s `verifyconfcert` policy.
+//! 4. Loops reading whole RADIUS frames out of the TLS stream and
 //!    dispatching them through the same authenticator-validation +
 //!    dedup + handler pipeline as UDP. The reply is sealed and
 //!    written back over the same TLS session.
+//!
+//! [`ClientStore::admit_radsec`]:
+//!     super::store::ClientStore::admit_radsec
+//! [`ClientStore::lookup_radsec_by_cert`]:
+//!     super::store::ClientStore::lookup_radsec_by_cert
 //!
 //! # Framing
 //!
@@ -75,34 +90,64 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 /// per call without round-tripping.
 const TLS_READ_CHUNK: usize = 16 * 1024;
 
-/// Per-listener admission policy.
-///
-/// See the design notes in `src/crypto/tls.rs` for the rationale
-/// behind the split. Briefly:
-///
-/// * **`CertKeyed`** — the default. Handshake runs against the
-///   listener-wide trust store, then
-///   [`ClientStore::lookup_radsec_by_cert`] maps the leaf
-///   certificate to a [`Client`]. This is the RFC 6614 §2.5 model
-///   and works for every deployment shape (including NAT'd peers,
-///   RFC 7585 dynamic discovery, consortium proxies).
-/// * **`IpGated`** — `ClientStore::admit_radsec(src)` is consulted
-///   *before* the TLS handshake. The returned client's per-record
-///   trust set narrows libssl's chain validation, so a successful
-///   handshake *is* the authorization decision. A performance /
-///   DoS-resistance optimization for enterprise / SP edges where
-///   every NAS source IP is known up front.
-///
-/// [`ClientStore::lookup_radsec_by_cert`]:
-///     super::store::ClientStore::lookup_radsec_by_cert
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RadSecMode {
-    /// Post-handshake authorization via leaf certificate lookup.
-    /// The default.
-    CertKeyed,
-    /// Pre-handshake admission by source IP, per-connection trust
-    /// narrowing.
-    IpGated,
+/// How often the connection driver requests a TLS 1.3 traffic-key
+/// update on a long-running session (RFC 8446 §4.6.3). Matches
+/// `radsecproxy`'s `RSP_TLS_REKEY_INTERVAL`. No-op below TLS 1.3.
+const TLS_KEY_UPDATE_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// TCP keepalive parameters applied to every accepted RadSec
+/// socket. Mirrors `radsecproxy`'s `enable_keepalive` (`util.c`):
+/// after [`KEEPALIVE_IDLE`] of silence the kernel emits probes,
+/// repeating every [`KEEPALIVE_INTERVAL`] up to [`KEEPALIVE_RETRIES`]
+/// times before declaring the connection dead. Without this the
+/// server happily holds a half-open TCP socket forever when a NAS
+/// or NAT box drops the path silently — `read_exact_or_eof`'s
+/// idle timer only fires while *new* data is expected.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_RETRIES: u32 = 3;
+
+/// Apply [`KEEPALIVE_IDLE`] / [`KEEPALIVE_INTERVAL`] /
+/// [`KEEPALIVE_RETRIES`] to `stream`. Errors are logged but not
+/// propagated: keepalive is a hardening / liveness aid, not a
+/// correctness requirement, and a kernel that refuses an option is
+/// no reason to drop the connection.
+fn apply_keepalive(stream: &TcpStream) {
+    use socket2::{SockRef, TcpKeepalive};
+    // `with_retries` is gated to platforms that expose `TCP_KEEPCNT`
+    // (Linux, the BSDs, macOS, …); skip it on the rare platform
+    // that doesn't and let the kernel use its default probe count.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+        target_os = "fuchsia",
+    ))]
+    let ka = TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL)
+        .with_retries(KEEPALIVE_RETRIES);
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+        target_os = "fuchsia",
+    )))]
+    let ka = TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL);
+    if let Err(_e) = SockRef::from(stream).set_tcp_keepalive(&ka) {
+        #[allow(clippy::used_underscore_binding)]
+        {
+            warn_!(event = "radsec_keepalive_failed", error = ?_e);
+        }
+    }
 }
 
 /// Tracks every active RadSec connection so the server can close
@@ -217,7 +262,6 @@ impl ConnectionRegistry {
 pub(crate) async fn serve_radsec<S, H>(
     listener: TcpListener,
     tls_ctx: TlsContext,
-    mode: RadSecMode,
     store: Arc<S>,
     handler: Arc<H>,
     cache: Arc<DedupCache>,
@@ -242,6 +286,10 @@ where
                 // request/response is naturally serialized, so any
                 // coalescing buys nothing and just adds latency.
                 let _ = stream.set_nodelay(true);
+                // Enable TCP keepalive so half-open connections
+                // (NAT timeout, NAS power-cycle, …) get reaped
+                // by the kernel instead of squatting forever.
+                apply_keepalive(&stream);
                 let store = Arc::clone(&store);
                 let handler = Arc::clone(&handler);
                 let cache = Arc::clone(&cache);
@@ -249,7 +297,7 @@ where
                 let tls_ctx = tls_ctx.clone();
                 tokio::spawn(async move {
                     if let Err(_e) = handle_connection(
-                        stream, peer, tls_ctx, mode, store, handler, cache, registry,
+                        stream, peer, tls_ctx, store, handler, cache, registry,
                     ).await {
                         warn_!(event = "radsec_connection_error", %peer, error = ?_e);
                     }
@@ -265,7 +313,6 @@ async fn handle_connection<S, H>(
     stream: TcpStream,
     peer: SocketAddr,
     tls_ctx: TlsContext,
-    mode: RadSecMode,
     store: Arc<S>,
     handler: Arc<H>,
     cache: Arc<DedupCache>,
@@ -275,33 +322,18 @@ where
     S: ClientStore,
     H: Handler,
 {
-    // Step 1: in IP-gated mode, run pre-handshake admission. No
-    // TLS state is allocated yet, so unknown peers cost us nothing
-    // beyond the accept(). In cert-keyed mode the source IP isn't
-    // the identity, so we skip this step and authorize after the
-    // handshake (Step 3 below).
-    let pre_client = match mode {
-        RadSecMode::IpGated => {
-            let Some(c) = store.admit_radsec(peer).await else {
-                debug!(event = "radsec_admit_reject", %peer);
-                count!("radius_tokio.radsec_admit_rejects");
-                return Ok(());
-            };
-            Some(c)
-        }
-        RadSecMode::CertKeyed => None,
-    };
-
-    // Step 2: build TLS state. In IP-gated mode, narrow chain
-    // validation to the admitted client's CA so libssl's check IS
-    // the authorization. In cert-keyed mode, the listener-wide
-    // trust store from `TlsContext::server` applies.
-    let mut tls = TlsConnection::accept(&tls_ctx).map_err(tls_to_io)?;
-    if let Some(client) = pre_client.as_ref() {
-        if let Some(trust) = client.radsec_trust() {
-            tls.set_client_trust(trust).map_err(tls_to_io)?;
-        }
+    // Step 1: pre-handshake DoS gate. No TLS state is allocated
+    // yet, so peers the consumer doesn't want to talk to cost us
+    // nothing beyond the accept().
+    if !store.admit_radsec(peer).await {
+        debug!(event = "radsec_admit_reject", %peer);
+        count!("radius_tokio.radsec_admit_rejects");
+        return Ok(());
     }
+
+    // Step 2: server-side mTLS handshake against the listener-wide
+    // trust store from `TlsContext::server`.
+    let tls = TlsConnection::accept(&tls_ctx).map_err(tls_to_io)?;
     let mut conn = AsyncTls::new(stream, tls);
     if let Err(_e) = conn.handshake().await {
         warn_!(event = "radsec_handshake_failed", %peer, error = ?_e);
@@ -309,54 +341,106 @@ where
         return Ok(());
     }
 
-    // Step 3: in cert-keyed mode, run post-handshake authorization
-    // by mapping the peer's leaf cert to a registered client. An
-    // unknown chain (one that libssl accepted but the consumer's
-    // store doesn't recognize) tears the connection down before
-    // any RADIUS frames are exchanged.
-    let client = match (pre_client, mode) {
-        (Some(c), _) => c,
-        (None, RadSecMode::CertKeyed) => {
-            let Some(peer_cert) = conn.peer_certificate() else {
-                // mTLS is mandatory in TlsContext::server; absence
-                // here would mean libssl let a no-cert client
-                // through, which it shouldn't. Defensive close.
-                warn_!(event = "radsec_cert_missing", %peer);
-                count!("radius_tokio.radsec_cert_lookup_failures", "reason" => "missing");
-                return Ok(());
-            };
-            if let Some(c) = store.lookup_radsec_by_cert(&peer_cert).await {
-                c
-            } else {
-                warn_!(
-                    event = "radsec_cert_lookup_reject",
-                    %peer,
-                    subject = %peer_cert.subject_display(),
-                );
-                count!(
-                    "radius_tokio.radsec_cert_lookup_failures",
-                    "reason" => "unknown_cert",
-                );
-                return Ok(());
-            }
-        }
-        (None, RadSecMode::IpGated) => {
-            // Unreachable: pre_client is always Some in IP-gated.
-            return Ok(());
-        }
+    // Step 3: post-handshake authorization. Map the peer's leaf
+    // cert (and source IP) to a registered client. An unknown
+    // chain (one that libssl accepted but the consumer's store
+    // doesn't recognize) tears the connection down before any
+    // RADIUS frames are exchanged.
+    let Some(peer_cert) = conn.peer_certificate() else {
+        // mTLS is mandatory in TlsContext::server; absence here
+        // would mean libssl let a no-cert client through, which
+        // it shouldn't. Defensive close.
+        warn_!(event = "radsec_cert_missing", %peer);
+        count!("radius_tokio.radsec_cert_lookup_failures", "reason" => "missing");
+        let _ = conn.shutdown_clean().await;
+        return Ok(());
+    };
+    let Some(client) = store.lookup_radsec_by_cert(peer, &peer_cert).await else {
+        warn_!(
+            event = "radsec_cert_lookup_reject",
+            %peer,
+            subject = %peer_cert.subject_display(),
+        );
+        count!(
+            "radius_tokio.radsec_cert_lookup_failures",
+            "reason" => "unknown_cert",
+        );
+        let _ = conn.shutdown_clean().await;
+        return Ok(());
     };
 
-    info!(event = "radsec_connected", %peer, client = ?client.id(), mode = ?mode);
+    info!(event = "radsec_connected", %peer, client = ?client.id());
     count!("radius_tokio.radsec_connections");
 
     // Register with the connection registry so a revocation can
     // tear the connection down. The guard removes the entry on
     // task exit.
-    let (_guard, mut close_rx) = registry.register(client.id());
+    let (_guard, close_rx) = registry.register(client.id());
 
-    // Step 4: per-frame loop.
+    // Step 4: per-frame loop. Routed through a helper so every
+    // exit path lands at the graceful-shutdown block below.
+    let loop_result = run_frame_loop(
+        &mut conn,
+        peer,
+        &client,
+        handler.as_ref(),
+        cache.as_ref(),
+        close_rx,
+    )
+    .await;
+
+    // Step 5: best-effort graceful close. Send `close_notify` and
+    // flush any produced ciphertext so the peer logs a clean
+    // shutdown rather than a truncation. We deliberately don't
+    // wait for the peer's reciprocal close_notify — the upper
+    // layer is already done and a misbehaving peer must not be
+    // allowed to delay teardown.
+    let _ = conn.shutdown_clean().await;
+    loop_result
+}
+
+/// Per-frame read/dispatch/write loop. Returns when the peer
+/// closes, the connection is revoked, the idle timer fires, or a
+/// dispatch decision (bad authenticator, malformed framing) demands
+/// a teardown.
+#[allow(clippy::used_underscore_binding)]
+async fn run_frame_loop<H: Handler>(
+    conn: &mut AsyncTls,
+    peer: SocketAddr,
+    client: &Arc<Client>,
+    handler: &H,
+    cache: &DedupCache,
+    mut close_rx: oneshot::Receiver<()>,
+) -> io::Result<()> {
     let mut frame = vec![0u8; MAX_PACKET_LEN];
+    let mut last_key_update = std::time::Instant::now();
     loop {
+        // Long-running TLS 1.3 sessions get a periodic traffic-key
+        // update (RFC 8446 §4.6.3). No-op below TLS 1.3 and when
+        // an update is already in flight, so the check is cheap
+        // even for short-lived connections.
+        if last_key_update.elapsed() >= TLS_KEY_UPDATE_INTERVAL {
+            match conn.tls.request_key_update() {
+                Ok(true) => {
+                    debug!(
+                        event = "radsec_key_update",
+                        %peer,
+                        client = ?client.id(),
+                    );
+                    count!("radius_tokio.radsec_key_updates");
+                }
+                Ok(false) => {}
+                Err(_e) => {
+                    warn_!(
+                        event = "radsec_key_update_failed",
+                        %peer,
+                        error = ?_e,
+                    );
+                }
+            }
+            last_key_update = std::time::Instant::now();
+        }
+
         tokio::select! {
             biased;
             _ = &mut close_rx => {
@@ -364,7 +448,7 @@ where
                 count!("radius_tokio.radsec_revocations_applied");
                 return Ok(());
             }
-            res = read_frame(&mut conn, &mut frame) => {
+            res = read_frame(conn, &mut frame) => {
                 let len = match res {
                     Ok(Some(n)) => n,
                     Ok(None) => {
@@ -377,12 +461,12 @@ where
                     }
                 };
                 if let Err(_e) = process_frame(
-                    &mut conn,
+                    conn,
                     &frame[..len],
                     peer,
-                    &client,
-                    handler.as_ref(),
-                    cache.as_ref(),
+                    client,
+                    handler,
+                    cache,
                 )
                 .await
                 {
@@ -463,7 +547,17 @@ async fn process_frame<H: Handler>(
             id = header.identifier,
         );
         count!("radius_tokio.packets_dropped", "reason" => "bad_request_authenticator");
-        return Ok(());
+        // Inside an authenticated TLS session, a bad RADIUS
+        // authenticator means either a misconfigured shared secret
+        // or something tampering inside the authenticated peer.
+        // Either way, continuing to read frames on this connection
+        // is unsafe — tear it down. Matches `radsecproxy`'s
+        // `tlsserverrd` policy. (UDP transport, by contrast,
+        // legitimately drops just the offending datagram.)
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad request authenticator",
+        ));
     }
 
     let ma_substitute = match header.code {
@@ -482,7 +576,12 @@ async fn process_frame<H: Handler>(
                 id = header.identifier,
             );
             count!("radius_tokio.packets_dropped", "reason" => "bad_message_authenticator");
-            return Ok(());
+            // See above: bad MA on a TLS-authenticated connection
+            // is a teardown condition, not a drop-and-continue.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad message authenticator",
+            ));
         }
     }
 
@@ -601,11 +700,10 @@ fn tls_to_io(e: TlsError) -> io::Error {
 struct AsyncTls {
     stream: TcpStream,
     tls: TlsConnection,
-    /// Scratch buffer for ciphertext shuttled out of `take_output`
-    /// before being written to the TCP socket.
-    out_buf: Vec<u8>,
     /// Scratch buffer for ciphertext read off the TCP socket before
-    /// being fed into `feed_input`.
+    /// being fed into `feed_input`. Outbound ciphertext is written
+    /// directly from libssl's mem-BIO buffer via
+    /// [`TlsConnection::pending_output`] — no staging buffer needed.
     in_buf: Vec<u8>,
     /// Once the peer's `read_exact` returns 0 we know no more
     /// ciphertext will arrive; subsequent attempts must surface as
@@ -623,7 +721,6 @@ impl AsyncTls {
         Self {
             stream,
             tls,
-            out_buf: vec![0u8; TLS_READ_CHUNK],
             in_buf: vec![0u8; TLS_READ_CHUNK],
             eof: false,
         }
@@ -749,14 +846,37 @@ impl AsyncTls {
 
     /// Drain everything libssl has queued in the output BIO down
     /// the TCP socket.
+    ///
+    /// Borrows the BIO's internal buffer in place
+    /// ([`TlsConnection::pending_output`]) and writes it straight
+    /// to the socket — no intermediate copy. After the write
+    /// completes the BIO is reset so the next `process` /
+    /// `SSL_write` starts from an empty buffer.
     async fn flush_tls_output(&mut self) -> io::Result<()> {
-        loop {
-            let n = self.tls.take_output(&mut self.out_buf).map_err(tls_to_io)?;
-            if n == 0 {
-                return Ok(());
-            }
-            self.stream.write_all(&self.out_buf[..n]).await?;
+        // Split the borrow so `pending_output(&mut tls)` and
+        // `stream.write_all(...)` can coexist on disjoint fields.
+        let Self { stream, tls, .. } = self;
+        let pending = tls.pending_output();
+        if pending.is_empty() {
+            return Ok(());
         }
+        stream.write_all(pending).await?;
+        tls.consume_output().map_err(tls_to_io)?;
+        Ok(())
+    }
+
+    /// Best-effort graceful shutdown: send TLS `close_notify`,
+    /// flush the resulting ciphertext, then drop. Does not wait
+    /// for the peer's reciprocal close_notify — the upper layer
+    /// is already done and a misbehaving peer must not be allowed
+    /// to delay teardown.
+    async fn shutdown_clean(&mut self) -> io::Result<()> {
+        let _ = self.tls.shutdown();
+        // Use a short, bounded timer so the shutdown path can't
+        // hang on a wedged socket. RadSec replies are small; the
+        // close_notify alert is one record.
+        let _ = tokio::time::timeout(Duration::from_secs(1), self.flush_tls_output()).await;
+        Ok(())
     }
 }
 
@@ -926,7 +1046,7 @@ mod tests {
         let server = Server::builder()
             .clients(store)
             .handler(AcceptAll)
-            .listen_radsec_ip_gated(addr, server_ctx)
+            .listen_radsec(addr, server_ctx)
             .build()
             .unwrap();
         let shutdown = server.shutdown_handle();
@@ -965,100 +1085,6 @@ mod tests {
         let _ = tokio::time::timeout(StdDuration::from_secs(2), server_task).await;
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn radsec_ip_gated_rejects_other_ca_cert() {
-        // IP-gated mode: the listener-wide trust covers BOTH CAs,
-        // but the client record at 127.0.0.1 is narrowed to CA-A.
-        // A peer presenting a CA-B-signed cert from that IP must
-        // fail the handshake — the connection is dropped.
-        let pki_a = crate::crypto::tls::test_client::build_pki();
-        let pki_b = crate::crypto::tls::test_client::build_pki();
-        let combined_ca: Vec<u8> = [pki_a.ca_pem.as_slice(), pki_b.ca_pem.as_slice()].concat();
-
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = probe.local_addr().unwrap();
-        drop(probe);
-
-        let server_ctx =
-            TlsContext::server(&pki_a.server_chain_pem, &pki_a.server_key_pem, &combined_ca)
-                .unwrap();
-
-        let trust_a = crate::tls::ClientTrust::from_pem(&pki_a.ca_pem).unwrap();
-        let client_record =
-            Arc::new(Client::new(b"shared-secret".as_slice()).with_radsec_trust(trust_a));
-
-        let store = StaticClients::builder()
-            .add(
-                IpCidr::host(Ipv4Addr::LOCALHOST.into()),
-                Arc::clone(&client_record),
-            )
-            .build();
-        let server = Server::builder()
-            .clients(store)
-            .handler(AcceptAll)
-            .listen_radsec_ip_gated(addr, server_ctx)
-            .build()
-            .unwrap();
-        let shutdown = server.shutdown_handle();
-        let server_task = tokio::spawn(server.run());
-
-        tokio::time::sleep(StdDuration::from_millis(50)).await;
-
-        // Wrong-CA peer. In TLS 1.3 the client-side handshake
-        // reports "established" before the server has finished
-        // validating the client cert; the server's rejection
-        // arrives as a post-handshake alert. So we additionally
-        // try to exchange a frame and assert that fails.
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let _ = stream.set_nodelay(true);
-        let ssl = client_side::builder(&pki_a.ca_pem)
-            .unwrap()
-            .with_client_cert(&pki_b.client_chain_pem, &pki_b.client_key_pem)
-            .unwrap()
-            .build()
-            .unwrap();
-        let mut pump = ClientPump::new(stream, ssl);
-        // The handshake call may or may not return Ok depending on
-        // when the server's alert reaches us; either is fine.
-        let _ = pump.handshake().await;
-        let (_req_auth, frame) = build_access_request(9, b"shared-secret");
-        // Best-effort write: may succeed locally, but...
-        let _ = pump.write_all(&frame).await;
-        // ...the reply must never arrive. Either the read errors
-        // out or the connection EOFs.
-        let mut hdr = [0u8; 4];
-        let read_res =
-            tokio::time::timeout(StdDuration::from_secs(2), pump.read_exact(&mut hdr)).await;
-        assert!(
-            matches!(read_res, Ok(Err(_)) | Err(_)),
-            "wrong-CA peer unexpectedly received a reply"
-        );
-
-        // Right-CA peer on the same listener succeeds — confirms
-        // the rejection above wasn't a listener-wide misconfig.
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let _ = stream.set_nodelay(true);
-        let ssl = client_side::builder(&pki_a.ca_pem)
-            .unwrap()
-            .with_client_cert(&pki_a.client_chain_pem, &pki_a.client_key_pem)
-            .unwrap()
-            .build()
-            .unwrap();
-        let mut pump = ClientPump::new(stream, ssl);
-        pump.handshake().await.expect("right-CA handshake");
-        let (_req_auth, frame) = build_access_request(11, b"shared-secret");
-        pump.write_all(&frame).await.expect("write request");
-        let mut hdr = [0u8; 4];
-        pump.read_exact(&mut hdr).await.expect("read header");
-        assert_eq!(hdr[0], Code::ACCESS_ACCEPT.0);
-        let len = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
-        let mut body = vec![0u8; len - 4];
-        pump.read_exact(&mut body).await.expect("read body");
-
-        shutdown.shutdown();
-        let _ = tokio::time::timeout(StdDuration::from_secs(2), server_task).await;
-    }
-
     // -----------------------------------------------------------
     // Cert-keyed mode: post-handshake authorization via a custom
     // ClientStore that maps the leaf cert's Subject DN to a Client.
@@ -1066,7 +1092,7 @@ mod tests {
 
     /// Cert-keyed `ClientStore` for tests: a flat list of
     /// `(subject-substring -> Client)` pairs. Returns `None` from
-    /// `lookup_udp` and `admit_radsec` (cert-keyed only) and
+    /// `lookup_udp`, admits every `RadSec` peer (default), and
     /// matches `lookup_radsec_by_cert` against the cert's Subject
     /// DN string.
     struct CertKeyedStore {
@@ -1082,8 +1108,18 @@ mod tests {
             async { None }
         }
 
+        // The library's default `admit_radsec` denies every peer
+        // (deliberately conservative deny forces consumers to think
+        // about DoS exposure). The test deals with a loopback
+        // mTLS handshake against an ephemeral CA, so admitting
+        // every source is fine.
+        async fn admit_radsec(&self, _src: SocketAddr) -> bool {
+            true
+        }
+
         fn lookup_radsec_by_cert(
             &self,
+            _src: SocketAddr,
             peer: &crate::tls::PeerCertificate,
         ) -> impl std::future::Future<Output = Option<Arc<Client>>> + Send {
             let subject = peer.subject_display();
