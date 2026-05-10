@@ -225,6 +225,26 @@ impl IssuedCertificate {
     pub fn issuer_pem(&self) -> &[u8] {
         &self.chain_pem[self.leaf_len..]
     }
+
+    /// Combined PEM bundle: private key followed by the full
+    /// certificate chain (leaf || issuer CA). This is the
+    /// "everything you need to be this peer" blob — the format
+    /// HAProxy, stunnel, Envoy, and most NAS firmwares accept as
+    /// a single file.
+    ///
+    /// Key-first ordering matches the convention used by HAProxy
+    /// and stunnel; consumers that want cert-first can build it
+    /// themselves from [`Self::chain_pem`] and [`Self::key_pem`].
+    ///
+    /// Treat the returned bytes as secret material — they contain
+    /// the unencrypted private key.
+    #[must_use]
+    pub fn to_bundle_pem(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.key_pem.len() + self.chain_pem.len());
+        out.extend_from_slice(&self.key_pem);
+        out.extend_from_slice(&self.chain_pem);
+        out
+    }
 }
 
 /// A self-signed certificate authority and its private key.
@@ -884,6 +904,27 @@ mod tests {
             .issue_client("nas-1", &[SubjectAltName::Ip("10.0.0.5".parse().unwrap())])
             .unwrap();
         let _ = Certificate::from_pem(c.cert_pem()).unwrap();
+    }
+
+    #[test]
+    fn bundle_pem_concatenates_key_then_chain() {
+        let ca = CertificateAuthority::new("Test Root").unwrap();
+        let issued = ca
+            .issue_server("radsec.test", &[SubjectAltName::Dns("radsec.test".into())])
+            .unwrap();
+        let bundle = issued.to_bundle_pem();
+        assert!(bundle.starts_with(b"-----BEGIN PRIVATE KEY-----"));
+        // Key + leaf + issuer => exactly two CERTIFICATE blocks.
+        assert_eq!(
+            bundle
+                .windows(b"-----BEGIN CERTIFICATE-----".len())
+                .filter(|w| *w == b"-----BEGIN CERTIFICATE-----")
+                .count(),
+            2
+        );
+        // Both halves parseable on their own.
+        assert_eq!(&bundle[..issued.key_pem.len()], issued.key_pem.as_slice());
+        assert_eq!(&bundle[issued.key_pem.len()..], issued.chain_pem.as_slice());
     }
 
     #[test]
