@@ -95,7 +95,7 @@ fn set_v4_dontfrag(sock: &socket2::Socket) {
         // c_int is 4 bytes on every platform we support; the
         // `as` cast here cannot truncate.
         #[allow(clippy::cast_possible_truncation)]
-        const OPTLEN: libc::socklen_t = size_of::<libc::c_int>() as libc::socklen_t;
+        const OPTLEN: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
         let val: libc::c_int = libc::IP_PMTUDISC_DONT;
         // SAFETY: fd is a valid open IPv4 UDP socket; `&val` is a
         // 4-byte readable buffer with the matching `optlen`.
@@ -133,7 +133,7 @@ fn set_v4_dontfrag(sock: &socket2::Socket) {
         // c_int is 4 bytes on every platform we support; the
         // `as` cast here cannot truncate.
         #[allow(clippy::cast_possible_truncation)]
-        const OPTLEN: libc::socklen_t = size_of::<libc::c_int>() as libc::socklen_t;
+        const OPTLEN: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
         let val: libc::c_int = 0;
         // SAFETY: see Linux branch.
         let rc = unsafe {
