@@ -88,6 +88,11 @@ const GROUPS: &[Group] = &[
         module: "wispr",
         entry: "dictionaries/vendor/dictionary.wispr",
     },
+    Group {
+        feature: "dict-tplink",
+        module: "tplink",
+        entry: "dictionaries/vendor/dictionary.tplink",
+    },
 ];
 
 fn main() {

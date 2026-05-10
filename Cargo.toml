@@ -48,6 +48,7 @@ dict-meraki = ["radius-dict/dict-meraki"]
 dict-microsoft = ["radius-dict/dict-microsoft"]
 dict-mikrotik = ["radius-dict/dict-mikrotik"]
 dict-ruckus = ["radius-dict/dict-ruckus"]
+dict-tplink = ["radius-dict/dict-tplink"]
 dict-wispr = ["radius-dict/dict-wispr"]
 # Umbrella enabling every vendored vendor dictionary.
 dict-vendor-all = [
@@ -61,6 +62,7 @@ dict-vendor-all = [
     "dict-microsoft",
     "dict-mikrotik",
     "dict-ruckus",
+    "dict-tplink",
     "dict-wispr",
 ]
 

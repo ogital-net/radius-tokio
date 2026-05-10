@@ -18,6 +18,7 @@
 #   429  (USR / 3Com — not included; non-CC-BY)
 #   529  Ascend Communications (Lucent / Nokia)
 #  2636  Juniper Networks
+# 11863  TP-Link
 # 12356  Fortinet
 # 14122  WISPr / Wireless Broadband Alliance
 # 14823  Aruba Networks / HPE
@@ -36,3 +37,4 @@ $INCLUDE dictionary.aruba
 $INCLUDE dictionary.mikrotik
 $INCLUDE dictionary.ruckus
 $INCLUDE dictionary.meraki
+$INCLUDE dictionary.tplink
