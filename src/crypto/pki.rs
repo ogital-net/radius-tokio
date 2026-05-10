@@ -23,6 +23,31 @@
 //!
 //! Anything beyond that is the consumer's PKI's problem.
 //!
+//! # Trust model: the CA generates subject keys
+//!
+//! Because there's no CSR support, the CA in this module
+//! generates the subject's keypair itself when issuing a leaf and
+//! returns both halves to the caller (see [`IssuedCertificate`]).
+//! That violates the textbook rule that a private key should
+//! never leave the subject — but it's the only shape that works
+//! without CSRs, and the alternative (every consumer wires up
+//! their own CSR plumbing for a quickstart) defeats the point of
+//! the module.
+//!
+//! In practice this means the module is appropriate for:
+//!
+//! * test fixtures (keys live in-process for milliseconds);
+//! * small deployments where one operator runs the CA *and*
+//!   provisions the NASes, and is willing to copy `key_pem` to
+//!   the NAS over `scp` / configuration management / a sealed
+//!   bootstrap channel;
+//! * demos and quickstarts.
+//!
+//! Larger deployments should bring their own CA (Vault PKI,
+//! step-ca, AWS Private CA, smallstep, …) that does CSRs the
+//! right way and feed its output into [`crate::tls::TlsContext`]
+//! directly.
+//!
 //! # Defaults (and why)
 //!
 //! | Setting | Default | Reason |
@@ -69,7 +94,7 @@
 //!
 //! // Now feed `server.chain_pem` + `server.key_pem` to the
 //! // listener's TlsContext, and ship `nas.chain_pem` + `nas.key_pem`
-//! // (plus `ca.cert_pem()`) to the NAS.
+//! // (plus `ca.cert_pem().unwrap()`) to the NAS.
 //! ```
 
 #![allow(
@@ -78,24 +103,22 @@
     clippy::must_use_candidate
 )]
 
-use std::ffi::{c_int, c_long, c_void, CString};
-use std::net::IpAddr;
+use std::ffi::{c_int, c_long, CString};
 use std::ptr::NonNull;
 
 use aws_lc_sys::{
-    ASN1_INTEGER_free, BIO_new, BIO_read, BIO_s_mem, BN_free, BN_new, BN_rand, BN_to_ASN1_INTEGER,
-    EVP_PKEY_CTX_free, EVP_PKEY_CTX_new_id, EVP_PKEY_CTX_set_ec_paramgen_curve_nid,
-    EVP_PKEY_CTX_set_rsa_keygen_bits, EVP_PKEY_keygen, EVP_PKEY_keygen_init, EVP_sha256,
-    NID_X9_62_prime256v1, NID_authority_key_identifier, NID_basic_constraints, NID_ext_key_usage,
-    NID_key_usage, NID_secp384r1, NID_subject_alt_name, NID_subject_key_identifier,
-    PEM_write_bio_PKCS8PrivateKey, PEM_write_bio_X509, X509V3_EXT_conf_nid, X509V3_set_ctx,
-    X509_EXTENSION_free, X509_NAME_add_entry_by_txt, X509_NAME_free, X509_NAME_new, X509_add_ext,
-    X509_gmtime_adj, X509_new, X509_set_issuer_name, X509_set_pubkey, X509_set_serialNumber,
-    X509_set_subject_name, X509_set_version, X509_sign, ASN1_INTEGER, BIGNUM, EVP_PKEY_CTX,
-    EVP_PKEY_EC, EVP_PKEY_RSA, MBSTRING_UTF8, X509V3_CTX, X509_NAME,
+    ASN1_INTEGER_free, BN_free, BN_new, BN_rand, BN_to_ASN1_INTEGER, EVP_PKEY_CTX_free,
+    EVP_PKEY_CTX_new_id, EVP_PKEY_CTX_set_ec_paramgen_curve_nid, EVP_PKEY_CTX_set_rsa_keygen_bits,
+    EVP_PKEY_keygen, EVP_PKEY_keygen_init, EVP_sha256, NID_X9_62_prime256v1,
+    NID_authority_key_identifier, NID_basic_constraints, NID_ext_key_usage, NID_key_usage,
+    NID_secp384r1, NID_subject_alt_name, NID_subject_key_identifier, X509V3_EXT_conf_nid,
+    X509V3_set_ctx, X509_EXTENSION_free, X509_NAME_add_entry_by_txt, X509_NAME_free, X509_NAME_new,
+    X509_add_ext, X509_gmtime_adj, X509_new, X509_set_issuer_name, X509_set_pubkey,
+    X509_set_serialNumber, X509_set_subject_name, X509_set_version, X509_sign, ASN1_INTEGER,
+    BIGNUM, EVP_PKEY_CTX, EVP_PKEY_EC, EVP_PKEY_RSA, MBSTRING_UTF8, X509V3_CTX, X509_NAME,
 };
 
-use super::tls::{pop_err, BioOwned, EvpPkeyOwned, TlsError, X509Owned};
+use super::tls::{pop_err, EvpPkeyOwned, TlsError, X509Owned};
 
 // ============================================================================
 // Public types
@@ -117,13 +140,10 @@ pub enum KeyAlgorithm {
 
 /// Subject Alternative Name entry. RFC 6614 leaves don't validate
 /// without one; the issuer functions reject empty SAN lists.
-#[derive(Debug, Clone)]
-pub enum SubjectAltName {
-    /// `dNSName` SAN.
-    Dns(String),
-    /// `iPAddress` SAN.
-    Ip(IpAddr),
-}
+///
+/// Re-exported from [`crate::tls`] so issuance and peer-cert matching
+/// share a single type.
+pub use super::tls::SubjectAltName;
 
 /// An asymmetric private key with its associated public key.
 pub struct PrivateKey {
@@ -147,17 +167,64 @@ unsafe impl Send for Certificate {}
 unsafe impl Sync for Certificate {}
 
 /// A leaf certificate as issued by a [`CertificateAuthority`],
-/// bundled with everything needed to ship it to a peer.
+/// bundled with the freshly-generated subject private key.
+///
+/// # Why the private key is here
+///
+/// In a textbook PKI the subject (NAS) generates its own keypair
+/// locally, sends a CSR carrying just the public key, and the CA
+/// signs a cert against it — the private key never leaves the
+/// subject. This module deliberately does **not** support CSRs
+/// (see the module-level "Scope" section), so [`issue_server`] /
+/// [`issue_client`] generate the keypair on the CA host and hand
+/// both halves back. The caller is then responsible for
+/// transporting `key_pem` to the subject out-of-band (operator
+/// `scp`, configuration management, sealed bootstrap channel,
+/// etc.).
+///
+/// That tradeoff is fine for the workflows this module targets —
+/// test fixtures, small private deployments where one operator
+/// owns both the CA and the NAS provisioning, and quickstarts /
+/// demos. Anything bigger should plug in a real CA (Vault PKI,
+/// step-ca, AWS Private CA, smallstep, …) that supports CSRs.
+///
+/// # Hygiene
+///
+/// `key_pem` is unencrypted PKCS#8. Treat the whole struct as
+/// secret material: don't log it, don't `Debug`-print it, drop
+/// it as soon as you've handed the bytes to whoever needs them.
+///
+/// [`issue_server`]: CertificateAuthority::issue_server
+/// [`issue_client`]: CertificateAuthority::issue_client
 #[derive(Debug, Clone)]
 pub struct IssuedCertificate {
-    /// PEM-encoded leaf certificate.
-    pub cert_pem: Vec<u8>,
     /// PEM-encoded chain: leaf followed by issuer CA. This is what
     /// you feed to `TlsContext::server_chain_pem` and what RFC 6614
     /// peers expect on the wire.
     pub chain_pem: Vec<u8>,
-    /// PKCS#8-encoded PEM private key. Unencrypted.
+    /// PKCS#8-encoded PEM private key for the subject (the NAS, or
+    /// the RadSec listener). Unencrypted; ship to the subject
+    /// out-of-band and treat as secret. See the type-level docs
+    /// for why the CA holds this at all.
     pub key_pem: Vec<u8>,
+    /// Byte length of the leaf within `chain_pem`. The leaf occupies
+    /// `chain_pem[..leaf_len]`; the issuer CA occupies the remainder.
+    leaf_len: usize,
+}
+
+impl IssuedCertificate {
+    /// PEM-encoded leaf certificate (a borrowed prefix of
+    /// [`Self::chain_pem`]).
+    #[must_use]
+    pub fn cert_pem(&self) -> &[u8] {
+        &self.chain_pem[..self.leaf_len]
+    }
+
+    /// PEM-encoded issuer certificate (the CA portion of the chain).
+    #[must_use]
+    pub fn issuer_pem(&self) -> &[u8] {
+        &self.chain_pem[self.leaf_len..]
+    }
 }
 
 /// A self-signed certificate authority and its private key.
@@ -168,8 +235,6 @@ pub struct IssuedCertificate {
 pub struct CertificateAuthority {
     cert: Certificate,
     key: PrivateKey,
-    cert_pem: Vec<u8>,
-    key_pem: Vec<u8>,
 }
 
 // ============================================================================
@@ -235,20 +300,9 @@ impl PrivateKey {
     /// Returns [`TlsError::Pem`] if the input is not a valid
     /// private-key PEM block.
     pub fn from_pem(pem: &[u8]) -> Result<Self, TlsError> {
-        let bio = new_mem_bio_readonly(pem)?;
-        // SAFETY: bio valid; NULL out-param / cb / userdata are
-        // documented as legal for unencrypted keys.
-        let raw = unsafe {
-            aws_lc_sys::PEM_read_bio_PrivateKey(
-                bio.0.as_ptr(),
-                std::ptr::null_mut(),
-                None,
-                std::ptr::null_mut(),
-            )
-        };
-        drop(bio);
-        let pkey = EvpPkeyOwned(NonNull::new(raw).ok_or(TlsError::Pem("private key"))?);
-        Ok(Self { pkey })
+        Ok(Self {
+            pkey: EvpPkeyOwned::from_pem(pem)?,
+        })
     }
 
     /// Encode this key as unencrypted PKCS#8 PEM.
@@ -257,25 +311,7 @@ impl PrivateKey {
     ///
     /// Returns [`TlsError::Ssl`] if `PEM_write_bio_PKCS8PrivateKey` fails.
     pub fn to_pem_pkcs8(&self) -> Result<Vec<u8>, TlsError> {
-        let bio = new_mem_bio()?;
-        // SAFETY: bio valid; remaining args choose the unencrypted
-        // PKCS#8 encoding path: enc = NULL, pass = NULL, pass_len = 0,
-        // cb = None, userdata = NULL.
-        let r = unsafe {
-            PEM_write_bio_PKCS8PrivateKey(
-                bio.0.as_ptr(),
-                self.pkey.0.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-                None,
-                std::ptr::null_mut(),
-            )
-        };
-        if r != 1 {
-            return Err(TlsError::Ssl(pop_err("PEM_write_bio_PKCS8PrivateKey")));
-        }
-        Ok(bio_drain(&bio))
+        self.pkey.to_pem_pkcs8()
     }
 }
 
@@ -291,19 +327,9 @@ impl Certificate {
     /// Returns [`TlsError::Pem`] if the input is not a single valid
     /// certificate PEM block.
     pub fn from_pem(pem: &[u8]) -> Result<Self, TlsError> {
-        let bio = new_mem_bio_readonly(pem)?;
-        // SAFETY: bio valid; remaining args may be NULL.
-        let raw = unsafe {
-            aws_lc_sys::PEM_read_bio_X509(
-                bio.0.as_ptr(),
-                std::ptr::null_mut(),
-                None,
-                std::ptr::null_mut(),
-            )
-        };
-        drop(bio);
-        let cert = X509Owned(NonNull::new(raw).ok_or(TlsError::Pem("certificate"))?);
-        Ok(Self { cert })
+        Ok(Self {
+            cert: X509Owned::from_pem(pem)?,
+        })
     }
 
     /// Encode this certificate as PEM.
@@ -312,14 +338,38 @@ impl Certificate {
     ///
     /// Returns [`TlsError::Ssl`] if `PEM_write_bio_X509` fails.
     pub fn to_pem(&self) -> Result<Vec<u8>, TlsError> {
-        let bio = new_mem_bio()?;
-        // SAFETY: bio and cert pointers valid; PEM_write_bio_X509
-        // returns 1 on success.
-        let r = unsafe { PEM_write_bio_X509(bio.0.as_ptr(), self.cert.0.as_ptr()) };
-        if r != 1 {
-            return Err(TlsError::Ssl(pop_err("PEM_write_bio_X509")));
-        }
-        Ok(bio_drain(&bio))
+        self.cert.to_pem()
+    }
+
+    /// DER-encoded bytes of the certificate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsError::Ssl`] if `i2d_X509` fails.
+    pub fn to_der(&self) -> Result<Vec<u8>, TlsError> {
+        self.cert.to_der()
+    }
+
+    /// Subject DN rendered as the OpenSSL one-line text
+    /// representation (`/CN=foo/O=bar`). Returns an empty string
+    /// if the cert has no Subject DN.
+    ///
+    /// **Diagnostic use only** — see
+    /// [`crate::tls::PeerCertificate::subject_display`].
+    #[must_use]
+    pub fn subject_display(&self) -> String {
+        self.cert.subject_display()
+    }
+
+    /// SHA-256 hash of the SubjectPublicKeyInfo, the canonical
+    /// "SPKI pin" used by RadSec deployments to bind a peer to a
+    /// specific key (independent of the issuer / chain).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsError::Ssl`] if `i2d_X509_PUBKEY` fails.
+    pub fn spki_sha256(&self) -> Result<[u8; 32], TlsError> {
+        self.cert.spki_sha256()
     }
 }
 
@@ -359,14 +409,7 @@ impl CertificateAuthority {
             profile: Profile::Ca,
             sans: &[],
         })?;
-        let cert_pem = cert.to_pem()?;
-        let key_pem = key.to_pem_pkcs8()?;
-        Ok(Self {
-            cert,
-            key,
-            cert_pem,
-            key_pem,
-        })
+        Ok(Self { cert, key })
     }
 
     /// Load a previously-issued CA cert + key from PEM.
@@ -377,26 +420,33 @@ impl CertificateAuthority {
     pub fn from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<Self, TlsError> {
         let cert = Certificate::from_pem(cert_pem)?;
         let key = PrivateKey::from_pem(key_pem)?;
-        Ok(Self {
-            cert,
-            key,
-            cert_pem: cert_pem.to_vec(),
-            key_pem: key_pem.to_vec(),
-        })
+        Ok(Self { cert, key })
     }
 
     /// PEM-encoded CA certificate. This is the trust anchor you
     /// distribute to peers as the `client_ca_pem` argument to
     /// `TlsContext`.
-    #[must_use]
-    pub fn cert_pem(&self) -> &[u8] {
-        &self.cert_pem
+    ///
+    /// Re-encodes from the in-memory `X509` on every call; cache
+    /// the result if you need to hand it out repeatedly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsError::Ssl`] if `PEM_write_bio_X509` fails.
+    pub fn cert_pem(&self) -> Result<Vec<u8>, TlsError> {
+        self.cert.to_pem()
     }
 
     /// PEM-encoded CA private key (unencrypted PKCS#8). Keep secret.
-    #[must_use]
-    pub fn key_pem(&self) -> &[u8] {
-        &self.key_pem
+    ///
+    /// Re-encodes from the in-memory `EVP_PKEY` on every call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsError::Ssl`] if `PEM_write_bio_PKCS8PrivateKey`
+    /// fails.
+    pub fn key_pem(&self) -> Result<Vec<u8>, TlsError> {
+        self.key.to_pem_pkcs8()
     }
 
     /// Issue a server certificate (EKU `serverAuth`, KU
@@ -454,14 +504,15 @@ impl CertificateAuthority {
             profile,
             sans,
         })?;
-        let cert_pem = cert.to_pem()?;
+        let leaf_pem = cert.to_pem()?;
         let key_pem = key.to_pem_pkcs8()?;
-        let mut chain_pem = cert_pem.clone();
-        chain_pem.extend_from_slice(&self.cert_pem);
+        let leaf_len = leaf_pem.len();
+        let mut chain_pem = leaf_pem;
+        chain_pem.extend_from_slice(&self.cert.to_pem()?);
         Ok(IssuedCertificate {
-            cert_pem,
             chain_pem,
             key_pem,
+            leaf_len,
         })
     }
 }
@@ -604,12 +655,11 @@ fn build_name(cn: &str) -> Result<X509NameOwned, TlsError> {
     // SAFETY: X509_NAME_new allocates; NULL on OOM.
     let raw = unsafe { X509_NAME_new() };
     let name = X509NameOwned(NonNull::new(raw).ok_or(TlsError::Init("X509_NAME_new"))?);
-    let cn_field = CString::new("CN").expect("static literal");
     // SAFETY: name valid; bytes is a non-NUL UTF-8 slice with explicit length.
     let r = unsafe {
         X509_NAME_add_entry_by_txt(
             name.0.as_ptr(),
-            cn_field.as_ptr(),
+            c"CN".as_ptr(),
             MBSTRING_UTF8,
             cn.as_ptr(),
             isize::try_from(cn.len()).map_err(|_| TlsError::Pem("CN too long"))?,
@@ -724,53 +774,8 @@ fn cn_of(cert: &Certificate) -> Result<String, TlsError> {
 }
 
 // ============================================================================
-// FFI helpers (memory BIO, owned newtypes)
+// FFI helpers (owned newtypes)
 // ============================================================================
-
-fn new_mem_bio() -> Result<BioOwned, TlsError> {
-    // SAFETY: BIO_s_mem returns a static method pointer; BIO_new
-    // allocates.
-    let raw = unsafe { BIO_new(BIO_s_mem()) };
-    NonNull::new(raw)
-        .map(BioOwned)
-        .ok_or(TlsError::Init("BIO_new(BIO_s_mem)"))
-}
-
-fn new_mem_bio_readonly(data: &[u8]) -> Result<BioOwned, TlsError> {
-    // SAFETY: BIO_new_mem_buf with explicit length never reads past
-    // data.len(); the BIO does not take ownership.
-    let raw = unsafe {
-        aws_lc_sys::BIO_new_mem_buf(
-            data.as_ptr().cast::<c_void>(),
-            isize::try_from(data.len()).map_err(|_| TlsError::Pem("input too large"))?,
-        )
-    };
-    NonNull::new(raw)
-        .map(BioOwned)
-        .ok_or(TlsError::Init("BIO_new_mem_buf"))
-}
-
-/// Drain a memory BIO via repeated `BIO_read` into a `Vec<u8>`.
-fn bio_drain(bio: &BioOwned) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        // SAFETY: bio valid; buf is a 4 KiB stack slice; len fits
-        // in c_int. Negative return = no data; zero = EOF.
-        let n = unsafe {
-            BIO_read(
-                bio.0.as_ptr(),
-                buf.as_mut_ptr().cast::<c_void>(),
-                c_int::try_from(buf.len()).unwrap_or(c_int::MAX),
-            )
-        };
-        if n <= 0 {
-            break;
-        }
-        out.extend_from_slice(&buf[..usize::try_from(n).expect("n > 0")]);
-    }
-    out
-}
 
 struct EvpPkeyCtxOwned(NonNull<EVP_PKEY_CTX>);
 impl Drop for EvpPkeyCtxOwned {
@@ -845,10 +850,18 @@ mod tests {
     #[test]
     fn ca_self_signs_and_round_trips() {
         let ca = CertificateAuthority::new("Test Root").unwrap();
-        assert!(ca.cert_pem().starts_with(b"-----BEGIN CERTIFICATE-----"));
-        assert!(ca.key_pem().starts_with(b"-----BEGIN PRIVATE KEY-----"));
-        let reloaded = CertificateAuthority::from_pem(ca.cert_pem(), ca.key_pem()).unwrap();
-        assert_eq!(reloaded.cert_pem(), ca.cert_pem());
+        assert!(ca
+            .cert_pem()
+            .unwrap()
+            .starts_with(b"-----BEGIN CERTIFICATE-----"));
+        assert!(ca
+            .key_pem()
+            .unwrap()
+            .starts_with(b"-----BEGIN PRIVATE KEY-----"));
+        let reloaded =
+            CertificateAuthority::from_pem(&ca.cert_pem().unwrap(), &ca.key_pem().unwrap())
+                .unwrap();
+        assert_eq!(reloaded.cert_pem().unwrap(), ca.cert_pem().unwrap());
     }
 
     #[test]
@@ -857,7 +870,7 @@ mod tests {
         let s = ca
             .issue_server("radsec.test", &[SubjectAltName::Dns("radsec.test".into())])
             .unwrap();
-        assert!(s.cert_pem.starts_with(b"-----BEGIN CERTIFICATE-----"));
+        assert!(s.cert_pem().starts_with(b"-----BEGIN CERTIFICATE-----"));
         // Chain = leaf || CA, so two BEGIN lines.
         assert_eq!(
             s.chain_pem
@@ -870,7 +883,7 @@ mod tests {
         let c = ca
             .issue_client("nas-1", &[SubjectAltName::Ip("10.0.0.5".parse().unwrap())])
             .unwrap();
-        let _ = Certificate::from_pem(&c.cert_pem).unwrap();
+        let _ = Certificate::from_pem(c.cert_pem()).unwrap();
     }
 
     #[test]
@@ -897,11 +910,11 @@ mod tests {
             .issue_client("nas-1", &[SubjectAltName::Dns("nas-1".into())])
             .unwrap();
 
-        let ctx =
-            TlsContext::server(&server.chain_pem, &server.key_pem, Some(ca.cert_pem())).unwrap();
+        let ctx = TlsContext::server(&server.chain_pem, &server.key_pem, &ca.cert_pem().unwrap())
+            .unwrap();
         let mut server_conn = TlsConnection::accept(&ctx).unwrap();
 
-        let mut client_conn = tc::builder(ca.cert_pem())
+        let mut client_conn = tc::builder(&ca.cert_pem().unwrap())
             .unwrap()
             .with_client_cert(&client.chain_pem, &client.key_pem)
             .unwrap()

@@ -42,10 +42,14 @@
 //! ## The store
 //!
 //! `MixedStore` is the smallest interesting `ClientStore`: a static
-//! IP map for UDP, and a Common-Name map for RadSec. A real
-//! deployment would back this with whatever identity database it
-//! already runs (see `examples/sqlite_clients.rs` for a backend
-//! pattern).
+//! IP map for UDP, and a SAN-keyed map for RadSec. Per RFC 6614
+//! §2.3 every RadSec leaf carries a `dNSName` SAN identifying the
+//! peer, and per RFC 6125 §6.4.4 the Common Name is deprecated for
+//! identity matching — so we match against
+//! [`PeerCertificate::subject_alt_names`] rather than parsing the
+//! Subject DN. A real deployment would back this with whatever
+//! identity database it already runs (see `examples/sqlite_clients.rs`
+//! for a backend pattern).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -56,7 +60,7 @@ use radius_tokio::dict::generated::rfc::attrs;
 use radius_tokio::server::{
     Client, ClientStore, Handler, HandlerResult, IpCidr, Request, Server, StaticClients,
 };
-use radius_tokio::tls::{PeerCertificate, TlsContext};
+use radius_tokio::tls::{PeerCertificate, SubjectAltName, TlsContext};
 use radius_tokio::Code;
 
 // ─── handler ──────────────────────────────────────────────────────
@@ -77,10 +81,11 @@ impl Handler for AcceptAll {
 // ─── store ────────────────────────────────────────────────────────
 
 /// Small union store: delegate UDP lookups to a [`StaticClients`]
-/// table, and resolve RadSec peers by the `CN` of their leaf cert.
+/// table, and resolve RadSec peers by a `dNSName` SAN on their
+/// leaf cert (RFC 6614 §2.3 / RFC 6125 §6.4.4).
 struct MixedStore {
     udp: StaticClients,
-    by_cn: HashMap<String, Arc<Client>>,
+    by_dns_san: HashMap<String, Arc<Client>>,
 }
 
 impl ClientStore for MixedStore {
@@ -92,16 +97,17 @@ impl ClientStore for MixedStore {
         &self,
         peer: &PeerCertificate,
     ) -> impl Future<Output = Option<Arc<Client>>> + Send {
-        // `PeerCertificate::subject()` returns the OpenSSL one-line
-        // form (e.g. `/CN=ap-edge-01.example.com`). Pull the CN out
-        // and look it up in our table.
-        let subject = peer.subject();
-        let cn = subject
-            .split('/')
-            .find_map(|part| part.strip_prefix("CN="))
-            .unwrap_or("")
-            .to_string();
-        let hit = self.by_cn.get(&cn).cloned();
+        // Walk every SAN entry; return the first registered DNS
+        // name that matches. We deliberately ignore the Subject DN
+        // (and its Common Name) — RFC 6125 §6.4.4 deprecates CN
+        // matching, and RadSec leaves are required to carry a SAN
+        // in any case.
+        let hit = peer.subject_alt_names().ok().and_then(|sans| {
+            sans.into_iter().find_map(|san| match san {
+                SubjectAltName::Dns(name) => self.by_dns_san.get(&name).cloned(),
+                SubjectAltName::Ip(_) => None,
+            })
+        });
         async move { hit }
     }
 }
@@ -116,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key_pem = std::fs::read("server.key")?;
     let client_ca_pem = std::fs::read("clients-ca.pem")?;
 
-    let tls = TlsContext::server(&cert_chain_pem, &key_pem, Some(&client_ca_pem))?;
+    let tls = TlsContext::server(&cert_chain_pem, &key_pem, &client_ca_pem)?;
 
     // UDP table: one /24 of NASes sharing one secret.
     let udp = StaticClients::builder()
@@ -126,19 +132,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .build();
 
-    // RadSec table: two known peers, keyed by the CN their cert
-    // presents.
-    let mut by_cn = HashMap::new();
-    by_cn.insert(
+    // RadSec table: two known peers, keyed by the `dNSName` SAN
+    // their cert presents.
+    let mut by_dns_san = HashMap::new();
+    by_dns_san.insert(
         "ap-edge-01.example.com".to_string(),
         Arc::new(Client::new(b"radsec-secret-edge-01".as_slice())),
     );
-    by_cn.insert(
+    by_dns_san.insert(
         "ap-edge-02.example.com".to_string(),
         Arc::new(Client::new(b"radsec-secret-edge-02".as_slice())),
     );
 
-    let store = MixedStore { udp, by_cn };
+    let store = MixedStore { udp, by_dns_san };
 
     // Build the server with three listeners: UDP auth + UDP acct +
     // RadSec (TCP/TLS). RadSec defaults to cert-keyed mode; switch

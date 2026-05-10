@@ -39,7 +39,7 @@ pub(crate) fn build_pki() -> Pki {
         server_key_pem: server.key_pem,
         client_chain_pem: client.chain_pem,
         client_key_pem: client.key_pem,
-        ca_pem: ca.cert_pem().to_vec(),
+        ca_pem: ca.cert_pem().unwrap(),
     }
 }
 

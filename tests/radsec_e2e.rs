@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use radius_tokio::server::{Client, ClientStore, Handler, HandlerResult, Request, Server};
-use radius_tokio::tls::{PeerCertificate, TlsContext};
+use radius_tokio::tls::{PeerCertificate, SubjectAltName, TlsContext};
 use radius_tokio::Code;
 
 struct AcceptAll;
@@ -55,14 +55,17 @@ impl Handler for AcceptAll {
     }
 }
 
-/// Cert-keyed `ClientStore`: maps a peer's Subject CN to a
-/// pre-registered [`Client`]. Real deployments would back this with
-/// a database; the test uses a frozen in-memory map.
-struct CnStore {
-    by_cn: HashMap<String, Arc<Client>>,
+/// Cert-keyed `ClientStore`: maps a peer's `dNSName` SAN to a
+/// pre-registered [`Client`]. RFC 6614 §2.3 mandates a SAN on
+/// RadSec leaves and RFC 6125 §6.4.4 deprecates Common Name
+/// matching, so SAN is the right hook here. Real deployments
+/// would back this with a database; the test uses a frozen
+/// in-memory map.
+struct SanStore {
+    by_dns_san: HashMap<String, Arc<Client>>,
 }
 
-impl ClientStore for CnStore {
+impl ClientStore for SanStore {
     #[allow(clippy::manual_async_fn)]
     fn lookup_udp(&self, _src: SocketAddr) -> impl Future<Output = Option<Arc<Client>>> + Send {
         // No UDP listeners in this test; default to None.
@@ -73,16 +76,15 @@ impl ClientStore for CnStore {
         &self,
         peer: &PeerCertificate,
     ) -> impl Future<Output = Option<Arc<Client>>> + Send {
-        // `subject()` returns the OpenSSL one-line form, e.g.
-        // `/CN=alice`. Parse the CN out — that's the deployment
-        // contract our PKI builder enforces.
-        let subject = peer.subject();
-        let cn = subject
-            .split('/')
-            .find_map(|part| part.strip_prefix("CN="))
-            .unwrap_or("")
-            .to_string();
-        let hit = self.by_cn.get(&cn).cloned();
+        // Walk the leaf's SAN list and return the first registered
+        // `dNSName` match. `iPAddress` and other types aren't used
+        // by the test PKI builder so they fall through.
+        let hit = peer.subject_alt_names().ok().and_then(|sans| {
+            sans.into_iter().find_map(|san| match san {
+                SubjectAltName::Dns(name) => self.by_dns_san.get(&name).cloned(),
+                SubjectAltName::Ip(_) => None,
+            })
+        });
         async move { hit }
     }
 }
@@ -157,7 +159,7 @@ fn build_pki() -> Pki {
         alice_key_pem: alice.key_pem,
         bob_chain_pem: bob.chain_pem,
         bob_key_pem: bob.key_pem,
-        ca_pem: ca.cert_pem().to_vec(),
+        ca_pem: ca.cert_pem().unwrap(),
     }
 }
 
@@ -203,21 +205,17 @@ async fn radsec_cert_keyed_dispatches_to_correct_client() {
     let proxy_udp_addr = ephemeral_udp().await;
 
     // ---- spawn our Server (cert-keyed) ---------------------------
-    let tls_ctx = TlsContext::server(
-        &pki.server_chain_pem,
-        &pki.server_key_pem,
-        Some(&pki.ca_pem),
-    )
-    .expect("build server tls ctx");
+    let tls_ctx = TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, &pki.ca_pem)
+        .expect("build server tls ctx");
 
     let alice_client = Arc::new(Client::new(alice_secret.as_bytes()));
     let bob_client = Arc::new(Client::new(bob_secret.as_bytes()));
     let alice_id = alice_client.id();
     let bob_id = bob_client.id();
-    let mut by_cn = HashMap::new();
-    by_cn.insert("alice".to_string(), Arc::clone(&alice_client));
-    by_cn.insert("bob".to_string(), Arc::clone(&bob_client));
-    let store = CnStore { by_cn };
+    let mut by_dns_san = HashMap::new();
+    by_dns_san.insert("alice".to_string(), Arc::clone(&alice_client));
+    by_dns_san.insert("bob".to_string(), Arc::clone(&bob_client));
+    let store = SanStore { by_dns_san };
 
     let server = Server::builder()
         .clients(store)

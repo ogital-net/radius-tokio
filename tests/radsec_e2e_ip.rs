@@ -118,7 +118,7 @@ fn build_pki() -> Pki {
         server_key_pem: server.key_pem,
         client_chain_pem: client.chain_pem,
         client_key_pem: client.key_pem,
-        ca_pem: ca.cert_pem().to_vec(),
+        ca_pem: ca.cert_pem().unwrap(),
     }
 }
 
@@ -161,12 +161,8 @@ async fn radsec_through_radsecproxy_to_server() {
     let proxy_udp_addr = ephemeral_udp().await;
 
     // ---- spawn our Server ----------------------------------------
-    let tls_ctx = TlsContext::server(
-        &pki.server_chain_pem,
-        &pki.server_key_pem,
-        Some(&pki.ca_pem),
-    )
-    .expect("build server tls ctx");
+    let tls_ctx = TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, &pki.ca_pem)
+        .expect("build server tls ctx");
 
     let client_record = Arc::new(Client::new(radsec_secret.as_bytes()));
     let store = StaticClients::builder()

@@ -70,20 +70,23 @@
 )]
 
 use std::ffi::{c_int, c_void, CStr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use aws_lc_sys::{
-    BIO_free, BIO_new, BIO_new_mem_buf, BIO_read, BIO_s_mem, BIO_write, ERR_error_string_n,
-    ERR_get_error, EVP_PKEY_free, PEM_read_bio_PrivateKey, PEM_read_bio_X509,
-    SSL_CTX_check_private_key, SSL_CTX_free, SSL_CTX_new, SSL_CTX_set1_cert_store,
-    SSL_CTX_set_default_verify_paths, SSL_CTX_set_min_proto_version, SSL_CTX_set_verify,
+    ASN1_STRING_get0_data, ASN1_STRING_length, BIO_free, BIO_new, BIO_new_mem_buf, BIO_read,
+    BIO_s_mem, BIO_write, ERR_error_string_n, ERR_get_error, EVP_PKEY_free, GENERAL_NAMES_free,
+    NID_subject_alt_name, OPENSSL_sk_num, OPENSSL_sk_value, PEM_read_bio_PrivateKey,
+    PEM_read_bio_X509, SSL_CTX_check_private_key, SSL_CTX_free, SSL_CTX_new,
+    SSL_CTX_set1_cert_store, SSL_CTX_set_min_proto_version, SSL_CTX_set_verify,
     SSL_CTX_use_PrivateKey, SSL_CTX_use_certificate, SSL_accept, SSL_free, SSL_get_error,
     SSL_get_peer_certificate, SSL_new, SSL_pending, SSL_read, SSL_set1_verify_cert_store,
     SSL_set_bio, SSL_write, TLS_server_method, X509_NAME_oneline, X509_STORE_add_cert,
-    X509_STORE_new, X509_free, X509_get_subject_name, BIO, EVP_PKEY, SSL, SSL_CTX, SSL_ERROR_NONE,
-    SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE, SSL_ERROR_ZERO_RETURN,
-    SSL_VERIFY_FAIL_IF_NO_PEER_CERT, SSL_VERIFY_PEER, TLS1_2_VERSION, X509, X509_STORE,
+    X509_STORE_new, X509_free, X509_get_ext_d2i, X509_get_subject_name, BIO, EVP_PKEY,
+    GENERAL_NAME, GEN_DNS, GEN_IPADD, SSL, SSL_CTX, SSL_ERROR_NONE, SSL_ERROR_WANT_READ,
+    SSL_ERROR_WANT_WRITE, SSL_ERROR_ZERO_RETURN, SSL_VERIFY_FAIL_IF_NO_PEER_CERT, SSL_VERIFY_PEER,
+    TLS1_2_VERSION, X509, X509_STORE,
 };
 
 // ============================================================================
@@ -219,6 +222,289 @@ impl Drop for X509Owned {
     }
 }
 
+impl X509Owned {
+    /// Parse a single X.509 certificate from PEM bytes.
+    pub(super) fn from_pem(pem: &[u8]) -> Result<Self, TlsError> {
+        let bio = new_mem_bio_readonly(pem)?;
+        // SAFETY: bio is a valid BIO* with `pem` as its read buffer.
+        // The remaining args are NULL: no password callback / userdata
+        // are needed for an unencrypted certificate PEM block.
+        let raw = unsafe {
+            PEM_read_bio_X509(
+                bio.0.as_ptr(),
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null_mut(),
+            )
+        };
+        drop(bio);
+        NonNull::new(raw)
+            .map(X509Owned)
+            .ok_or(TlsError::Pem("certificate"))
+    }
+
+    /// Encode this certificate as PEM.
+    pub(super) fn to_pem(&self) -> Result<Vec<u8>, TlsError> {
+        let bio = new_mem_bio()?;
+        // SAFETY: bio and cert pointers valid; PEM_write_bio_X509
+        // returns 1 on success.
+        let r = unsafe { aws_lc_sys::PEM_write_bio_X509(bio.0.as_ptr(), self.0.as_ptr()) };
+        if r != 1 {
+            return Err(TlsError::Ssl(pop_err("PEM_write_bio_X509")));
+        }
+        Ok(bio_drain(&bio))
+    }
+
+    /// DER-encoded bytes of the certificate.
+    pub(super) fn to_der(&self) -> Result<Vec<u8>, TlsError> {
+        // SAFETY: passing a NULL out-pointer to i2d_X509 returns the
+        // required length without writing anything.
+        let len = unsafe { aws_lc_sys::i2d_X509(self.0.as_ptr(), std::ptr::null_mut()) };
+        if len <= 0 {
+            return Err(TlsError::Ssl(pop_err("i2d_X509 length")));
+        }
+        let mut buf = vec![0u8; usize::try_from(len).expect("len > 0")];
+        let mut p = buf.as_mut_ptr();
+        // SAFETY: buf is at least `len` bytes; i2d_X509 writes
+        // exactly `len` bytes and advances the pointer.
+        let written = unsafe { aws_lc_sys::i2d_X509(self.0.as_ptr(), &mut p) };
+        if written != len {
+            return Err(TlsError::Ssl(pop_err("i2d_X509 write")));
+        }
+        Ok(buf)
+    }
+
+    /// Subject DN rendered as the OpenSSL one-line text
+    /// representation (`/CN=foo/O=bar`). Returns an empty string
+    /// if the cert has no Subject DN.
+    ///
+    /// **Diagnostic use only.** This format is the legacy OpenSSL
+    /// rendering, not RFC 4514 LDAP DN form, and it is not safely
+    /// parseable: CN/O values may contain `/` and `=`. For
+    /// identity matching consult
+    /// [`subject_alt_names`](Self::subject_alt_names) (RFC 6125
+    /// §6.4.4 / RFC 6614 §2.3) or
+    /// [`spki_sha256`](Self::spki_sha256) instead.
+    pub(super) fn subject_display(&self) -> String {
+        // SAFETY: cert valid; X509_get_subject_name returns an
+        // interior pointer owned by the X509.
+        let name = unsafe { X509_get_subject_name(self.0.as_ptr()) };
+        if name.is_null() {
+            return String::new();
+        }
+        // 512 covers the realistic worst case for an RFC 5280 DN
+        // (~6 RDNs each at their X.520 upper bound). X509_NAME_oneline
+        // truncates rather than failing if the buffer is too small.
+        let mut buf = [0u8; 512];
+        // SAFETY: buf valid; X509_NAME_oneline writes a
+        // NUL-terminated string up to buf_size bytes; with a
+        // non-null buf the return value points into our buffer.
+        let ptr = unsafe {
+            X509_NAME_oneline(
+                name,
+                buf.as_mut_ptr().cast::<std::os::raw::c_char>(),
+                c_int::try_from(buf.len()).unwrap_or(c_int::MAX),
+            )
+        };
+        if ptr.is_null() {
+            return String::new();
+        }
+        // SAFETY: ptr came from our buffer and is NUL-terminated.
+        let cstr = unsafe { CStr::from_ptr(ptr) };
+        cstr.to_string_lossy().into_owned()
+    }
+
+    /// SHA-256 hash of the SubjectPublicKeyInfo (the canonical
+    /// "SPKI pin").
+    pub(super) fn spki_sha256(&self) -> Result<[u8; 32], TlsError> {
+        // SAFETY: X509_get_X509_PUBKEY returns an interior pointer
+        // (no ownership transfer).
+        let pubkey = unsafe { aws_lc_sys::X509_get_X509_PUBKEY(self.0.as_ptr()) };
+        if pubkey.is_null() {
+            return Err(TlsError::Ssl(pop_err("X509_get_X509_PUBKEY")));
+        }
+        // SAFETY: NULL out-pointer => length query.
+        let len = unsafe { aws_lc_sys::i2d_X509_PUBKEY(pubkey, std::ptr::null_mut()) };
+        if len <= 0 {
+            return Err(TlsError::Ssl(pop_err("i2d_X509_PUBKEY length")));
+        }
+        let mut der = vec![0u8; usize::try_from(len).expect("len > 0")];
+        let mut p = der.as_mut_ptr();
+        // SAFETY: der has `len` bytes of capacity; i2d_X509_PUBKEY
+        // writes exactly `len` bytes and advances the pointer.
+        let written = unsafe { aws_lc_sys::i2d_X509_PUBKEY(pubkey, &mut p) };
+        if written != len {
+            return Err(TlsError::Ssl(pop_err("i2d_X509_PUBKEY write")));
+        }
+        let mut hash = [0u8; 32];
+        // SAFETY: SHA256 takes (data, len, out); out must be 32
+        // bytes; returns NULL only on internal allocation failure.
+        let r = unsafe { aws_lc_sys::SHA256(der.as_ptr(), der.len(), hash.as_mut_ptr()) };
+        if r.is_null() {
+            return Err(TlsError::Ssl(pop_err("SHA256")));
+        }
+        Ok(hash)
+    }
+
+    /// Decode the certificate's `subjectAltName` extension into a
+    /// list of [`SubjectAltName`] entries. Returns an empty vector
+    /// if the extension is absent. Entries with types other than
+    /// `dNSName` and `iPAddress` are silently skipped — those are
+    /// the only types RFC 6614 §2.3 mandates support for and the
+    /// only ones the SAN matchers in `radius-tokio` consume.
+    pub(super) fn subject_alt_names(&self) -> Result<Vec<SubjectAltName>, TlsError> {
+        // SAFETY: cert valid; `X509_get_ext_d2i` returns a
+        // freshly-decoded `GENERAL_NAMES*` (caller-owned) when the
+        // extension exists, NULL otherwise. We pass NULL for the
+        // critical/index out-params since we want neither.
+        let raw = unsafe {
+            X509_get_ext_d2i(
+                self.0.as_ptr(),
+                NID_subject_alt_name,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        let Some(stack) = NonNull::new(raw.cast::<aws_lc_sys::stack_st_GENERAL_NAME>()) else {
+            return Ok(Vec::new());
+        };
+        let _guard = GeneralNamesGuard(stack);
+        // SAFETY: stack is a valid `GENERAL_NAMES*`; the cast to
+        // `OPENSSL_STACK*` matches BoringSSL's stack ABI.
+        let count = unsafe { OPENSSL_sk_num(stack.as_ptr().cast()) };
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            // SAFETY: 0 <= i < count; the returned `GENERAL_NAME*`
+            // is borrowed from the stack and remains valid until
+            // `GENERAL_NAMES_free` runs (via the guard).
+            let gn = unsafe { OPENSSL_sk_value(stack.as_ptr().cast(), i) }.cast::<GENERAL_NAME>();
+            let Some(gn) = NonNull::new(gn) else { continue };
+            // SAFETY: gn valid; reading the discriminant before the
+            // matching union arm.
+            let ty = unsafe { (*gn.as_ptr()).type_ };
+            if ty == GEN_DNS {
+                // SAFETY: when `type_ == GEN_DNS`, `d.dNSName` is
+                // the active union arm and points at an
+                // `ASN1_IA5STRING` owned by the stack.
+                let s = unsafe { (*gn.as_ptr()).d.dNSName };
+                if let Some(name) = read_asn1_string_utf8(s) {
+                    out.push(SubjectAltName::Dns(name));
+                }
+            } else if ty == GEN_IPADD {
+                // SAFETY: when `type_ == GEN_IPADD`, `d.iPAddress`
+                // is the active union arm and points at an
+                // `ASN1_OCTET_STRING` owned by the stack.
+                let s = unsafe { (*gn.as_ptr()).d.iPAddress };
+                if let Some(ip) = read_asn1_ip(s) {
+                    out.push(SubjectAltName::Ip(ip));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// RAII guard that frees a `GENERAL_NAMES*` (a `STACK_OF(GENERAL_NAME)`)
+/// returned by `X509_get_ext_d2i`. `GENERAL_NAMES_free` walks the
+/// stack and frees each entry plus the stack itself.
+struct GeneralNamesGuard(NonNull<aws_lc_sys::stack_st_GENERAL_NAME>);
+
+impl Drop for GeneralNamesGuard {
+    fn drop(&mut self) {
+        // SAFETY: pointer non-null and was obtained from
+        // `X509_get_ext_d2i(NID_subject_alt_name, ...)`, which
+        // documents `GENERAL_NAMES_free` as the matching free.
+        unsafe { GENERAL_NAMES_free(self.0.as_ptr()) };
+    }
+}
+
+/// Read an `ASN1_STRING` (IA5/UTF-8 family) as a `String`. Returns
+/// `None` if the pointer is null or the bytes aren't valid UTF-8.
+fn read_asn1_string_utf8(s: *const aws_lc_sys::ASN1_STRING) -> Option<String> {
+    if s.is_null() {
+        return None;
+    }
+    // SAFETY: s non-null; the two ASN1_STRING accessors are
+    // documented as borrowing-only and length-bounded.
+    let (data, len) = unsafe {
+        (
+            ASN1_STRING_get0_data(s),
+            usize::try_from(ASN1_STRING_length(s)).ok()?,
+        )
+    };
+    if data.is_null() {
+        return None;
+    }
+    // SAFETY: the accessors above guarantee `data` points at `len`
+    // valid bytes owned by the ASN1_STRING.
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    std::str::from_utf8(bytes).ok().map(str::to_owned)
+}
+
+/// Read an `ASN1_OCTET_STRING` carrying a SAN `iPAddress` value.
+/// RFC 5280 §4.2.1.6 fixes the encoding at exactly 4 octets (IPv4)
+/// or 16 octets (IPv6); other lengths are skipped.
+fn read_asn1_ip(s: *const aws_lc_sys::ASN1_STRING) -> Option<IpAddr> {
+    if s.is_null() {
+        return None;
+    }
+    // SAFETY: see `read_asn1_string_utf8`.
+    let (data, len) = unsafe {
+        (
+            ASN1_STRING_get0_data(s),
+            usize::try_from(ASN1_STRING_length(s)).ok()?,
+        )
+    };
+    if data.is_null() {
+        return None;
+    }
+    // SAFETY: `data` points at `len` valid bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    match bytes.len() {
+        4 => Some(IpAddr::V4(Ipv4Addr::new(
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ))),
+        16 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(bytes);
+            Some(IpAddr::V6(Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
+}
+
+/// Build an empty memory BIO (writable).
+pub(super) fn new_mem_bio() -> Result<BioOwned, TlsError> {
+    // SAFETY: BIO_s_mem returns a static method pointer; BIO_new
+    // allocates.
+    let raw = unsafe { BIO_new(BIO_s_mem()) };
+    NonNull::new(raw)
+        .map(BioOwned)
+        .ok_or(TlsError::Init("BIO_new(BIO_s_mem)"))
+}
+
+/// Drain a memory BIO via repeated `BIO_read` into a `Vec<u8>`.
+pub(super) fn bio_drain(bio: &BioOwned) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        // SAFETY: bio valid; buf is a 4 KiB stack slice; len fits
+        // in c_int. Negative return = no data; zero = EOF.
+        let n = unsafe {
+            BIO_read(
+                bio.0.as_ptr(),
+                buf.as_mut_ptr().cast::<c_void>(),
+                c_int::try_from(buf.len()).unwrap_or(c_int::MAX),
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..usize::try_from(n).expect("n > 0")]);
+    }
+    out
+}
+
 /// Owning newtype for `EVP_PKEY*`.
 pub(super) struct EvpPkeyOwned(pub(super) NonNull<EVP_PKEY>);
 
@@ -226,6 +512,51 @@ impl Drop for EvpPkeyOwned {
     fn drop(&mut self) {
         // SAFETY: pointer non-null; EVP_PKEY_free decrements the refcount.
         unsafe { EVP_PKEY_free(self.0.as_ptr()) };
+    }
+}
+
+impl EvpPkeyOwned {
+    /// Parse a private key (any algorithm) from unencrypted PEM
+    /// bytes (PKCS#8 or algorithm-specific).
+    pub(super) fn from_pem(pem: &[u8]) -> Result<Self, TlsError> {
+        let bio = new_mem_bio_readonly(pem)?;
+        // SAFETY: bio valid; NULL out-param / cb / userdata are
+        // documented as legal for unencrypted keys.
+        let raw = unsafe {
+            PEM_read_bio_PrivateKey(
+                bio.0.as_ptr(),
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null_mut(),
+            )
+        };
+        drop(bio);
+        NonNull::new(raw)
+            .map(EvpPkeyOwned)
+            .ok_or(TlsError::Pem("private key"))
+    }
+
+    /// Encode this key as unencrypted PKCS#8 PEM.
+    pub(super) fn to_pem_pkcs8(&self) -> Result<Vec<u8>, TlsError> {
+        let bio = new_mem_bio()?;
+        // SAFETY: bio valid; remaining args choose the unencrypted
+        // PKCS#8 encoding path: enc = NULL, pass = NULL, pass_len = 0,
+        // cb = None, userdata = NULL.
+        let r = unsafe {
+            aws_lc_sys::PEM_write_bio_PKCS8PrivateKey(
+                bio.0.as_ptr(),
+                self.0.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                None,
+                std::ptr::null_mut(),
+            )
+        };
+        if r != 1 {
+            return Err(TlsError::Ssl(pop_err("PEM_write_bio_PKCS8PrivateKey")));
+        }
+        Ok(bio_drain(&bio))
     }
 }
 
@@ -250,51 +581,11 @@ unsafe impl Sync for X509StoreOwned {}
 // PEM parsing helpers
 // ============================================================================
 
-/// Parse a single X.509 certificate from PEM bytes.
-fn parse_pem_cert(pem: &[u8]) -> Result<X509Owned, TlsError> {
-    let bio = new_mem_bio_readonly(pem)?;
-    // SAFETY: bio is a valid BIO* with `pem` as its read buffer.
-    // The remaining args are NULL: no password callback / userdata
-    // are needed for an unencrypted certificate PEM block.
-    let raw = unsafe {
-        PEM_read_bio_X509(
-            bio.0.as_ptr(),
-            std::ptr::null_mut(),
-            None,
-            std::ptr::null_mut(),
-        )
-    };
-    drop(bio);
-    NonNull::new(raw)
-        .map(X509Owned)
-        .ok_or(TlsError::Pem("certificate"))
-}
-
-/// Parse a private key (any algorithm) from PEM bytes.
-fn parse_pem_key(pem: &[u8]) -> Result<EvpPkeyOwned, TlsError> {
-    let bio = new_mem_bio_readonly(pem)?;
-    // SAFETY: same invariants as parse_pem_cert; the function
-    // signature accepts NULL for the optional out-param and
-    // password callback.
-    let raw = unsafe {
-        PEM_read_bio_PrivateKey(
-            bio.0.as_ptr(),
-            std::ptr::null_mut(),
-            None,
-            std::ptr::null_mut(),
-        )
-    };
-    drop(bio);
-    NonNull::new(raw)
-        .map(EvpPkeyOwned)
-        .ok_or(TlsError::Pem("private key"))
-}
-
 /// Build a memory-backed BIO that *reads* from `data`. The returned
 /// BIO does not own `data` — caller must keep it alive while the BIO
 /// is in use. We never re-export this BIO past the immediate parse
 /// call, so its lifetime is bounded by the stack frame.
-fn new_mem_bio_readonly(data: &[u8]) -> Result<BioOwned, TlsError> {
+pub(super) fn new_mem_bio_readonly(data: &[u8]) -> Result<BioOwned, TlsError> {
     // SAFETY: BIO_new_mem_buf with len = -1 would treat `data` as a
     // C string; we always supply a positive length so the BIO sees
     // exactly `data.len()` bytes regardless of NUL content.
@@ -312,6 +603,26 @@ fn new_mem_bio_readonly(data: &[u8]) -> Result<BioOwned, TlsError> {
 // ============================================================================
 // PeerCertificate
 // ============================================================================
+
+/// A Subject Alternative Name entry, both for issuance
+/// (see [`crate::pki`]) and for matching peer certificates
+/// (see [`PeerCertificate::subject_alt_names`]).
+///
+/// RFC 6614 §2.3 mandates that RadSec leaf certificates carry a
+/// SAN with a `dNSName` and / or `iPAddress` identifying the peer.
+/// Per RFC 6125 §6.4.4 the Common Name in the Subject DN is
+/// deprecated for identity matching — consumers should always key
+/// off SAN entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubjectAltName {
+    /// `dNSName` SAN entry. The contained string is the literal
+    /// IA5/UTF-8 value as it appears in the certificate (no
+    /// case-folding, no IDNA processing).
+    Dns(String),
+    /// `iPAddress` SAN entry. RFC 5280 fixes the wire encoding at
+    /// 4 octets (IPv4) or 16 octets (IPv6).
+    Ip(IpAddr),
+}
 
 /// Owned view of the peer's leaf certificate.
 ///
@@ -346,51 +657,22 @@ impl PeerCertificate {
     ///
     /// Returns [`TlsError::Ssl`] if `i2d_X509` fails.
     pub fn to_der(&self) -> Result<Vec<u8>, TlsError> {
-        // SAFETY: passing a NULL out-pointer to i2d_X509 returns the
-        // required length without writing anything.
-        let len = unsafe { aws_lc_sys::i2d_X509(self.cert.0.as_ptr(), std::ptr::null_mut()) };
-        if len <= 0 {
-            return Err(TlsError::Ssl(pop_err("i2d_X509 length")));
-        }
-        let mut buf = vec![0u8; usize::try_from(len).expect("len > 0")];
-        let mut p = buf.as_mut_ptr();
-        // SAFETY: buf is at least `len` bytes; i2d_X509 will write
-        // exactly `len` bytes and advance the pointer. We do not
-        // re-read the advanced pointer after the call.
-        let written = unsafe { aws_lc_sys::i2d_X509(self.cert.0.as_ptr(), &mut p) };
-        if written != len {
-            return Err(TlsError::Ssl(pop_err("i2d_X509 write")));
-        }
-        Ok(buf)
+        self.cert.to_der()
     }
 
-    /// Subject DN as the OpenSSL one-line text representation
-    /// (`/CN=foo/O=bar`).
+    /// Subject DN rendered as the OpenSSL one-line text
+    /// representation (`/CN=foo/O=bar`).
+    ///
+    /// **Diagnostic use only.** This format is the legacy OpenSSL
+    /// rendering, not RFC 4514 LDAP DN form, and it is not safely
+    /// parseable: CN/O values may contain `/` and `=`. For
+    /// identity matching consult
+    /// [`subject_alt_names`](Self::subject_alt_names) (RFC 6125
+    /// §6.4.4 / RFC 6614 §2.3) or
+    /// [`spki_sha256`](Self::spki_sha256) instead.
     #[must_use]
-    pub fn subject(&self) -> String {
-        // SAFETY: cert is a valid X509*; X509_get_subject_name
-        // returns an interior pointer owned by the X509.
-        let name = unsafe { X509_get_subject_name(self.cert.0.as_ptr()) };
-        if name.is_null() {
-            return String::new();
-        }
-        let mut buf = [0u8; 512];
-        // SAFETY: passing buf+len. X509_NAME_oneline writes a
-        // NUL-terminated string up to buf_size bytes; with a
-        // non-null buf the return value points into our buffer.
-        let ptr = unsafe {
-            X509_NAME_oneline(
-                name,
-                buf.as_mut_ptr().cast::<std::os::raw::c_char>(),
-                c_int::try_from(buf.len()).unwrap_or(c_int::MAX),
-            )
-        };
-        if ptr.is_null() {
-            return String::new();
-        }
-        // SAFETY: ptr came from our buffer and is NUL-terminated.
-        let cstr = unsafe { CStr::from_ptr(ptr) };
-        cstr.to_string_lossy().into_owned()
+    pub fn subject_display(&self) -> String {
+        self.cert.subject_display()
     }
 
     /// SHA-256 hash of the SubjectPublicKeyInfo, the canonical
@@ -401,33 +683,23 @@ impl PeerCertificate {
     ///
     /// Returns [`TlsError::Ssl`] if `i2d_X509_PUBKEY` fails.
     pub fn spki_sha256(&self) -> Result<[u8; 32], TlsError> {
-        // SAFETY: X509_get_X509_PUBKEY returns an interior pointer
-        // (no ownership transfer).
-        let pubkey = unsafe { aws_lc_sys::X509_get_X509_PUBKEY(self.cert.0.as_ptr()) };
-        if pubkey.is_null() {
-            return Err(TlsError::Ssl(pop_err("X509_get_X509_PUBKEY")));
-        }
-        // SAFETY: NULL out-pointer => length query.
-        let len = unsafe { aws_lc_sys::i2d_X509_PUBKEY(pubkey, std::ptr::null_mut()) };
-        if len <= 0 {
-            return Err(TlsError::Ssl(pop_err("i2d_X509_PUBKEY length")));
-        }
-        let mut der = vec![0u8; usize::try_from(len).expect("len > 0")];
-        let mut p = der.as_mut_ptr();
-        // SAFETY: der has `len` bytes of capacity; i2d_X509_PUBKEY
-        // writes exactly `len` bytes and advances the pointer.
-        let written = unsafe { aws_lc_sys::i2d_X509_PUBKEY(pubkey, &mut p) };
-        if written != len {
-            return Err(TlsError::Ssl(pop_err("i2d_X509_PUBKEY write")));
-        }
-        let mut hash = [0u8; 32];
-        // SAFETY: SHA256() takes (data, len, out); out must be 32
-        // bytes; returns NULL only on internal allocation failure.
-        let r = unsafe { aws_lc_sys::SHA256(der.as_ptr(), der.len(), hash.as_mut_ptr()) };
-        if r.is_null() {
-            return Err(TlsError::Ssl(pop_err("SHA256")));
-        }
-        Ok(hash)
+        self.cert.spki_sha256()
+    }
+
+    /// Decode the leaf's `subjectAltName` extension into a list of
+    /// [`SubjectAltName`] entries. This is the recommended way to
+    /// identify a RadSec peer in cert-keyed mode (RFC 6125 §6.4.4
+    /// deprecates Common Name matching).
+    ///
+    /// Returns an empty vector when the certificate has no SAN
+    /// extension. Entries with types other than `dNSName` and
+    /// `iPAddress` are silently skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsError::Ssl`] if the underlying decode fails.
+    pub fn subject_alt_names(&self) -> Result<Vec<SubjectAltName>, TlsError> {
+        self.cert.subject_alt_names()
     }
 }
 
@@ -459,8 +731,13 @@ impl TlsContext {
     ///   bytes after if any).
     /// * `key_pem` — matching private key.
     /// * `client_ca_pem` — concatenated PEM of the root CAs allowed
-    ///   to issue *client* certificates. Empty / not-supplied means
-    ///   the listener trusts the platform default verify paths.
+    ///   to issue *client* certificates. Required: there is no
+    ///   system-CA fallback. RadSec listeners must own their trust
+    ///   anchors explicitly — a fallback to the platform store
+    ///   would silently let any publicly-issued certificate pass
+    ///   libssl's chain check, leaving cert-keyed authorization
+    ///   relying entirely on the consumer's `lookup_radsec_by_cert`
+    ///   to spot a spoofed Subject / SAN.
     ///
     /// Mutual TLS is mandatory (`SSL_VERIFY_PEER |
     /// SSL_VERIFY_FAIL_IF_NO_PEER_CERT`); chain validation is
@@ -472,11 +749,12 @@ impl TlsContext {
     /// # Errors
     ///
     /// Returns [`TlsError`] for any libssl init / parse / mismatch
-    /// failure.
+    /// failure, or [`TlsError::Pem`] if `client_ca_pem` decodes to
+    /// no certificates.
     pub fn server(
         cert_chain_pem: &[u8],
         key_pem: &[u8],
-        client_ca_pem: Option<&[u8]>,
+        client_ca_pem: &[u8],
     ) -> Result<Self, TlsError> {
         // SAFETY: TLS_server_method returns a pointer to a static
         // SSL_METHOD, never NULL.
@@ -503,8 +781,8 @@ impl TlsContext {
         }
 
         // Parse cert + key, install both, then verify the pair.
-        let cert = parse_pem_cert(cert_chain_pem)?;
-        let key = parse_pem_key(key_pem)?;
+        let cert = X509Owned::from_pem(cert_chain_pem)?;
+        let key = EvpPkeyOwned::from_pem(key_pem)?;
         // SAFETY: ctx and cert/key are valid; functions take an
         // additional reference internally so our owners stay valid.
         let r = unsafe { SSL_CTX_use_certificate(ctx.0.as_ptr(), cert.0.as_ptr()) };
@@ -525,21 +803,10 @@ impl TlsContext {
         drop(cert);
         drop(key);
 
-        // Trust anchors for the *client* certs.
-        if let Some(pem) = client_ca_pem {
-            install_client_cas(&ctx, pem)?;
-        } else {
-            // Fall back to the platform's default verify paths so
-            // tests on a host with system CAs still get a workable
-            // store. RadSec deployments will always supply
-            // `client_ca_pem`.
-            //
-            // SAFETY: ctx is valid; function returns 1 on success.
-            let r = unsafe { SSL_CTX_set_default_verify_paths(ctx.0.as_ptr()) };
-            if r != 1 {
-                return Err(TlsError::Ssl(pop_err("SSL_CTX_set_default_verify_paths")));
-            }
-        }
+        // Trust anchors for the *client* certs. Required — see
+        // the doc comment on `server()` for why we don't fall back
+        // to the platform store.
+        install_client_cas(&ctx, client_ca_pem)?;
 
         // Mandatory mTLS for RadSec: peer MUST present a cert and
         // its chain MUST validate against the configured trust

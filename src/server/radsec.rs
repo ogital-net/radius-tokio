@@ -331,7 +331,7 @@ where
                 warn_!(
                     event = "radsec_cert_lookup_reject",
                     %peer,
-                    subject = %peer_cert.subject(),
+                    subject = %peer_cert.subject_display(),
                 );
                 count!(
                     "radius_tokio.radsec_cert_lookup_failures",
@@ -915,12 +915,8 @@ mod tests {
         let addr = probe.local_addr().unwrap();
         drop(probe);
 
-        let server_ctx = TlsContext::server(
-            &pki.server_chain_pem,
-            &pki.server_key_pem,
-            Some(&pki.ca_pem),
-        )
-        .unwrap();
+        let server_ctx =
+            TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, &pki.ca_pem).unwrap();
         let store = StaticClients::builder()
             .add(
                 IpCidr::host(Ipv4Addr::LOCALHOST.into()),
@@ -983,12 +979,9 @@ mod tests {
         let addr = probe.local_addr().unwrap();
         drop(probe);
 
-        let server_ctx = TlsContext::server(
-            &pki_a.server_chain_pem,
-            &pki_a.server_key_pem,
-            Some(&combined_ca),
-        )
-        .unwrap();
+        let server_ctx =
+            TlsContext::server(&pki_a.server_chain_pem, &pki_a.server_key_pem, &combined_ca)
+                .unwrap();
 
         let trust_a = crate::tls::ClientTrust::from_pem(&pki_a.ca_pem).unwrap();
         let client_record =
@@ -1093,7 +1086,7 @@ mod tests {
             &self,
             peer: &crate::tls::PeerCertificate,
         ) -> impl std::future::Future<Output = Option<Arc<Client>>> + Send {
-            let subject = peer.subject();
+            let subject = peer.subject_display();
             let hit = self
                 .entries
                 .iter()
@@ -1116,12 +1109,8 @@ mod tests {
         let addr = probe.local_addr().unwrap();
         drop(probe);
 
-        let server_ctx = TlsContext::server(
-            &pki.server_chain_pem,
-            &pki.server_key_pem,
-            Some(&pki.ca_pem),
-        )
-        .unwrap();
+        let server_ctx =
+            TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, &pki.ca_pem).unwrap();
         let server = Server::builder()
             .clients(store)
             .handler(AcceptAll)
@@ -1175,12 +1164,8 @@ mod tests {
         let addr = probe.local_addr().unwrap();
         drop(probe);
 
-        let server_ctx = TlsContext::server(
-            &pki.server_chain_pem,
-            &pki.server_key_pem,
-            Some(&pki.ca_pem),
-        )
-        .unwrap();
+        let server_ctx =
+            TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, &pki.ca_pem).unwrap();
         let server = Server::builder()
             .clients(store)
             .handler(AcceptAll)
@@ -1235,12 +1220,8 @@ mod tests {
         let addr = probe.local_addr().unwrap();
         drop(probe);
 
-        let server_ctx = TlsContext::server(
-            &pki.server_chain_pem,
-            &pki.server_key_pem,
-            Some(&pki.ca_pem),
-        )
-        .unwrap();
+        let server_ctx =
+            TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, &pki.ca_pem).unwrap();
         let server = Server::builder()
             .clients(store)
             .handler(AcceptAll)

@@ -192,7 +192,7 @@ let nas = ca.issue_client(
 )?;
 
 // `server.chain_pem` + `server.key_pem` go to TlsContext::server;
-// `nas.chain_pem` + `nas.key_pem` + `ca.cert_pem()` go to the NAS.
+// `nas.chain_pem` + `nas.key_pem` + `ca.cert_pem()?` go to the NAS.
 # Ok(())
 # }
 ```

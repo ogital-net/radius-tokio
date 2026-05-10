@@ -52,12 +52,8 @@ fn drive(server: &mut TlsConnection, client: &mut client_side::ClientSsl) -> Res
 #[test]
 fn handshake_succeeds_with_valid_chain() {
     let pki = build_pki();
-    let server_ctx = TlsContext::server(
-        &pki.server_chain_pem,
-        &pki.server_key_pem,
-        Some(&pki.ca_pem),
-    )
-    .expect("build server ctx");
+    let server_ctx = TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, &pki.ca_pem)
+        .expect("build server ctx");
     let mut server = TlsConnection::accept(&server_ctx).expect("accept");
     let mut client = client_side::builder(&pki.ca_pem)
         .unwrap()
@@ -72,12 +68,8 @@ fn handshake_succeeds_with_valid_chain() {
 #[test]
 fn peer_certificate_exposes_subject_der_and_spki() {
     let pki = build_pki();
-    let server_ctx = TlsContext::server(
-        &pki.server_chain_pem,
-        &pki.server_key_pem,
-        Some(&pki.ca_pem),
-    )
-    .unwrap();
+    let server_ctx =
+        TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, &pki.ca_pem).unwrap();
     let mut server = TlsConnection::accept(&server_ctx).unwrap();
     let mut client = client_side::builder(&pki.ca_pem)
         .unwrap()
@@ -89,22 +81,28 @@ fn peer_certificate_exposes_subject_der_and_spki() {
     // Cert-keyed authorization path: the consumer inspects the peer
     // leaf and decides what to do.
     let peer = server.peer_certificate().expect("peer cert present");
-    assert!(peer.subject().contains("nas-1"), "got: {}", peer.subject());
+    assert!(
+        peer.subject_display().contains("nas-1"),
+        "got: {}",
+        peer.subject_display()
+    );
     let der = peer.to_der().unwrap();
     assert!(!der.is_empty());
     let spki = peer.spki_sha256().unwrap();
     assert_ne!(spki, [0u8; 32]);
+    let sans = peer.subject_alt_names().unwrap();
+    assert!(
+        sans.iter()
+            .any(|s| matches!(s, super::SubjectAltName::Dns(d) if d == "nas-1")),
+        "expected DNS SAN nas-1, got: {sans:?}"
+    );
 }
 
 #[test]
 fn handshake_fails_without_client_cert() {
     let pki = build_pki();
-    let server_ctx = TlsContext::server(
-        &pki.server_chain_pem,
-        &pki.server_key_pem,
-        Some(&pki.ca_pem),
-    )
-    .unwrap();
+    let server_ctx =
+        TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, &pki.ca_pem).unwrap();
     let mut server = TlsConnection::accept(&server_ctx).unwrap();
     let mut client = client_side::builder(&pki.ca_pem).unwrap().build().unwrap();
     let result = drive(&mut server, &mut client);
@@ -119,7 +117,7 @@ fn handshake_fails_for_untrusted_client_chain() {
     let server_ctx = TlsContext::server(
         &trusted.server_chain_pem,
         &trusted.server_key_pem,
-        Some(&trusted.ca_pem),
+        &trusted.ca_pem,
     )
     .unwrap();
     let mut server = TlsConnection::accept(&server_ctx).unwrap();
@@ -139,11 +137,7 @@ fn handshake_fails_for_untrusted_client_chain() {
 fn cert_key_mismatch_is_detected() {
     let pki = build_pki();
     // Pair the server cert with the *client*'s key — must mismatch.
-    let result = TlsContext::server(
-        &pki.server_chain_pem,
-        &pki.client_key_pem,
-        Some(&pki.ca_pem),
-    );
+    let result = TlsContext::server(&pki.server_chain_pem, &pki.client_key_pem, &pki.ca_pem);
     // Detected either by `SSL_CTX_use_PrivateKey` directly (Ssl)
     // or by the explicit follow-up check (KeyMismatch). Either is
     // correct behaviour.
@@ -156,7 +150,7 @@ fn cert_key_mismatch_is_detected() {
 #[test]
 fn malformed_cert_pem_surfaces_error() {
     let pki = build_pki();
-    let result = TlsContext::server(b"not a pem block", &pki.server_key_pem, Some(&pki.ca_pem));
+    let result = TlsContext::server(b"not a pem block", &pki.server_key_pem, &pki.ca_pem);
     assert!(matches!(result, Err(TlsError::Pem(_))));
 }
 
@@ -167,12 +161,8 @@ fn drop_cleanliness_smoke() {
     // would catch it in CI.
     let pki = build_pki();
     for _ in 0..32 {
-        let ctx = TlsContext::server(
-            &pki.server_chain_pem,
-            &pki.server_key_pem,
-            Some(&pki.ca_pem),
-        )
-        .unwrap();
+        let ctx =
+            TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, &pki.ca_pem).unwrap();
         let _ = TlsConnection::accept(&ctx).unwrap();
     }
 }
@@ -184,12 +174,8 @@ fn per_connection_trust_accepts_matching_client_cert() {
     let pki_a = build_pki();
     let pki_b = build_pki();
     let combined_ca: Vec<u8> = [pki_a.ca_pem.as_slice(), pki_b.ca_pem.as_slice()].concat();
-    let server_ctx = TlsContext::server(
-        &pki_a.server_chain_pem,
-        &pki_a.server_key_pem,
-        Some(&combined_ca),
-    )
-    .unwrap();
+    let server_ctx =
+        TlsContext::server(&pki_a.server_chain_pem, &pki_a.server_key_pem, &combined_ca).unwrap();
     let mut server = TlsConnection::accept(&server_ctx).unwrap();
     let trust_a = ClientTrust::from_pem(&pki_a.ca_pem).unwrap();
     server.set_client_trust(&trust_a).unwrap();
@@ -213,12 +199,8 @@ fn per_connection_trust_rejects_other_ca_client_cert() {
     let pki_a = build_pki();
     let pki_b = build_pki();
     let combined_ca: Vec<u8> = [pki_a.ca_pem.as_slice(), pki_b.ca_pem.as_slice()].concat();
-    let server_ctx = TlsContext::server(
-        &pki_a.server_chain_pem,
-        &pki_a.server_key_pem,
-        Some(&combined_ca),
-    )
-    .unwrap();
+    let server_ctx =
+        TlsContext::server(&pki_a.server_chain_pem, &pki_a.server_key_pem, &combined_ca).unwrap();
     let mut server = TlsConnection::accept(&server_ctx).unwrap();
     let trust_a = ClientTrust::from_pem(&pki_a.ca_pem).unwrap();
     server.set_client_trust(&trust_a).unwrap();
