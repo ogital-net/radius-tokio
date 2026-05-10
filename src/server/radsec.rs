@@ -585,7 +585,39 @@ async fn process_frame<H: Handler>(
         _ => header.authenticator,
     };
     match message_authenticator::verify(datagram, &ma_substitute, client.secret()) {
-        Verification::Valid | Verification::Absent => {}
+        Verification::Valid => {}
+        Verification::Absent => {
+            // RFC 5080 §2.2.2 / RFC 3579 §3.2: Access-Request
+            // packets must carry Message-Authenticator if the
+            // operator has opted in to the strict policy
+            // (default — see [`Client::require_message_authenticator`]).
+            // Accounting / CoA / Disconnect are exempt; see
+            // the matching block in `server::udp` for the
+            // reasoning. On RadSec a missing-MA inside an
+            // authenticated TLS session is still a teardown
+            // condition under strict policy: it indicates a
+            // misconfigured peer that should be reconciled
+            // before more frames flow.
+            let strict_code = matches!(header.code, Code::ACCESS_REQUEST);
+            if strict_code && client.require_message_authenticator() {
+                warn_!(
+                    event = "radsec_drop",
+                    reason = "missing_message_authenticator",
+                    %peer,
+                    client = ?client.id(),
+                    code = header.code.0,
+                    id = header.identifier,
+                );
+                count!(
+                    "radius_tokio.packets_dropped",
+                    "reason" => "missing_message_authenticator"
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing message authenticator",
+                ));
+            }
+        }
         Verification::Invalid => {
             warn_!(
                 event = "radsec_drop",

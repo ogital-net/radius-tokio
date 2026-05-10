@@ -181,7 +181,34 @@ async fn inspect_and_dispatch<S, H>(
         _ => header.authenticator,
     };
     match message_authenticator::verify(datagram, &ma_substitute, client.secret()) {
-        Verification::Valid | Verification::Absent => {}
+        Verification::Valid => {}
+        Verification::Absent => {
+            // RFC 5080 §2.2.2 / RFC 3579 §3.2: Access-Request
+            // packets must carry Message-Authenticator if the
+            // operator has opted in to the strict policy (which
+            // is the default — see [`Client::require_message_authenticator`]).
+            // Accounting-Request / CoA-Request / Disconnect-Request
+            // are exempt: they authenticate via the Request
+            // Authenticator over the packet body and have never
+            // been required to carry M-A; forcing it would break
+            // the installed base for no security gain.
+            let strict_code = matches!(header.code, Code::ACCESS_REQUEST);
+            if strict_code && client.require_message_authenticator() {
+                warn_!(
+                    event = "drop",
+                    reason = "missing_message_authenticator",
+                    %src,
+                    client = ?client.id(),
+                    code = header.code.0,
+                    id = header.identifier,
+                );
+                count!(
+                    "radius_tokio.packets_dropped",
+                    "reason" => "missing_message_authenticator"
+                );
+                return;
+            }
+        }
         Verification::Invalid => {
             warn_!(
                 event = "drop",
@@ -396,6 +423,19 @@ mod tests {
         let tag = message_authenticator::compute(buf.as_bytes(), &req_auth, secret);
         message_authenticator::patch(&mut buf, value_off, &tag);
         (req_auth, buf.as_bytes().to_vec())
+    }
+
+    /// Same shape as [`build_access_request`] but **without** a
+    /// Message-Authenticator attribute. Models a legacy NAS that
+    /// predates RFC 5080 §2.2.2 hardening.
+    fn build_access_request_no_ma(identifier: u8) -> ([u8; 16], Vec<u8>) {
+        let req_auth = authenticator::random_request_authenticator();
+        let mut pkt = vec![Code::ACCESS_REQUEST.0, identifier, 0, 0];
+        pkt.extend_from_slice(&req_auth);
+        pkt.extend_from_slice(&[1, 7, b'a', b'l', b'i', b'c', b'e']);
+        let len = u16::try_from(pkt.len()).unwrap();
+        pkt[2..4].copy_from_slice(&len.to_be_bytes());
+        (req_auth, pkt)
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -711,5 +751,130 @@ mod tests {
             "expected WARN drop event, got {:?}",
             sink.snapshot(),
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn strict_client_drops_access_request_missing_message_authenticator() {
+        // Default `Client::new(...)` requires Message-Authenticator
+        // on Access-Request. A legacy-shaped packet (no M-A slot)
+        // must be dropped without a reply.
+        let (server_sock, server_addr) = bind_loopback().await;
+        let secret = b"shared".to_vec();
+        let client = Arc::new(Client::new(secret.as_slice()));
+        let store = Arc::new(
+            StaticClients::builder()
+                .add(
+                    IpCidr::host(Ipv4Addr::LOCALHOST.into()),
+                    Arc::clone(&client),
+                )
+                .build(),
+        );
+        let handler = Arc::new(AcceptCounter {
+            calls: Mutex::new(0),
+        });
+        let cache = Arc::new(DedupCache::new(DEFAULT_DEDUP_TTL));
+        let (tx, rx) = watch::channel(false);
+        let server = tokio::spawn(serve_udp(server_sock, store, handler, cache, rx));
+
+        let client_sock = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let (_, datagram) = build_access_request_no_ma(3);
+        client_sock.send_to(&datagram, server_addr).await.unwrap();
+
+        let mut buf = vec![0u8; MAX_PACKET_LEN];
+        let res =
+            tokio::time::timeout(Duration::from_millis(150), client_sock.recv_from(&mut buf)).await;
+        assert!(res.is_err(), "strict client must drop missing-MA request");
+
+        tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_client_accepts_access_request_missing_message_authenticator() {
+        // Opt-out flag set: the same legacy-shaped packet now
+        // round-trips to Access-Accept.
+        let (server_sock, server_addr) = bind_loopback().await;
+        let secret = b"shared".to_vec();
+        let client = Arc::new(Client::new(secret.as_slice()).allow_missing_message_authenticator());
+        let store = Arc::new(
+            StaticClients::builder()
+                .add(
+                    IpCidr::host(Ipv4Addr::LOCALHOST.into()),
+                    Arc::clone(&client),
+                )
+                .build(),
+        );
+        let handler = Arc::new(AcceptCounter {
+            calls: Mutex::new(0),
+        });
+        let cache = Arc::new(DedupCache::new(DEFAULT_DEDUP_TTL));
+        let (tx, rx) = watch::channel(false);
+        let server = tokio::spawn(serve_udp(
+            server_sock,
+            store,
+            Arc::clone(&handler),
+            cache,
+            rx,
+        ));
+
+        let client_sock = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let (req_auth, datagram) = build_access_request_no_ma(4);
+        client_sock.send_to(&datagram, server_addr).await.unwrap();
+
+        let mut buf = vec![0u8; MAX_PACKET_LEN];
+        let (len, _) =
+            tokio::time::timeout(Duration::from_secs(1), client_sock.recv_from(&mut buf))
+                .await
+                .expect("legacy-mode client must receive a reply")
+                .unwrap();
+        let reply = &buf[..len];
+        let (header, _) = Header::parse(reply).unwrap();
+        assert_eq!(header.code, Code::ACCESS_ACCEPT);
+        assert_eq!(header.identifier, 4);
+        assert!(authenticator::verify_response(reply, &req_auth, &secret));
+        assert_eq!(*handler.calls.lock().unwrap(), 1);
+
+        tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_client_still_drops_invalid_message_authenticator() {
+        // The opt-out only relaxes the *Absent* case. A *present*
+        // M-A with the wrong tag must still be discarded — RFC
+        // 3579 §3.2 leaves no room there.
+        let (server_sock, server_addr) = bind_loopback().await;
+        let secret = b"shared".to_vec();
+        let client = Arc::new(Client::new(secret.as_slice()).allow_missing_message_authenticator());
+        let store = Arc::new(
+            StaticClients::builder()
+                .add(
+                    IpCidr::host(Ipv4Addr::LOCALHOST.into()),
+                    Arc::clone(&client),
+                )
+                .build(),
+        );
+        let handler = Arc::new(AcceptCounter {
+            calls: Mutex::new(0),
+        });
+        let cache = Arc::new(DedupCache::new(DEFAULT_DEDUP_TTL));
+        let (tx, rx) = watch::channel(false);
+        let server = tokio::spawn(serve_udp(server_sock, store, handler, cache, rx));
+
+        let client_sock = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        // Build a properly-MA'd request, then corrupt the tag's
+        // last byte.
+        let (_, mut datagram) = build_access_request(5, &secret);
+        let last = datagram.len() - 1;
+        datagram[last] ^= 0xFF;
+        client_sock.send_to(&datagram, server_addr).await.unwrap();
+
+        let mut buf = vec![0u8; MAX_PACKET_LEN];
+        let res =
+            tokio::time::timeout(Duration::from_millis(150), client_sock.recv_from(&mut buf)).await;
+        assert!(res.is_err(), "invalid MA must always be dropped");
+
+        tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
     }
 }

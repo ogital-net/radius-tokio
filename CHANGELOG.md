@@ -17,8 +17,29 @@ and deprecation precedes removal by at least one minor release.
 
 ## [Unreleased]
 
+### Security
+
+- **Message-Authenticator now required by default on Access-Request
+  packets.** Inbound Access-Request packets that omit RFC 3579 §3.2
+  Message-Authenticator are dropped before dispatch, closing the
+  default exposure to the `BlastRADIUS` family of attacks
+  (CVE-2024-3596). The policy is per-`Client` and defaults to
+  strict; legacy NAS firmware that cannot emit the attribute can be
+  opted out one device at a time via
+  `Client::allow_missing_message_authenticator()`. The verbose
+  method name is deliberate — flipping the bit should be a
+  conscious, audit-visible act. Accounting / CoA / Disconnect
+  packets are unaffected (they authenticate via the Request
+  Authenticator and have never been required to carry M-A).
+  Listeners emit a `tracing` warn event and a
+  `radius_tokio.packets_dropped{reason="missing_message_authenticator"}`
+  metric on each drop.
+
 ### Added
 
+- `Client::require_message_authenticator()` accessor and
+  `Client::allow_missing_message_authenticator()` builder method
+  (see Security note above).
 - **PKI helpers (`radius_tokio::pki`, gated on `radsec`).** Sensible-
   defaults wrappers over `aws-lc-sys` for spinning up a private CA
   and issuing RadSec server / client leaves with RFC 5280 §4.2 +
@@ -26,6 +47,21 @@ and deprecation precedes removal by at least one minor release.
   random serial, correct EKU / KU / BasicConstraints / SAN / SKI /
   AKI). Reduces the from-zero-to-working-RadSec friction without
   pulling in a third-party PKI library.
+- `PeerCertificate::matches_hostname(name, allow_common_name)`
+  implementing RFC 6125 §6.4.3 (SAN dNSName preferred, leftmost-
+  label wildcards, IP-literal expectations matched against
+  iPAddress SANs) and §6.4.4 (CN consulted only when no DNS SAN
+  exists *and* the caller opts in). The `mixed_udp_radsec` example
+  and `radsec_e2e` integration test both consume it.
+
+### Changed
+
+- **Behaviour change**: deployments that previously relied on the
+  permissive Message-Authenticator default and have NAS devices
+  which do not emit the attribute on Access-Request will now drop
+  those packets. Migration: call
+  `.allow_missing_message_authenticator()` on the affected
+  `Client` records.
 
 ### Removed
 

@@ -109,15 +109,23 @@ impl fmt::Debug for SecretBytes {
 pub struct Client {
     id: ClientId,
     secret: SecretBytes,
+    require_message_authenticator: bool,
 }
 
 impl Client {
     /// Build a client with just the shared secret.
+    ///
+    /// Defaults to **requiring** Message-Authenticator (RFC 3579
+    /// §3.2) on inbound Access-Request packets — the
+    /// `BlastRADIUS`-safe (CVE-2024-3596) posture. Use
+    /// [`Self::allow_missing_message_authenticator`] to opt out
+    /// for legacy NAS firmware that cannot emit the attribute.
     #[must_use]
     pub fn new(secret: impl Into<SecretBytes>) -> Self {
         Self {
             id: ClientId::new(),
             secret: secret.into(),
+            require_message_authenticator: true,
         }
     }
 
@@ -132,6 +140,44 @@ impl Client {
     #[must_use]
     pub fn secret(&self) -> &[u8] {
         self.secret.as_bytes()
+    }
+
+    /// Whether the listener should drop inbound Access-Request
+    /// packets from this client that omit Message-Authenticator
+    /// (RFC 3579 §3.2). Defaults to `true`.
+    ///
+    /// The flag governs *only* the `Absent` case. A *present* but
+    /// invalid Message-Authenticator is always rejected, regardless
+    /// of this setting — RFC 3579 §3.2 leaves no room there.
+    ///
+    /// Accounting-Request packets (RFC 2866) are not affected: they
+    /// authenticate via the Request Authenticator over the packet
+    /// body and have never been required to carry
+    /// Message-Authenticator. Forcing it would break essentially
+    /// every NAS in the field for no security gain.
+    #[must_use]
+    pub fn require_message_authenticator(&self) -> bool {
+        self.require_message_authenticator
+    }
+
+    /// Permit Access-Request packets from this client that omit
+    /// Message-Authenticator.
+    ///
+    /// **Insecure.** Without Message-Authenticator the packet is
+    /// authenticated only by `MD5(packet || secret)`, which is the
+    /// exact construction the `BlastRADIUS` family of attacks
+    /// (CVE-2024-3596) targets. Enable only for a specific NAS
+    /// whose firmware cannot be updated to emit the attribute, and
+    /// keep its blast radius narrow — the flag is per-`Client`
+    /// precisely so a single legacy device does not weaken the
+    /// rest of the deployment.
+    ///
+    /// The verbose method name is deliberate; flipping this bit
+    /// should be a conscious, audit-visible act.
+    #[must_use]
+    pub fn allow_missing_message_authenticator(mut self) -> Self {
+        self.require_message_authenticator = false;
+        self
     }
 }
 
@@ -166,5 +212,17 @@ mod tests {
         assert_eq!(s.as_bytes(), b"abcd");
         let s2: SecretBytes = (&[1u8, 2, 3, 4, 5]).into();
         assert_eq!(s2.as_bytes(), &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn require_message_authenticator_defaults_true() {
+        let c = Client::new(b"secret".as_slice());
+        assert!(c.require_message_authenticator());
+    }
+
+    #[test]
+    fn allow_missing_message_authenticator_clears_flag() {
+        let c = Client::new(b"secret".as_slice()).allow_missing_message_authenticator();
+        assert!(!c.require_message_authenticator());
     }
 }
