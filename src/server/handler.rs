@@ -216,6 +216,38 @@ impl<'a> Request<'a> {
     pub fn reply_with_capacity(&self, code: Code, capacity: usize) -> Reply {
         Reply::with_capacity(code, self.identifier, capacity)
     }
+
+    /// Append a `Tunnel-Password` attribute (RFC 2868 §3.5) to `reply`,
+    /// using this request's authenticator and shared secret as the
+    /// encryption material.
+    ///
+    /// This is a convenience wrapper around [`Reply::add_tunnel_password`]
+    /// that removes the need to thread `request.authenticator()` and
+    /// `request.client().secret()` through the call site:
+    ///
+    /// ```ignore
+    /// let mut reply = request.reply(Code::ACCESS_ACCEPT);
+    /// request.add_tunnel_password(&mut reply, 0x01, b"vlan42-psk")?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Forwards every [`CodecError`] from [`Reply::add_tunnel_password`],
+    /// including [`CodecError::WrongPacketType`] when `reply` is not an
+    /// `Access-Accept`.
+    ///
+    /// [`CodecError`]: crate::CodecError
+    /// [`CodecError::WrongPacketType`]: crate::CodecError::WrongPacketType
+    pub fn add_tunnel_password(
+        &self,
+        reply: &mut Reply,
+        tag: u8,
+        password: &[u8],
+    ) -> Result<(), crate::CodecError> {
+        reply
+            .add_tunnel_password(tag, password, self.authenticator(), self.client().secret())
+            .map(|_| ())
+    }
 }
 
 /// Consumer-supplied request handler.
@@ -270,5 +302,58 @@ mod tests {
         let raw = req.first_raw(1).unwrap().expect("present");
         assert_eq!(raw.value(), b"alice");
         assert!(req.first_raw(99).unwrap().is_none());
+    }
+
+    #[test]
+    fn add_tunnel_password_convenience_roundtrip() {
+        let secret = b"shared";
+        let req_auth = [0x55u8; 16];
+        let password = b"vlan42-psk";
+
+        let client = Arc::new(Client::new(secret.as_slice()));
+        let req = Request::new(
+            Code::ACCESS_REQUEST,
+            7,
+            req_auth,
+            &[],
+            &client,
+            "127.0.0.1:1812".parse().unwrap(),
+        );
+
+        let mut reply = req.reply(Code::ACCESS_ACCEPT);
+        req.add_tunnel_password(&mut reply, 0x01, password)
+            .expect("ok");
+
+        let pkt = reply.seal_for(&req_auth, secret);
+        // Tunnel-Password (type 69) is present.
+        let attr = crate::codec::attributes::iter(pkt.attributes())
+            .filter_map(std::result::Result::ok)
+            .find(|r| r.attribute_type() == 69)
+            .expect("Tunnel-Password present");
+
+        let val = attr.value();
+        let salt = [val[1], val[2]];
+        let pt =
+            crate::crypto::password::tunnel_password_decrypt(&val[3..], secret, &req_auth, salt)
+                .expect("decrypt");
+        assert_eq!(pt.as_bytes(), password);
+    }
+
+    #[test]
+    fn add_tunnel_password_convenience_rejects_non_accept() {
+        let client = Arc::new(Client::new(b"s".as_slice()));
+        let req = Request::new(
+            Code::ACCESS_REQUEST,
+            1,
+            [0; 16],
+            &[],
+            &client,
+            "127.0.0.1:1812".parse().unwrap(),
+        );
+        let mut reply = req.reply(Code::ACCESS_REJECT);
+        assert_eq!(
+            req.add_tunnel_password(&mut reply, 0, b"x"),
+            Err(crate::CodecError::WrongPacketType),
+        );
     }
 }

@@ -92,6 +92,11 @@ pub enum CodecError {
         /// Length of the value the caller passed in.
         len: usize,
     },
+    /// The attribute is not permitted in a packet of this code.
+    ///
+    /// For example, `Tunnel-Password` (RFC 2868 §3.5) may only appear
+    /// in an `Access-Accept` packet.
+    WrongPacketType,
 }
 
 impl std::fmt::Display for CodecError {
@@ -105,6 +110,9 @@ impl std::fmt::Display for CodecError {
                 f,
                 "attribute value of {len} bytes exceeds the {MAX_ATTRIBUTE_VALUE_LEN}-byte limit",
             ),
+            CodecError::WrongPacketType => {
+                f.write_str("attribute not permitted in a packet of this type")
+            }
         }
     }
 }

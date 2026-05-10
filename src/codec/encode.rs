@@ -28,6 +28,17 @@ use super::header::Code;
 use super::typed::{Attr, IntoWire, VsaAttr, WireType};
 use super::{authenticator, message_authenticator, CodecError, PacketBuffer};
 
+/// Attribute type code for `Tunnel-Password` (RFC 2868 §3.5).
+const TUNNEL_PASSWORD_TYPE: u8 = 69;
+
+/// Maximum plaintext length for a `Tunnel-Password` attribute (RFC 2868 §3.5).
+///
+/// The 1-byte length prefix + up to 239 password bytes fits within one
+/// 16-byte-aligned ciphertext block sequence of ≤ 240 bytes. Combined with
+/// the 1-byte tag and 2-byte salt, the total attribute value is ≤ 243 bytes,
+/// which is within the 253-byte attribute value limit.
+const TUNNEL_PASSWORD_MAX_LEN: usize = 239;
+
 /// Builder for an outbound reply.
 #[derive(Debug)]
 pub struct Reply {
@@ -202,6 +213,63 @@ impl Reply {
         Ok(self)
     }
 
+    /// Append a `Tunnel-Password` attribute (RFC 2868 §3.5) with automatic
+    /// encryption.
+    ///
+    /// The library generates a fresh random 2-byte salt (with the MSB of the
+    /// first byte set, as required by RFC 2868 §3.5) and encrypts `password`
+    /// using the Tunnel-Password scheme before appending the result as
+    /// attribute type 69. Callers supply the plaintext password and the
+    /// encryption material from the corresponding request; no manual cipher
+    /// work is required.
+    ///
+    /// Wire layout of the appended attribute value:
+    /// `tag (1 byte) || salt (2 bytes) || ciphertext (N × 16 bytes)`
+    ///
+    /// # Arguments
+    ///
+    /// - `tag` — tunnel tag byte. `0x00` means untagged; `0x01`–`0x1F`
+    ///   identify tunnels 1–31 (RFC 2868 §3.1).
+    /// - `password` — plaintext tunnel secret (at most 239 bytes).
+    /// - `request_authenticator` — the 16-byte Request Authenticator from the
+    ///   corresponding Access-Request, used as the encryption seed per
+    ///   RFC 2868 §3.5.
+    /// - `secret` — the shared secret for this client.
+    ///
+    /// # Errors
+    ///
+    /// - [`CodecError::AttributeValueTooLong`] — `password` exceeds 239 bytes.
+    /// - [`CodecError::PacketTooLarge`] — the encrypted attribute would push
+    ///   the packet past 4 096 bytes.
+    pub fn add_tunnel_password(
+        &mut self,
+        tag: u8,
+        password: &[u8],
+        request_authenticator: &[u8; 16],
+        secret: &[u8],
+    ) -> Result<&mut Self, CodecError> {
+        // RFC 2868 §3.5: Tunnel-Password may only be included in an Access-Accept.
+        if self.buf.header().code != Code::ACCESS_ACCEPT {
+            return Err(CodecError::WrongPacketType);
+        }
+        if password.len() > TUNNEL_PASSWORD_MAX_LEN {
+            return Err(CodecError::AttributeValueTooLong {
+                len: password.len(),
+            });
+        }
+        let (salt, ciphertext) = crate::crypto::password::tunnel_password_encrypt(
+            password,
+            secret,
+            request_authenticator,
+        );
+        // Wire value: tag(1) || salt(2) || ciphertext(n × 16)
+        let mut value = Vec::with_capacity(3 + ciphertext.len());
+        value.push(tag);
+        value.extend_from_slice(&salt);
+        value.extend_from_slice(&ciphertext);
+        self.add_attribute(TUNNEL_PASSWORD_TYPE, &value)
+    }
+
     /// Finalize the reply against the matching request's Authenticator
     /// and the shared secret.
     ///
@@ -298,6 +366,82 @@ mod tests {
             .map(|r| r.unwrap().attribute_type())
             .collect();
         assert_eq!(attrs, vec![18]);
+    }
+
+    #[test]
+    fn add_tunnel_password_encrypts_and_roundtrips() {
+        let secret = b"shared";
+        let req_auth = [0x55u8; 16];
+        let password = b"tunnel-secret";
+        let tag = 0x01;
+
+        let mut reply = Reply::new(Code::ACCESS_ACCEPT, 1);
+        reply
+            .add_tunnel_password(tag, password, &req_auth, secret)
+            .unwrap();
+        let pkt = reply.seal_for(&req_auth, secret);
+
+        // Locate the Tunnel-Password attribute (type 69).
+        let attr = attributes::iter(pkt.attributes())
+            .filter_map(|r| r.ok())
+            .find(|r| r.attribute_type() == TUNNEL_PASSWORD_TYPE)
+            .expect("Tunnel-Password attribute present");
+
+        let val = attr.value();
+        // Minimum: tag(1) + salt(2) + one 16-byte ciphertext block = 19.
+        assert!(val.len() >= 3 + 16, "value too short: {} bytes", val.len());
+        assert_eq!(val[0], tag, "tag byte preserved");
+        assert!(val[1] & 0x80 != 0, "salt MSB must be set per RFC 2868 §3.5");
+
+        // Decrypt and verify plaintext.
+        let salt = [val[1], val[2]];
+        let ciphertext = &val[3..];
+        let plaintext =
+            crate::crypto::password::tunnel_password_decrypt(ciphertext, secret, &req_auth, salt)
+                .expect("decrypt");
+        assert_eq!(plaintext.as_bytes(), password);
+    }
+
+    #[test]
+    fn add_tunnel_password_untagged() {
+        // tag 0 (untagged) must work identically.
+        let secret = b"s3cr3t";
+        let req_auth = [0u8; 16];
+        let mut reply = Reply::new(Code::ACCESS_ACCEPT, 2);
+        reply
+            .add_tunnel_password(0, b"pass", &req_auth, secret)
+            .unwrap();
+        let pkt = reply.seal_for(&req_auth, secret);
+        let attr = attributes::iter(pkt.attributes())
+            .filter_map(|r| r.ok())
+            .find(|r| r.attribute_type() == TUNNEL_PASSWORD_TYPE)
+            .expect("present");
+        assert_eq!(attr.value()[0], 0u8, "tag byte is 0");
+    }
+
+    #[test]
+    fn add_tunnel_password_too_long_is_error() {
+        let mut reply = Reply::new(Code::ACCESS_ACCEPT, 3);
+        let result = reply.add_tunnel_password(0, &[0u8; 240], &[0; 16], b"s");
+        assert!(
+            matches!(result, Err(CodecError::AttributeValueTooLong { .. })),
+            "expected AttributeValueTooLong, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn add_tunnel_password_wrong_packet_type_is_error() {
+        // Tunnel-Password is only permitted in Access-Accept (RFC 2868 §3.5).
+        for code in [Code::ACCESS_REJECT, Code::ACCESS_CHALLENGE] {
+            let mut reply = Reply::new(code, 1);
+            let result = reply.add_tunnel_password(0, b"pass", &[0; 16], b"s");
+            assert_eq!(
+                result.map(|_| ()),
+                Err(CodecError::WrongPacketType),
+                "expected WrongPacketType for code {:?}",
+                code,
+            );
+        }
     }
 
     #[test]
