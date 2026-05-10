@@ -1,0 +1,782 @@
+//! Wireshark-style human-readable packet dissection.
+//!
+//! Every type in this module is a thin `Display`-only wrapper around
+//! borrowed packet bytes. Constructing a wrapper is a pointer copy;
+//! formatting is the only thing that costs CPU, and it is only paid
+//! when the caller writes the wrapper to a `Formatter` (`{}`-print,
+//! `to_string()`, `tracing::info!`, etc.). Nothing in the steady-state
+//! encode / decode path touches this module.
+//!
+//! # Example
+//!
+//! ```ignore
+//! use radius_tokio::PacketBuffer;
+//!
+//! let pkt = PacketBuffer::from_bytes(&datagram)?;
+//! eprintln!("{}", pkt.dissect());
+//! ```
+//!
+//! Output mirrors Wireshark's `RADIUS Protocol` tree:
+//!
+//! ```text
+//! RADIUS Protocol
+//!     Code: Access-Request (1)
+//!     Packet identifier: 0x42 (66)
+//!     Length: 84
+//!     Authenticator: 0102030405060708090a0b0c0d0e0f10
+//!     Attribute Value Pairs
+//!         AVP: t=User-Name(1) l=7 val="alice"
+//!         AVP: t=NAS-IP-Address(4) l=6 val=10.0.0.1
+//!         AVP: t=Vendor-Specific(26) l=12 vnd=Cisco(9)
+//!             VSA: t=Cisco-AVPair(1) l=4 val="foo"
+//! ```
+//!
+//! # Caveats
+//!
+//! * Encrypted attributes (`User-Password`, `Tunnel-Password`) are
+//!   shown as raw hex with an `<encrypted>` marker — the dissector
+//!   does not have access to a shared secret. A future
+//!   `dissect_with_secret` could decrypt; deferred.
+//! * Sub-VSAs packed into a single attribute-26 slot beyond the first
+//!   are not unpacked. The first per-vendor TLV is dissected; trailing
+//!   bytes of that slot are reported as raw hex.
+//! * The renderer is intentionally lossy on truly malformed packets:
+//!   it prints the offending bytes plus a `<malformed>` marker rather
+//!   than refusing to format. Diagnosing bad input is the use case.
+
+use std::fmt;
+use std::net::{Ipv4Addr, Ipv6Addr};
+
+use super::attributes::{AttributesIter, RawAttribute};
+use super::header::{Code, Header};
+use super::PacketBuffer;
+use crate::dict::generated::AttributeEntry;
+use crate::dict::{registry, Type};
+
+/// Indent applied per Wireshark "tree" level.
+const INDENT: &str = "    ";
+
+/// Hex-dump cap on raw byte values inside an attribute. Anything
+/// larger is truncated with a `…(N more)` suffix to keep log lines
+/// usable. Picked to comfortably hold a Message-Authenticator (16),
+/// EAP-Message fragment (≤253), and most realistic VSAs.
+const MAX_HEX_BYTES: usize = 64;
+
+// ---- public wrappers --------------------------------------------------
+
+/// `Display` wrapper rendering a full packet (header + AVP tree).
+#[derive(Clone, Copy)]
+pub struct PacketDissect<'a> {
+    src: PacketSource<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum PacketSource<'a> {
+    /// Built or received via [`PacketBuffer`]; we read the header and
+    /// attribute region directly from the buffer's accessors so an
+    /// unsealed (length-placeholder) buffer still dissects correctly.
+    Buffer(&'a PacketBuffer),
+    /// Raw datagram bytes; the header is parsed on demand.
+    Bytes(&'a [u8]),
+}
+
+impl<'a> PacketDissect<'a> {
+    /// Build a dissector view over a validated packet buffer.
+    #[must_use]
+    pub fn new(pkt: &'a PacketBuffer) -> Self {
+        Self {
+            src: PacketSource::Buffer(pkt),
+        }
+    }
+
+    /// Build a dissector view directly from raw datagram bytes.
+    ///
+    /// Useful for logging un-parsed input (e.g. on a header-validation
+    /// failure path); the renderer falls back to a `<malformed
+    /// header>` line if the bytes are not a valid RADIUS packet.
+    #[must_use]
+    pub fn from_bytes(bytes: &'a [u8]) -> Self {
+        Self {
+            src: PacketSource::Bytes(bytes),
+        }
+    }
+}
+
+impl fmt::Display for PacketDissect<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (header, attrs): (Header, &[u8]) = match self.src {
+            PacketSource::Buffer(pkt) => (pkt.header(), pkt.attributes()),
+            PacketSource::Bytes(bytes) => match Header::parse(bytes) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    writeln!(f, "RADIUS Protocol")?;
+                    writeln!(f, "{INDENT}<malformed header: {e}>")?;
+                    return write_raw_hex(f, INDENT, bytes);
+                }
+            },
+        };
+        writeln!(f, "RADIUS Protocol")?;
+        write_header_lines(f, INDENT, &header)?;
+        writeln!(f, "{INDENT}Attribute Value Pairs")?;
+        let avp_indent = concat_indent(2);
+        for slot in super::attributes::iter(attrs) {
+            match slot {
+                Ok(raw) => write_attribute(f, &avp_indent, raw)?,
+                Err(e) => {
+                    writeln!(f, "{avp_indent}<malformed attribute: {e}>")?;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `Display` wrapper for a single header (no AVPs).
+#[derive(Clone, Copy)]
+pub struct HeaderDissect<'a> {
+    header: &'a Header,
+}
+
+impl<'a> HeaderDissect<'a> {
+    /// Build a header-only dissector view.
+    #[must_use]
+    pub fn new(header: &'a Header) -> Self {
+        Self { header }
+    }
+}
+
+impl fmt::Display for HeaderDissect<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "RADIUS Protocol")?;
+        write_header_lines(f, INDENT, self.header)
+    }
+}
+
+/// `Display` wrapper for a single attribute slot (incl. nested VSA).
+#[derive(Clone, Copy)]
+pub struct AttrDissect<'a> {
+    raw: RawAttribute<'a>,
+}
+
+impl<'a> AttrDissect<'a> {
+    /// Build a single-attribute dissector view.
+    #[must_use]
+    pub fn new(raw: RawAttribute<'a>) -> Self {
+        Self { raw }
+    }
+}
+
+impl fmt::Display for AttrDissect<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_attribute(f, "", self.raw)
+    }
+}
+
+/// `Display` wrapper that renders an [`AttributesIter`] as a flat AVP
+/// list (one per line, no surrounding `RADIUS Protocol` header).
+pub struct AttributesDissect<'a> {
+    iter: AttributesIter<'a>,
+}
+
+impl<'a> AttributesDissect<'a> {
+    /// Build a dissector view over an attribute iterator.
+    #[must_use]
+    pub fn new(iter: AttributesIter<'a>) -> Self {
+        Self { iter }
+    }
+}
+
+impl fmt::Display for AttributesDissect<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for slot in self.iter.clone() {
+            match slot {
+                Ok(raw) => write_attribute(f, "", raw)?,
+                Err(e) => {
+                    writeln!(f, "<malformed attribute: {e}>")?;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---- ergonomic accessors on existing types ----------------------------
+
+impl PacketBuffer {
+    /// Wireshark-style human-readable dissection. See [`PacketDissect`].
+    #[inline]
+    #[must_use]
+    pub fn dissect(&self) -> PacketDissect<'_> {
+        PacketDissect::new(self)
+    }
+}
+
+impl Header {
+    /// Wireshark-style human-readable dissection. See [`HeaderDissect`].
+    #[inline]
+    #[must_use]
+    pub fn dissect(&self) -> HeaderDissect<'_> {
+        HeaderDissect::new(self)
+    }
+}
+
+impl<'a> RawAttribute<'a> {
+    /// Wireshark-style human-readable dissection. See [`AttrDissect`].
+    #[inline]
+    #[must_use]
+    pub fn dissect(self) -> AttrDissect<'a> {
+        AttrDissect::new(self)
+    }
+}
+
+// ---- internals --------------------------------------------------------
+
+fn write_header_lines(f: &mut fmt::Formatter<'_>, indent: &str, h: &Header) -> fmt::Result {
+    let code_name = code_name(h.code);
+    match code_name {
+        Some(name) => writeln!(f, "{indent}Code: {name} ({})", h.code.0)?,
+        None => writeln!(f, "{indent}Code: Unknown ({})", h.code.0)?,
+    }
+    writeln!(
+        f,
+        "{indent}Packet identifier: 0x{:02x} ({})",
+        h.identifier, h.identifier
+    )?;
+    writeln!(f, "{indent}Length: {}", h.length)?;
+    write!(f, "{indent}Authenticator: ")?;
+    for b in &h.authenticator {
+        write!(f, "{b:02x}")?;
+    }
+    writeln!(f)
+}
+
+fn write_attribute(f: &mut fmt::Formatter<'_>, indent: &str, raw: RawAttribute<'_>) -> fmt::Result {
+    let typ = raw.attribute_type();
+    let len = raw.wire_len();
+    let val = raw.value();
+
+    // Vendor-Specific gets nested treatment.
+    if typ == 26 {
+        return write_vsa(f, indent, len, val);
+    }
+
+    let entry = registry::attribute(typ);
+    let name = entry.map_or("Unknown", |e| e.name);
+    write!(f, "{indent}AVP: t={name}({typ}) l={len}")?;
+    write_value(f, indent, entry, val)
+}
+
+fn write_vsa(f: &mut fmt::Formatter<'_>, indent: &str, len: u8, val: &[u8]) -> fmt::Result {
+    let Some((pen_bytes, rest)) = val.split_first_chunk::<4>() else {
+        writeln!(
+            f,
+            "{indent}AVP: t=Vendor-Specific(26) l={len} <truncated VSA>"
+        )?;
+        return write_raw_hex(f, indent, val);
+    };
+    let pen = u32::from_be_bytes(*pen_bytes);
+    let vendor_entry = registry::vendor(pen);
+    let vendor_name = vendor_entry.map_or("Unknown", |v| v.name);
+    writeln!(
+        f,
+        "{indent}AVP: t=Vendor-Specific(26) l={len} vnd={vendor_name}({pen})"
+    )?;
+
+    // RFC 2865 §5.26 framing assumed (1-byte type, 1-byte length).
+    // FreeRADIUS `format=t,l` overrides are not yet honoured here;
+    // they are rare in the dictionaries we vendor.
+    let inner_indent_buf;
+    let inner_indent: &str = {
+        inner_indent_buf = format!("{indent}{INDENT}");
+        &inner_indent_buf
+    };
+
+    let Some((&[v_type, v_len], data_and_rest)) = rest.split_first_chunk::<2>() else {
+        writeln!(f, "{inner_indent}<truncated vendor TLV>")?;
+        return write_raw_hex(f, inner_indent, rest);
+    };
+    let data_len = match (v_len as usize).checked_sub(2) {
+        Some(n) if n <= data_and_rest.len() => n,
+        _ => {
+            writeln!(
+                f,
+                "{inner_indent}<vendor length {v_len} exceeds {} remaining>",
+                data_and_rest.len() + 2
+            )?;
+            return write_raw_hex(f, inner_indent, data_and_rest);
+        }
+    };
+    let data = &data_and_rest[..data_len];
+    let entry = registry::vsa(pen, v_type);
+    let vname = entry.map_or("Unknown", |e| e.name);
+    write!(f, "{inner_indent}VSA: t={vname}({v_type}) l={v_len}")?;
+    write_value(f, inner_indent, entry, data)?;
+
+    let trailing = &data_and_rest[data_len..];
+    if !trailing.is_empty() {
+        writeln!(
+            f,
+            "{inner_indent}<trailing {} byte(s) in VSA slot>",
+            trailing.len()
+        )?;
+        write_raw_hex(f, inner_indent, trailing)?;
+    }
+    Ok(())
+}
+
+/// Render the value portion (` val=…\n`) of an AVP line.
+///
+/// `entry` is the dictionary lookup result for the surrounding
+/// attribute; it drives type-aware formatting (decimal vs hex,
+/// enumerator name vs raw integer, encrypted-marker, etc.). When
+/// `entry` is `None` we fall back to a hex dump.
+fn write_value(
+    f: &mut fmt::Formatter<'_>,
+    indent: &str,
+    entry: Option<&'static AttributeEntry>,
+    val: &[u8],
+) -> fmt::Result {
+    let Some(entry) = entry else {
+        write!(f, " val=")?;
+        write_hex_inline(f, val)?;
+        return writeln!(f);
+    };
+
+    if entry.flags.encrypt.is_some() {
+        write!(f, " val=<encrypted ")?;
+        write_hex_inline(f, val)?;
+        return writeln!(f, ">");
+    }
+
+    match entry.typ {
+        Type::String => {
+            if let Ok(s) = std::str::from_utf8(val) {
+                writeln!(f, " val={s:?}")
+            } else {
+                write!(f, " val=<non-utf8 ")?;
+                write_hex_inline(f, val)?;
+                writeln!(f, ">")
+            }
+        }
+        Type::Octets | Type::FixedOctets(_) | Type::Abinary => {
+            write!(f, " val=")?;
+            write_hex_inline(f, val)?;
+            writeln!(f)
+        }
+        Type::Ipaddr => match <[u8; 4]>::try_from(val) {
+            Ok(octets) => writeln!(f, " val={}", Ipv4Addr::from(octets)),
+            Err(_) => writeln!(f, " val=<bad ipv4 len={}>", val.len()),
+        },
+        Type::Ipv6addr => match <[u8; 16]>::try_from(val) {
+            Ok(octets) => writeln!(f, " val={}", Ipv6Addr::from(octets)),
+            Err(_) => writeln!(f, " val=<bad ipv6 len={}>", val.len()),
+        },
+        Type::Ipv4prefix => write_ip_prefix(f, val, 4),
+        Type::Ipv6prefix => write_ip_prefix(f, val, 16),
+        Type::Byte => match val {
+            [b] => write_integer(f, entry, i64::from(*b)),
+            _ => writeln!(f, " val=<bad byte len={}>", val.len()),
+        },
+        Type::Short => match <[u8; 2]>::try_from(val) {
+            Ok(b) => write_integer(f, entry, i64::from(u16::from_be_bytes(b))),
+            Err(_) => writeln!(f, " val=<bad short len={}>", val.len()),
+        },
+        Type::Integer | Type::Uint32 => match <[u8; 4]>::try_from(val) {
+            Ok(b) => write_integer(f, entry, i64::from(u32::from_be_bytes(b))),
+            Err(_) => writeln!(f, " val=<bad integer len={}>", val.len()),
+        },
+        Type::Integer64 => match <[u8; 8]>::try_from(val) {
+            Ok(b) => writeln!(f, " val={}", u64::from_be_bytes(b)),
+            Err(_) => writeln!(f, " val=<bad integer64 len={}>", val.len()),
+        },
+        Type::Signed => match <[u8; 4]>::try_from(val) {
+            Ok(b) => write_integer(f, entry, i64::from(i32::from_be_bytes(b))),
+            Err(_) => writeln!(f, " val=<bad signed len={}>", val.len()),
+        },
+        Type::Date => match <[u8; 4]>::try_from(val) {
+            Ok(b) => writeln!(f, " val={} (epoch seconds)", u32::from_be_bytes(b)),
+            Err(_) => writeln!(f, " val=<bad date len={}>", val.len()),
+        },
+        Type::Ether => {
+            if let Ok(m) = <[u8; 6]>::try_from(val) {
+                writeln!(
+                    f,
+                    " val={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    m[0], m[1], m[2], m[3], m[4], m[5]
+                )
+            } else {
+                writeln!(f, " val=<bad ether len={}>", val.len())
+            }
+        }
+        Type::Ifid => {
+            if val.len() == 8 {
+                write!(f, " val=")?;
+                for (i, chunk) in val.chunks(2).enumerate() {
+                    if i > 0 {
+                        write!(f, ":")?;
+                    }
+                    for b in chunk {
+                        write!(f, "{b:02x}")?;
+                    }
+                }
+                writeln!(f)
+            } else {
+                writeln!(f, " val=<bad ifid len={}>", val.len())
+            }
+        }
+        Type::Tlv | Type::Vsa | Type::Evs | Type::Extended | Type::LongExtended | Type::Struct => {
+            // Container types — no first-class renderer yet. Dump
+            // raw payload for forensic value, on a continuation line
+            // so the AVP header line stays short.
+            writeln!(f, " <{:?}>", entry.typ)?;
+            let cont = format!("{indent}{INDENT}");
+            write_raw_hex(f, &cont, val)
+        }
+    }
+}
+
+fn write_integer(
+    f: &mut fmt::Formatter<'_>,
+    entry: &'static AttributeEntry,
+    n: i64,
+) -> fmt::Result {
+    match registry::value_name(entry.name, n) {
+        Some(name) => writeln!(f, " val={name}({n})"),
+        None => writeln!(f, " val={n}"),
+    }
+}
+
+fn write_ip_prefix(f: &mut fmt::Formatter<'_>, val: &[u8], addr_len: usize) -> fmt::Result {
+    // RFC 6572 / RFC 3162: 1 reserved + 1 prefix-len + up to addr_len bytes.
+    if val.len() < 2 || val.len() > 2 + addr_len {
+        return writeln!(f, " val=<bad prefix len={}>", val.len());
+    }
+    let prefix_len = val[1];
+    let mut buf = vec![0u8; addr_len];
+    buf[..val.len() - 2].copy_from_slice(&val[2..]);
+    if addr_len == 4 {
+        let octets: [u8; 4] = buf.as_slice().try_into().unwrap();
+        writeln!(f, " val={}/{prefix_len}", Ipv4Addr::from(octets))
+    } else {
+        let octets: [u8; 16] = buf.as_slice().try_into().unwrap();
+        writeln!(f, " val={}/{prefix_len}", Ipv6Addr::from(octets))
+    }
+}
+
+fn write_hex_inline(f: &mut fmt::Formatter<'_>, val: &[u8]) -> fmt::Result {
+    let cap = val.len().min(MAX_HEX_BYTES);
+    write!(f, "0x")?;
+    for b in &val[..cap] {
+        write!(f, "{b:02x}")?;
+    }
+    if val.len() > cap {
+        write!(f, "…({} more)", val.len() - cap)?;
+    }
+    Ok(())
+}
+
+fn write_raw_hex(f: &mut fmt::Formatter<'_>, indent: &str, val: &[u8]) -> fmt::Result {
+    if val.is_empty() {
+        return Ok(());
+    }
+    write!(f, "{indent}")?;
+    write_hex_inline(f, val)?;
+    writeln!(f)
+}
+
+fn concat_indent(levels: usize) -> String {
+    let mut s = String::with_capacity(INDENT.len() * levels);
+    for _ in 0..levels {
+        s.push_str(INDENT);
+    }
+    s
+}
+
+fn code_name(c: Code) -> Option<&'static str> {
+    Some(match c {
+        Code::ACCESS_REQUEST => "Access-Request",
+        Code::ACCESS_ACCEPT => "Access-Accept",
+        Code::ACCESS_REJECT => "Access-Reject",
+        Code::ACCOUNTING_REQUEST => "Accounting-Request",
+        Code::ACCOUNTING_RESPONSE => "Accounting-Response",
+        Code::ACCESS_CHALLENGE => "Access-Challenge",
+        Code::STATUS_SERVER => "Status-Server",
+        Code::STATUS_CLIENT => "Status-Client",
+        Code::DISCONNECT_REQUEST => "Disconnect-Request",
+        Code::DISCONNECT_ACK => "Disconnect-ACK",
+        Code::DISCONNECT_NAK => "Disconnect-NAK",
+        Code::COA_REQUEST => "CoA-Request",
+        Code::COA_ACK => "CoA-ACK",
+        Code::COA_NAK => "CoA-NAK",
+        _ => return None,
+    })
+}
+
+#[cfg(all(test, feature = "dict-rfc"))]
+mod tests {
+    use super::*;
+    use crate::codec::PacketBuffer;
+    use crate::Code;
+
+    #[test]
+    fn dissect_minimal_access_request() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 42);
+        buf.add_attribute(1, b"alice").unwrap();
+        buf.add_attribute(4, &[10, 0, 0, 1]).unwrap();
+
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("RADIUS Protocol"), "{s}");
+        assert!(s.contains("Code: Access-Request (1)"), "{s}");
+        assert!(s.contains("Packet identifier: 0x2a (42)"), "{s}");
+        assert!(s.contains("AVP: t=User-Name(1)"), "{s}");
+        assert!(s.contains(r#"val="alice""#), "{s}");
+        assert!(s.contains("AVP: t=NAS-IP-Address(4)"), "{s}");
+        assert!(s.contains("val=10.0.0.1"), "{s}");
+    }
+
+    #[test]
+    fn dissect_unknown_code_and_attribute() {
+        let mut buf = PacketBuffer::new(Code(99), 7);
+        buf.add_attribute(250, &[0xde, 0xad, 0xbe, 0xef]).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("Code: Unknown (99)"), "{s}");
+        assert!(s.contains("AVP: t=Unknown(250)"), "{s}");
+        assert!(s.contains("0xdeadbeef"), "{s}");
+    }
+
+    #[test]
+    fn dissect_enumerated_integer_uses_value_name() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // Service-Type = 2 → Framed-User
+        buf.add_attribute(6, &2u32.to_be_bytes()).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("val=Framed-User(2)"), "{s}");
+    }
+
+    #[test]
+    fn dissect_encrypted_attribute_marked() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // User-Password (2) is encrypt=1.
+        buf.add_attribute(2, &[0u8; 16]).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("val=<encrypted "), "{s}");
+    }
+
+    #[test]
+    fn dissect_malformed_header_does_not_panic() {
+        let s = format!("{}", PacketDissect::from_bytes(&[1, 2, 3]));
+        assert!(s.contains("<malformed header"), "{s}");
+    }
+
+    #[cfg(feature = "dict-cisco")]
+    #[test]
+    fn dissect_known_vsa_resolves_vendor_and_attr() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // Cisco PEN = 9, Cisco-AVPair = 1, value "shell:priv-lvl=15".
+        let mut v = Vec::new();
+        v.extend_from_slice(&9u32.to_be_bytes());
+        let payload = b"shell:priv-lvl=15";
+        v.push(1); // vendor-type
+        v.push(u8::try_from(payload.len() + 2).unwrap()); // vendor-length
+        v.extend_from_slice(payload);
+        buf.add_attribute(26, &v).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("vnd=Cisco(9)"), "{s}");
+        assert!(s.contains("VSA: t=Cisco-AVPair(1)"), "{s}");
+        assert!(s.contains("shell:priv-lvl=15"), "{s}");
+    }
+
+    #[test]
+    fn dissect_ipv6_address_attribute() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // NAS-IPv6-Address (95) is Ipv6addr.
+        let addr: [u8; 16] = std::net::Ipv6Addr::LOCALHOST.octets();
+        buf.add_attribute(95, &addr).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("AVP: t=NAS-IPv6-Address(95)"), "{s}");
+        assert!(s.contains("val=::1"), "{s}");
+    }
+
+    #[test]
+    fn dissect_ipv6_address_bad_length() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        buf.add_attribute(95, &[0u8; 8]).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("val=<bad ipv6 len="), "{s}");
+    }
+
+    #[test]
+    fn dissect_ipv6_prefix_attribute() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // Framed-IPv6-Prefix (97) is Ipv6prefix: 1-byte reserved, 1-byte
+        // prefix-length, up to 16 bytes of address.
+        let mut payload = vec![0u8, 64];
+        payload.extend_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0]);
+        buf.add_attribute(97, &payload).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("AVP: t=Framed-IPv6-Prefix(97)"), "{s}");
+        assert!(s.contains("/64"), "{s}");
+    }
+
+    #[test]
+    fn dissect_ipv6_prefix_bad_length() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        buf.add_attribute(97, &[0u8]).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("val=<bad prefix len="), "{s}");
+    }
+
+    #[test]
+    fn dissect_date_attribute() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // Event-Timestamp (55) is Date.
+        buf.add_attribute(55, &1_700_000_000u32.to_be_bytes())
+            .unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("(epoch seconds)"), "{s}");
+    }
+
+    #[test]
+    fn dissect_date_bad_length() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        buf.add_attribute(55, &[0u8, 1, 2]).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("val=<bad date len="), "{s}");
+    }
+
+    #[test]
+    fn dissect_ifid_attribute() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // Framed-Interface-Id (96) is Ifid (8 bytes, colon-rendered).
+        buf.add_attribute(96, &[0xfe, 0x80, 0, 0, 0, 0, 0, 1])
+            .unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("AVP: t=Framed-Interface-Id(96)"), "{s}");
+        assert!(s.contains("val=fe80:0000:0000:0001"), "{s}");
+    }
+
+    #[test]
+    fn dissect_ifid_bad_length() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        buf.add_attribute(96, &[0u8, 1, 2, 3]).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("val=<bad ifid len="), "{s}");
+    }
+
+    #[test]
+    fn dissect_integer64_attribute() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // MIP6-Feature-Vector (124) is Integer64.
+        buf.add_attribute(124, &0xdead_beef_u64.to_be_bytes())
+            .unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("val=3735928559"), "{s}");
+    }
+
+    #[test]
+    fn dissect_integer64_bad_length() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        buf.add_attribute(124, &[0u8; 4]).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("val=<bad integer64 len="), "{s}");
+    }
+
+    #[test]
+    fn dissect_ipaddr_bad_length() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // NAS-IP-Address (4) is Ipaddr; feed wrong length.
+        buf.add_attribute(4, &[10, 0, 0]).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("val=<bad ipv4 len="), "{s}");
+    }
+
+    #[test]
+    fn dissect_truncated_vsa_slot_too_small_for_pen() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // Vendor-Specific (26) with fewer than 4 PEN bytes.
+        buf.add_attribute(26, &[1u8, 2, 3]).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("<truncated VSA>"), "{s}");
+    }
+
+    #[test]
+    fn dissect_truncated_vsa_inner_tlv() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // Valid PEN, but no room for the inner type/length header.
+        let mut v = Vec::new();
+        v.extend_from_slice(&9u32.to_be_bytes());
+        v.push(1); // single trailing byte – not enough for [type,len].
+        buf.add_attribute(26, &v).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("<truncated vendor TLV>"), "{s}");
+    }
+
+    #[test]
+    fn dissect_vsa_bad_inner_length() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // PEN + vendor-type + vendor-length claiming more than is present.
+        let mut v = Vec::new();
+        v.extend_from_slice(&9u32.to_be_bytes());
+        v.push(1); // type
+        v.push(50); // claims 48 bytes payload but provides 0
+        buf.add_attribute(26, &v).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("exceeds"), "{s}");
+    }
+
+    #[test]
+    fn dissect_vsa_with_trailing_bytes() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // PEN + first inner TLV (type=1, len=3, 1 data byte) + 4 trailing
+        // bytes that are not unpacked.
+        let mut v = Vec::new();
+        v.extend_from_slice(&9u32.to_be_bytes());
+        v.extend_from_slice(&[1u8, 3, 0xaa]); // first TLV
+        v.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]); // trailing
+        buf.add_attribute(26, &v).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("<trailing 4 byte(s) in VSA slot>"), "{s}");
+    }
+
+    #[test]
+    fn header_dissect_renders_well_known_code() {
+        use crate::codec::header::Header;
+        let header = Header {
+            code: Code::ACCESS_ACCEPT,
+            identifier: 7,
+            length: 20,
+            authenticator: [0x11; 16],
+        };
+        let s = format!("{}", header.dissect());
+        assert!(s.contains("Code: Access-Accept (2)"), "{s}");
+        assert!(s.contains("11111111111111111111111111111111"), "{s}");
+    }
+
+    #[test]
+    fn attr_dissect_renders_single_avp() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        buf.add_attribute(1, b"alice").unwrap();
+        let raw = crate::codec::attributes::iter(buf.attributes())
+            .next()
+            .unwrap()
+            .unwrap();
+        let s = format!("{}", raw.dissect());
+        assert!(s.contains("AVP: t=User-Name(1)"), "{s}");
+        assert!(s.contains(r#"val="alice""#), "{s}");
+    }
+
+    #[test]
+    fn attributes_dissect_iterates_all() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        buf.add_attribute(1, b"bob").unwrap();
+        buf.add_attribute(4, &[10, 0, 0, 1]).unwrap();
+        let s = format!(
+            "{}",
+            AttributesDissect::new(crate::codec::attributes::iter(buf.attributes()))
+        );
+        assert!(s.contains("User-Name"), "{s}");
+        assert!(s.contains("NAS-IP-Address"), "{s}");
+    }
+}

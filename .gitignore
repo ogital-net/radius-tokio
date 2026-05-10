@@ -1,0 +1,29 @@
+# Cargo.lock is committed. This is a library crate, but committing the
+# lockfile keeps CI (and contributor builds) reproducible — especially
+# for the MSRV cell, where transitive bumps to `edition2024` would
+# otherwise break the build whenever crates.io ships a new minor.
+# Downstream consumers still resolve their own lockfiles; only the
+# repository's own builds (CI, examples, benches) are pinned.
+/target
+/dhat-heap.json
+
+### macOS ###
+*.DS_Store
+.AppleDouble
+.LSOverride
+
+# Files that might appear in the root of a volume
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+### VisualStudioCode ###
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json

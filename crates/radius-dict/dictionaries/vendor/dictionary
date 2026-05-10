@@ -1,0 +1,38 @@
+# -*- text -*-
+# Copyright (C) 2019 The FreeRADIUS Server project and contributors
+# This work is licensed under CC-BY version 4.0
+# https://creativecommons.org/licenses/by/4.0
+#
+# Root include file for vendored vendor-specific dictionaries.
+#
+# Files are sourced verbatim from the FreeRADIUS v3.2.x repository
+# (share/ directory). Only dictionaries with CC-BY-4.0 headers are
+# included; each is listed below together with the IANA Private
+# Enterprise Number (PEN) of the corresponding vendor.
+#
+# PEN    Vendor
+# -----  -----------------------------------------------
+#     9  Cisco Systems
+#    11  HP / ProCurve / Aruba-HPE
+#   311  Microsoft
+#   429  (USR / 3Com — not included; non-CC-BY)
+#   529  Ascend Communications (Lucent / Nokia)
+#  2636  Juniper Networks
+# 12356  Fortinet
+# 14122  WISPr / Wireless Broadband Alliance
+# 14823  Aruba Networks / HPE
+# 14988  MikroTik
+# 25053  Ruckus Wireless
+# 29671  Meraki (Cisco)
+
+$INCLUDE dictionary.cisco
+$INCLUDE dictionary.hp
+$INCLUDE dictionary.microsoft
+$INCLUDE dictionary.ascend
+$INCLUDE dictionary.juniper
+$INCLUDE dictionary.fortinet
+$INCLUDE dictionary.wispr
+$INCLUDE dictionary.aruba
+$INCLUDE dictionary.mikrotik
+$INCLUDE dictionary.ruckus
+$INCLUDE dictionary.meraki

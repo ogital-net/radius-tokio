@@ -1,0 +1,161 @@
+[workspace]
+members = [
+    ".",
+    "crates/radius-dict-codegen",
+    "crates/radius-dict",
+]
+resolver = "2"
+
+[package]
+name = "radius-tokio"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.79"
+description = "A high-performance, async RADIUS server library (RFC 2865/2866/6614)"
+license = "BSD-2-Clause"
+repository = "https://github.com/example/radius-tokio"
+keywords = ["radius", "aaa", "networking", "tokio"]
+categories = ["network-programming", "asynchronous"]
+# CLAUDE.md is the in-repo source-of-truth for project vision and roadmap.
+# It is internal documentation; keep it out of the published package so
+# nothing in the crate's docs can reference a file that isn't shipped.
+exclude = ["CLAUDE.md", "dhat-heap.json"]
+
+[features]
+default = ["dict-rfc"]
+# Emit `tracing` spans/events around accept, decode, dispatch, reply,
+# and CoA lifecycle. Off by default — pulls in the `tracing` crate.
+tracing = ["dep:tracing"]
+# Expose counters/histograms via the `metrics` facade (packets, drops,
+# dedup hits, handler latency, CoA outcomes). Off by default.
+metrics = ["dep:metrics"]
+# RadSec / RADIUS-over-TLS (RFC 6614). Enables the `tls` module
+# and turns on the `ssl` feature of `aws-lc-sys`, which triggers
+# bindgen at build time and adds ~30s to a cold build. Build deps
+# (cmake + clang + libclang) become required. Off by default.
+radsec = ["aws-lc-sys/ssl", "tokio/io-util"]
+# IETF / RFC dictionaries (always recommended; small).
+# These forward the feature flag to the radius-dict crate.
+dict-rfc = ["radius-dict/dict-rfc"]
+# Per-vendor VSA dictionaries; opt in to keep generated code small.
+dict-cisco = ["radius-dict/dict-cisco"]
+dict-aruba = ["radius-dict/dict-aruba"]
+dict-ascend = ["radius-dict/dict-ascend"]
+dict-fortinet = ["radius-dict/dict-fortinet"]
+dict-hp = ["radius-dict/dict-hp"]
+dict-juniper = ["radius-dict/dict-juniper"]
+dict-meraki = ["radius-dict/dict-meraki"]
+dict-microsoft = ["radius-dict/dict-microsoft"]
+dict-mikrotik = ["radius-dict/dict-mikrotik"]
+dict-ruckus = ["radius-dict/dict-ruckus"]
+dict-wispr = ["radius-dict/dict-wispr"]
+# Umbrella enabling every vendored vendor dictionary.
+dict-vendor-all = [
+    "dict-cisco",
+    "dict-aruba",
+    "dict-ascend",
+    "dict-fortinet",
+    "dict-hp",
+    "dict-juniper",
+    "dict-meraki",
+    "dict-microsoft",
+    "dict-mikrotik",
+    "dict-ruckus",
+    "dict-wispr",
+]
+
+[dependencies]
+# Typed FreeRADIUS dictionary tables generated at build time.
+# Feature flags above forward dict-* selections to this crate.
+radius-dict = { path = "crates/radius-dict", version = "0.1.0" }
+# Core crypto bindings (HMAC-MD5, AES, RNG, …). The `ssl` feature
+# is *not* enabled here; turn it on via the `radsec` cargo feature
+# when RadSec / TLS support is needed. Without `ssl`, the crypto-
+# only bindings are pre-generated and bindgen is skipped, keeping
+# cold builds fast and avoiding the cmake / clang dependency.
+#
+# Version: floor at the release we built and tested against, ceiling
+# below 2.0. aws-lc-sys is a thin shim over an OpenSSL-1.1-shaped C
+# API and has been API-stable across its 0.x line in practice; pinning
+# to a single 0.x minor (Cargo's default `^0.40` behaviour) would
+# force consumers onto our exact bump cadence for no real reason.
+aws-lc-sys = ">=0.40, <2"
+tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
+# Optional structured logging. Gated by the `tracing` feature so the
+# default build keeps zero non-aws-lc / non-tokio dependencies. With
+# the feature off the macros in `crate::obs` expand to nothing.
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
+# Optional metrics facade. Gated by the `metrics` feature so the default
+# build stays dependency-free. With the feature off the macros in
+# `crate::obs` expand to nothing.
+metrics = { version = "0.24", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }
+# Benchmarks. Pulled in only for `cargo bench`; dependency-light and
+# offline (no html_reports → drops the `plotters`/`tinytemplate` tree).
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# Heap profiler for the `dhat_hot_path` example. Pure Rust, no native
+# deps; only compiled into the example, never linked into the library
+# or the bench harness.
+dhat = "0.3"
+# Lock-free atomic Arc-swap, used by the `mutable_clients` example to
+# show how a runtime-mutable `ClientStore` can be built on top of the
+# trait. Example-only; the library itself never depends on it.
+arc-swap = "1"
+# SQLite (bundled C amalgamation) for the `sqlite_clients` example,
+# which demonstrates wrapping a blocking-I/O backend with
+# `CachedStore` + `tokio::task::spawn_blocking`. Example-only; the
+# library itself never depends on it.
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[[example]]
+name = "dhat_hot_path"
+
+[[example]]
+name = "mutable_clients"
+
+[[example]]
+name = "sqlite_clients"
+
+[[example]]
+name = "threadlocal_responder"
+
+[[example]]
+name = "coa_originator"
+
+[[example]]
+name = "mixed_udp_radsec"
+required-features = ["radsec"]
+
+[[bench]]
+name = "codec_decode"
+harness = false
+
+[[bench]]
+name = "codec_encode"
+harness = false
+
+[[bench]]
+name = "crypto_primitives"
+harness = false
+
+[[bench]]
+name = "client_store"
+harness = false
+
+[[bench]]
+name = "roundtrip"
+harness = false
+
+[[bench]]
+name = "server_udp"
+harness = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+dead_code = "allow"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

@@ -1,0 +1,195 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  # Keep aws-lc-sys's bindgen step quiet and reproducible.
+  AWS_LC_SYS_NO_ASM: 0
+
+jobs:
+  # ── Format ────────────────────────────────────────────────────────────────
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # ── Clippy (workspace, all features) ─────────────────────────────────────
+  # All-features turns on `radsec`, which pulls in aws-lc-sys's `ssl` feature
+  # and triggers bindgen → cmake + clang must be present on the runner.
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps for aws-lc-sys (ssl)
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+  # ── Docs (warnings = errors) ─────────────────────────────────────────────
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps for aws-lc-sys (ssl)
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --all-features --no-deps
+
+  # ── Build & test matrix ──────────────────────────────────────────────────
+  # Hosts: Linux x86_64 (glibc), macOS aarch64 (Apple Silicon), Windows
+  # x86_64 (MSVC). The crate has no arch-specific code; this matrix
+  # exercises the three host shapes that build aws-lc-sys cleanly.
+  # The RADIUS test tooling (freeradius, eapoltest, radsecproxy) only
+  # ships convenient packages on Linux, so the e2e tests under tests/
+  # self-skip on macOS and Windows — those cells still catch portability
+  # regressions in the codec, server, and crypto wrappers.
+  test:
+    name: test / ${{ matrix.toolchain }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, "1.79"]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # cmake / clang / libclang-dev: bindgen for aws-lc-sys (ssl).
+      # freeradius / eapoltest / radsecproxy: drive the e2e tests
+      # under tests/ (radclient_e2e, radsec_e2e*, eapol_test_mschapv2).
+      # The tests self-skip if the binaries are missing — installing
+      # them here means CI actually exercises the integration paths.
+      - name: Install build + e2e deps — Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake clang libclang-dev \
+            freeradius eapoltest radsecproxy
+
+      - name: Install build deps for aws-lc-sys (ssl) — macOS
+        if: runner.os == 'macOS'
+        run: brew install cmake
+
+      # aws-lc-sys's `ssl` feature builds AWS-LC via cmake and needs
+      # NASM to assemble the x86_64 perl-asm sources on Windows. cmake
+      # and an MSVC toolchain are already on the windows-latest image;
+      # NASM is not. Clang/libclang are bundled with LLVM via the
+      # GitHub-Actions `runner.tool_cache`, so bindgen finds them
+      # automatically when invoked through `cargo`.
+      - name: Install build deps for aws-lc-sys (ssl) — Windows
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      # Always install stable as the default toolchain. `Swatinem/rust-cache@v2`
+      # runs `cargo metadata` for cache-key computation, and `cargo metadata`
+      # does an *unlocked* resolve — which on the MSRV cell picks the latest
+      # semver-compatible deps and trips edition2024 manifests (e.g.
+      # `clap_builder 4.6.0`) before any of our `--locked` steps run. Keeping
+      # stable as the default sidesteps that; the MSRV build commands below
+      # invoke `cargo +1.79.0` explicitly.
+      - name: Install stable toolchain (default)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install MSRV toolchain
+        if: matrix.toolchain != 'stable'
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.toolchain }}
+
+      - name: Select cargo channel
+        id: channel
+        shell: bash
+        run: |
+          if [[ "${{ matrix.toolchain }}" == "stable" ]]; then
+            echo "flag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=+${{ matrix.toolchain }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Default features only first — fast, no bindgen, no cmake on the
+      # crypto path, exercises the dependency-light public API.
+      - name: Build (default features)
+        run: cargo ${{ steps.channel.outputs.flag }} build --workspace --locked
+      - name: Test (default features)
+        run: cargo ${{ steps.channel.outputs.flag }} test --workspace --locked
+
+      # Then the full matrix (radsec + every vendor dictionary).
+      - name: Build (all features)
+        run: cargo ${{ steps.channel.outputs.flag }} build --workspace --all-features --locked
+      - name: Test (all features)
+        run: cargo ${{ steps.channel.outputs.flag }} test --workspace --all-features --locked
+
+  # ── Miri ─────────────────────────────────────────────────────────────────
+  # Intentionally not run. The only `unsafe` in the workspace lives in
+  # `src/crypto/`, which is a thin shim over `aws-lc-sys` (FFI) — miri
+  # cannot execute foreign functions. The pure-Rust workspace members
+  # (`radius-dict`, `radius-dict-codegen`) have no `unsafe` worth
+  # checking. The FFI surface is exercised under AddressSanitizer in
+  # the `asan` job below.
+
+  # ── AddressSanitizer over the FFI shims ──────────────────────────────────
+  # Catches the leaks/UAFs miri can't see because they live behind FFI.
+  asan:
+    name: asan
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Zsanitizer=address
+      RUSTDOCFLAGS: -Zsanitizer=address
+      ASAN_OPTIONS: detect_leaks=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps for aws-lc-sys (ssl)
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --all-features --lib crypto
+
+  # ── cargo-deny (licenses, advisories, bans, sources) ─────────────────────
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans advisories sources
+
+  # ── Publish dry-run for the build-only codegen crate ─────────────────────
+  # Verifies the crate that's first in the publish chain still packages
+  # cleanly. The other two members can't be dry-run verified until their
+  # path-deps are actually on crates.io (chicken-and-egg with workspace
+  # publish chains; see CLAUDE.md Phase 11).
+  publish_dryrun:
+    name: publish dry-run (radius-dict-codegen)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish --dry-run -p radius-dict-codegen

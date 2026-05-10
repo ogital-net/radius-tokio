@@ -1,0 +1,47 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
+]
+
+# ── Licenses ────────────────────────────────────────────────────────────────
+[licenses]
+# Only allow permissive / weak-copyleft licenses compatible with MIT/Apache-2.0.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",     # this workspace's own crates
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",      # unicode-ident (transitively, via proc-macro2)
+]
+# Note: cargo-deny removed the `[licenses].deny` key in
+# https://github.com/EmbarkStudios/cargo-deny/pull/611. Anything not in
+# `allow` above is now implicitly denied — copyleft licenses (GPL-*, AGPL-*,
+# LGPL-*) are excluded by omission rather than by an explicit list.
+unused-allowed-license = "warn"
+
+# ── Bans ────────────────────────────────────────────────────────────────────
+[bans]
+# Deny multiple versions of the same crate unless explicitly allowed.
+multiple-versions = "warn"
+# Deny wildcard dependencies.
+wildcards = "deny"
+
+# ── Advisories ──────────────────────────────────────────────────────────────
+[advisories]
+# Deny crates with known security vulnerabilities.
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = []
+
+# ── Sources ─────────────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

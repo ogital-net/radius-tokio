@@ -1,0 +1,17 @@
+# Extend clippy's `doc-valid-idents` list with the names that show up
+# in this crate's prose. These are conventional spellings of products,
+# protocols, and acronyms — not Rust identifiers — and shouldn't trip
+# `clippy::doc_markdown` (part of `clippy::pedantic`).
+#
+# `..` keeps clippy's built-in defaults (TLS, SSL, URL, JSON, …) on top
+# of these additions.
+doc-valid-idents = [
+    "..",
+    "RadSec",
+    "FreeRADIUS",
+    "CoA",
+    "DoS",
+    "mTLS",
+    "MikroTik",
+    "WISPr",
+]

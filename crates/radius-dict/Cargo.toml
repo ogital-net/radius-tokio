@@ -1,0 +1,54 @@
+[package]
+name = "radius-dict"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.79"
+description = "Typed FreeRADIUS dictionary tables for RADIUS attribute encoding/decoding"
+license = "BSD-2-Clause"
+repository = "https://github.com/example/radius-tokio"
+build = "build.rs"
+
+[features]
+default = ["dict-rfc"]
+# IETF / RFC dictionaries (always recommended; small).
+dict-rfc = []
+# Per-vendor VSA dictionaries; opt in to keep generated code small.
+dict-cisco = []
+dict-aruba = []
+dict-ascend = []
+dict-fortinet = []
+dict-hp = []
+dict-juniper = []
+dict-meraki = []
+dict-microsoft = []
+dict-mikrotik = []
+dict-ruckus = []
+dict-wispr = []
+# Umbrella enabling every vendored vendor dictionary.
+dict-vendor-all = [
+    "dict-cisco",
+    "dict-aruba",
+    "dict-ascend",
+    "dict-fortinet",
+    "dict-hp",
+    "dict-juniper",
+    "dict-meraki",
+    "dict-microsoft",
+    "dict-mikrotik",
+    "dict-ruckus",
+    "dict-wispr",
+]
+
+[build-dependencies]
+radius-dict-codegen = { path = "../radius-dict-codegen", version = "0.1.0" }
+
+[dev-dependencies]
+radius-dict-codegen = { path = "../radius-dict-codegen", version = "0.1.0" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+dead_code = "allow"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

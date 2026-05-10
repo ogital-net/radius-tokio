@@ -1,0 +1,46 @@
+name: coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  llvm-cov:
+    name: cargo-llvm-cov
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: llvm-cov
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Generate coverage (lcov)
+        run: cargo llvm-cov --workspace --all-features --no-fail-fast --lcov --output-path lcov.info
+      - name: Print summary
+        run: cargo llvm-cov report --summary-only
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+          if-no-files-found: error
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+        # Codecov upload is best-effort: it requires a repo token for
+        # private repos, but the lcov.info artifact is always preserved
+        # above so reviewers can pull the report regardless.
