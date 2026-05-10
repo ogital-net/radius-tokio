@@ -144,7 +144,7 @@ fn write_attrs_module(out: &mut String, dict: &Dictionary) {
             // current dictionary, but guard anyway).
             continue;
         };
-        let marker = wire_marker(a.typ);
+        let marker = wire_marker(a.typ, a.flags);
         let ident = const_ident(&a.name);
         match a.vendor {
             None => writeln!(
@@ -177,10 +177,41 @@ fn const_ident(name: &str) -> String {
     out
 }
 
-/// Map a dictionary [`Type`] to the codec wire-type marker that decodes
-/// it. Container / extended types fall back to [`WBytes`]: callers get
-/// the raw value octets and can drill in with a future TLV walker.
-fn wire_marker(t: Type) -> &'static str {
+/// Map a dictionary [`Type`] (plus its flags) to the codec wire-type
+/// marker that decodes it.
+///
+/// Three shapes feed in here:
+///
+/// - **Encrypted** attributes (`encrypt=N`) carry a cipher-shaped
+///   value (e.g. `User-Password`'s xor-MD5 stream, `Tunnel-Password`'s
+///   `tag || salt || ciphertext`) that has no meaning as the parent
+///   dictionary type. They map to [`WBytes`] so a typed `get(...)`
+///   yields the raw octets and callers route plaintext through the
+///   dedicated `Reply::add_*_password` helpers.
+/// - **Tagged** attributes (`has_tag`, RFC 2868 §3) get the
+///   tag-aware markers so consumers see a [`Tagged<V>`] view and
+///   never have to peel the tag byte themselves.
+/// - Everything else maps directly to its scalar marker; container /
+///   variable-shape types fall back to [`WBytes`] until a TLV walker
+///   lands.
+fn wire_marker(t: Type, flags: Flags) -> &'static str {
+    // Encrypted attributes ship cipher-shaped values that don't match
+    // the source dictionary type. Force raw octets so callers route
+    // through the dedicated decrypt helpers (e.g. add_tunnel_password)
+    // instead of UTF-8-decoding ciphertext.
+    if flags.encrypt.is_some() {
+        return "WBytes";
+    }
+    if flags.has_tag {
+        return match t {
+            Type::String => "WTaggedText",
+            Type::Integer | Type::Uint32 | Type::Date => "WTaggedInteger",
+            // No other RFC-defined types currently combine with
+            // `has_tag`; fall through to raw octets if a dictionary
+            // surprises us so we don't silently strip a tag byte.
+            _ => "WBytes",
+        };
+    }
     match t {
         Type::String => "WText",
         Type::Byte => "WByte",
@@ -349,5 +380,53 @@ mod tests {
         assert_eq!(super::const_ident("User-Name"), "USER_NAME");
         assert_eq!(super::const_ident("Cisco-AVPair"), "CISCO_AVPAIR");
         assert_eq!(super::const_ident("MS-CHAP2-Response"), "MS_CHAP2_RESPONSE");
+    }
+
+    #[test]
+    fn tagged_attributes_get_tagged_markers() {
+        let d = Dictionary {
+            vendors: vec![],
+            attributes: vec![
+                Attribute {
+                    name: "Tunnel-Type".into(),
+                    oid: Oid(vec![64]),
+                    vendor: None,
+                    typ: Type::Integer,
+                    flags: Flags {
+                        has_tag: true,
+                        ..Flags::default()
+                    },
+                },
+                Attribute {
+                    name: "Tunnel-Client-Endpoint".into(),
+                    oid: Oid(vec![66]),
+                    vendor: None,
+                    typ: Type::String,
+                    flags: Flags {
+                        has_tag: true,
+                        ..Flags::default()
+                    },
+                },
+                // `has_tag,encrypt=2` — encryption wins; the typed handle
+                // exposes raw octets so callers go through the dedicated
+                // tunnel-password helper instead.
+                Attribute {
+                    name: "Tunnel-Password".into(),
+                    oid: Oid(vec![69]),
+                    vendor: None,
+                    typ: Type::String,
+                    flags: Flags {
+                        has_tag: true,
+                        encrypt: Some(2),
+                        ..Flags::default()
+                    },
+                },
+            ],
+            values: vec![],
+        };
+        let s = render("test", &d);
+        assert!(s.contains("pub const TUNNEL_TYPE: Attr<WTaggedInteger>"));
+        assert!(s.contains("pub const TUNNEL_CLIENT_ENDPOINT: Attr<WTaggedText>"));
+        assert!(s.contains("pub const TUNNEL_PASSWORD: Attr<WBytes>"));
     }
 }

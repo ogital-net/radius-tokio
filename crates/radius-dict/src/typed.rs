@@ -72,6 +72,72 @@ pub struct WEther;
 /// 8-byte interface identifier (`ifid`).
 pub struct WIfid;
 
+/// Tagged UTF-8 text (RFC 2868 §3.5: `string has_tag`).
+///
+/// Wire layout: an optional 1-byte tag in the range `0x01..=0x1F`
+/// followed by the UTF-8 payload. If the first byte is `> 0x1F` it is
+/// not a tag and forms part of the string. Decodes into
+/// [`Tagged<&str>`]; encodes from [`Tagged<&str>`] or `(u8, &str)`.
+pub struct WTaggedText;
+
+/// Tagged 32-bit unsigned integer (RFC 2868 §3.6: `integer has_tag`).
+///
+/// Wire layout is always 4 bytes: the first byte is the tag and the
+/// remaining 3 bytes are the big-endian integer value (24-bit range).
+/// If the first byte is `> 0x1F` it is treated as the high-order octet
+/// of a normal 32-bit integer and no tag is reported. Decodes into
+/// [`Tagged<u32>`]; encodes from [`Tagged<u32>`] or `(u8, u32)`.
+pub struct WTaggedInteger;
+
+/// Value-plus-tag pair returned for tagged attributes (RFC 2868 §3.1).
+///
+/// `tag` is `Some(t)` when the on-wire encoding carried a tag byte in
+/// the `0x00..=0x1F` range that groups this attribute with other
+/// attributes for the same tunnel; it is `None` when the attribute was
+/// encoded without a tag (string: first byte `> 0x1F`; integer: first
+/// byte `> 0x1F`, in which case `value` holds the full 32-bit integer).
+///
+/// On encode, `Some(t)` writes the tag byte (clamped to `t & 0x1F`)
+/// and `None` omits it — except for tagged integers, where the wire
+/// format is always 4 bytes; an untagged tagged-integer therefore
+/// writes the full `u32` and the caller must ensure the high byte is
+/// `> 0x1F` (otherwise a peer will decode it as a tagged value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Tagged<V> {
+    /// RFC 2868 §3.1 tag in the range `0x00..=0x1F`, or `None` if the
+    /// attribute was sent untagged.
+    pub tag: Option<u8>,
+    /// The attribute's typed value.
+    pub value: V,
+}
+
+impl<V> Tagged<V> {
+    /// Build a tagged pair. The tag is masked to its lower 5 bits per
+    /// RFC 2868 §3.1.
+    #[inline]
+    #[must_use]
+    pub const fn new(tag: u8, value: V) -> Self {
+        Self {
+            tag: Some(tag & 0x1F),
+            value,
+        }
+    }
+
+    /// Build a pair with no tag byte on the wire.
+    #[inline]
+    #[must_use]
+    pub const fn untagged(value: V) -> Self {
+        Self { tag: None, value }
+    }
+}
+
+impl<V> From<(u8, V)> for Tagged<V> {
+    #[inline]
+    fn from((tag, value): (u8, V)) -> Self {
+        Tagged::new(tag, value)
+    }
+}
+
 // ---------- impls ------------------------------------------------------
 
 impl WireType for WText {
@@ -164,6 +230,55 @@ impl WireType for WIfid {
     #[inline]
     fn decode(bytes: &[u8]) -> Option<[u8; 8]> {
         bytes.try_into().ok()
+    }
+}
+
+/// Split a tagged value's leading byte into `(tag, rest)`.
+///
+/// Returns `(Some(t), &bytes[1..])` if `bytes[0]` lies in the
+/// reserved tag range `0x00..=0x1F`, otherwise `(None, bytes)` —
+/// matching the RFC 2868 §3.1 rule that values above `0x1F` are
+/// payload bytes, not tags.
+#[inline]
+fn split_tag(bytes: &[u8]) -> (Option<u8>, &[u8]) {
+    match bytes.split_first() {
+        Some((&t, rest)) if t <= 0x1F => (Some(t), rest),
+        _ => (None, bytes),
+    }
+}
+
+impl WireType for WTaggedText {
+    type View<'a> = Tagged<&'a str>;
+    #[inline]
+    fn decode(bytes: &[u8]) -> Option<Tagged<&str>> {
+        let (tag, rest) = split_tag(bytes);
+        std::str::from_utf8(rest)
+            .ok()
+            .map(|value| Tagged { tag, value })
+    }
+}
+
+impl WireType for WTaggedInteger {
+    type View<'a> = Tagged<u32>;
+    #[inline]
+    fn decode(bytes: &[u8]) -> Option<Tagged<u32>> {
+        // RFC 2868 §3.6 fixes the on-wire size at 4 bytes.
+        let octets: [u8; 4] = bytes.try_into().ok()?;
+        if octets[0] <= 0x1F {
+            // Tagged: first byte is the tag, remaining 3 bytes are the
+            // big-endian 24-bit value.
+            let value = u32::from_be_bytes([0, octets[1], octets[2], octets[3]]);
+            Some(Tagged {
+                tag: Some(octets[0]),
+                value,
+            })
+        } else {
+            // Untagged: full 32-bit integer.
+            Some(Tagged {
+                tag: None,
+                value: u32::from_be_bytes(octets),
+            })
+        }
     }
 }
 
@@ -351,6 +466,70 @@ impl IntoWire<WIfid> for [u8; 8] {
     }
 }
 
+// --- tagged encoders ---------------------------------------------------
+//
+// Tag bytes are masked to 5 bits (`& 0x1F`) on emit, matching the
+// RFC 2868 §3.1 tag space; passing a wider value silently truncates
+// rather than corrupting the wire by spilling into the payload range.
+
+impl IntoWire<WTaggedText> for Tagged<&str> {
+    #[inline]
+    fn write_value(self, out: &mut Vec<u8>) {
+        if let Some(tag) = self.tag {
+            out.push(tag & 0x1F);
+        }
+        out.extend_from_slice(self.value.as_bytes());
+    }
+}
+
+impl IntoWire<WTaggedText> for Tagged<&String> {
+    #[inline]
+    fn write_value(self, out: &mut Vec<u8>) {
+        Tagged {
+            tag: self.tag,
+            value: self.value.as_str(),
+        }
+        .write_value(out);
+    }
+}
+
+/// Shorthand: `(tag, value)` always writes a tag byte. Use
+/// [`Tagged::untagged`] to omit it.
+impl IntoWire<WTaggedText> for (u8, &str) {
+    #[inline]
+    fn write_value(self, out: &mut Vec<u8>) {
+        Tagged::new(self.0, self.1).write_value(out);
+    }
+}
+
+impl IntoWire<WTaggedInteger> for Tagged<u32> {
+    #[inline]
+    fn write_value(self, out: &mut Vec<u8>) {
+        // RFC 2868 §3.6 forces a 4-byte wire form. When the caller
+        // requests a tag, emit `tag (1) || value[1..4] (3)` so the
+        // 24-bit value occupies the lower three octets. When they
+        // omit the tag, emit the full 32-bit big-endian integer; the
+        // caller is responsible for ensuring the high byte is `>
+        // 0x1F` so peers parse it as untagged.
+        if let Some(tag) = self.tag {
+            out.push(tag & 0x1F);
+            let bytes = self.value.to_be_bytes();
+            out.extend_from_slice(&bytes[1..4]);
+        } else {
+            out.extend_from_slice(&self.value.to_be_bytes());
+        }
+    }
+}
+
+/// Shorthand: `(tag, value)` always writes a tag byte. Use
+/// [`Tagged::untagged`] to omit it.
+impl IntoWire<WTaggedInteger> for (u8, u32) {
+    #[inline]
+    fn write_value(self, out: &mut Vec<u8>) {
+        Tagged::new(self.0, self.1).write_value(out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +577,126 @@ mod tests {
         );
         // VsaAttr carries PEN + vendor-type; alignment may pad it to a u32.
         assert!(std::mem::size_of::<VsaAttr<WBytes>>() <= std::mem::size_of::<u32>() * 2);
+    }
+
+    #[test]
+    fn tagged_text_decode_with_tag() {
+        // `0x01 || "vpn0"` — tag 1, value "vpn0".
+        let v = WTaggedText::decode(b"\x01vpn0").unwrap();
+        assert_eq!(v.tag, Some(1));
+        assert_eq!(v.value, "vpn0");
+    }
+
+    #[test]
+    fn tagged_text_decode_untagged_when_high_byte() {
+        // First byte 0x76 ('v') > 0x1F — no tag, whole string is value.
+        let v = WTaggedText::decode(b"vpn0").unwrap();
+        assert_eq!(v.tag, None);
+        assert_eq!(v.value, "vpn0");
+    }
+
+    #[test]
+    fn tagged_text_decode_empty_value_with_tag() {
+        let v = WTaggedText::decode(b"\x05").unwrap();
+        assert_eq!(v.tag, Some(5));
+        assert_eq!(v.value, "");
+    }
+
+    #[test]
+    fn tagged_text_decode_rejects_bad_utf8() {
+        assert!(WTaggedText::decode(b"\x01\xff\xfe").is_none());
+    }
+
+    #[test]
+    fn tagged_integer_decode_with_tag() {
+        // tag=1, value=0x000006 (IPSec ESP).
+        let v = WTaggedInteger::decode(&[0x01, 0x00, 0x00, 0x06]).unwrap();
+        assert_eq!(v.tag, Some(1));
+        assert_eq!(v.value, 6);
+    }
+
+    #[test]
+    fn tagged_integer_decode_untagged() {
+        // First byte 0xAA > 0x1F — whole word is the integer value.
+        let v = WTaggedInteger::decode(&[0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
+        assert_eq!(v.tag, None);
+        assert_eq!(v.value, 0xAABB_CCDD);
+    }
+
+    #[test]
+    fn tagged_integer_decode_rejects_wrong_length() {
+        assert!(WTaggedInteger::decode(&[0x01, 0x00, 0x06]).is_none());
+        assert!(WTaggedInteger::decode(&[0x01, 0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn tagged_text_encode_with_tag() {
+        let mut out = Vec::new();
+        Tagged::new(2, "vpn0").write_value(&mut out);
+        assert_eq!(out, b"\x02vpn0");
+    }
+
+    #[test]
+    fn tagged_text_encode_untagged() {
+        let mut out = Vec::new();
+        Tagged::untagged("vpn0").write_value(&mut out);
+        assert_eq!(out, b"vpn0");
+    }
+
+    #[test]
+    fn tagged_text_encode_tuple_shorthand() {
+        let mut out = Vec::new();
+        IntoWire::<WTaggedText>::write_value((3u8, "ipsec"), &mut out);
+        assert_eq!(out, b"\x03ipsec");
+    }
+
+    #[test]
+    fn tagged_text_encode_masks_oversized_tag() {
+        // 0x21 (> 0x1F) must be truncated to 0x01 so the byte cannot
+        // be misread as the first byte of the payload.
+        let mut out = Vec::new();
+        Tagged::new(0x21, "vpn0").write_value(&mut out);
+        assert_eq!(out, b"\x01vpn0");
+    }
+
+    #[test]
+    fn tagged_integer_encode_with_tag() {
+        let mut out = Vec::new();
+        Tagged::new(1, 6u32).write_value(&mut out);
+        // tag(1) || 0x00 0x00 0x06
+        assert_eq!(out, [0x01, 0x00, 0x00, 0x06]);
+    }
+
+    #[test]
+    fn tagged_integer_encode_drops_top_byte_when_tagged() {
+        // value 0xFF_00_00_06 collides with the tagged 24-bit space;
+        // the top byte is silently dropped to keep the wire valid.
+        let mut out = Vec::new();
+        Tagged::new(1, 0xFF00_0006u32).write_value(&mut out);
+        assert_eq!(out, [0x01, 0x00, 0x00, 0x06]);
+    }
+
+    #[test]
+    fn tagged_integer_encode_untagged_emits_full_word() {
+        let mut out = Vec::new();
+        Tagged::untagged(0xAABB_CCDDu32).write_value(&mut out);
+        assert_eq!(out, [0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn tagged_integer_roundtrip() {
+        let mut buf = Vec::new();
+        Tagged::new(7, 0x12_3456u32).write_value(&mut buf);
+        let v = WTaggedInteger::decode(&buf).unwrap();
+        assert_eq!(v, Tagged::new(7, 0x12_3456));
+    }
+
+    #[test]
+    fn tagged_text_roundtrip() {
+        let mut buf = Vec::new();
+        Tagged::new(4, "alpha").write_value(&mut buf);
+        let v = WTaggedText::decode(&buf).unwrap();
+        assert_eq!(v.tag, Some(4));
+        assert_eq!(v.value, "alpha");
     }
 }

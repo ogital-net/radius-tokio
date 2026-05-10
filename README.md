@@ -104,6 +104,38 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
+### Tagged tunnel attributes (RFC 2868)
+
+Attributes carrying an RFC 2868 §3.1 tag — `Tunnel-Type`,
+`Tunnel-Medium-Type`, `Tunnel-Private-Group-Id`, … — are exposed
+through `Tagged<V>` so consumers never hand-roll the tag byte or the
+24-bit packing of tagged integers. The typed handle picks the right
+wire shape automatically:
+
+```rust,no_run
+use radius_tokio::dict::generated::rfc::attrs;
+use radius_tokio::dict::typed::Tagged;
+# fn demo(request: radius_tokio::server::Request<'_>) {
+# use radius_tokio::Code;
+# let mut reply = request.reply(Code::ACCESS_ACCEPT);
+
+// Encode: a `(tag, value)` tuple is the shorthand; `Tagged::untagged`
+// drops the tag byte. Tagged-integer values are clamped to 24 bits.
+reply.add(attrs::TUNNEL_TYPE, (1u8, 13u32)).unwrap();           // tag=1, VLAN
+reply.add(attrs::TUNNEL_MEDIUM_TYPE, (1u8, 6u32)).unwrap();     // tag=1, IEEE-802
+reply.add(attrs::TUNNEL_PRIVATE_GROUP_ID, (1u8, "42")).unwrap();// tag=1, VLAN 42
+reply.add(attrs::TUNNEL_PREFERENCE, Tagged::untagged(1u32)).unwrap();
+
+// Decode: `get(...)` yields `Tagged<V>`; the tag is `None` when the
+// peer sent the attribute without one.
+for attr in request.attributes_iter().flatten() {
+    if let Some(t) = attr.get(attrs::TUNNEL_TYPE) {
+        let _ = (t.tag, t.value); // Option<u8>, u32
+    }
+}
+# }
+```
+
 See [`examples/`](examples/) for richer scenarios:
 
 - `mutable_clients.rs` — a runtime-mutable in-memory `ClientStore`.
