@@ -38,4 +38,5 @@ pub use codec::header::Code;
 pub use codec::typed;
 pub use codec::{
     attributes, authenticator, dissect, header, message_authenticator, CodecError, PacketBuffer,
+    TlvWriter,
 };
