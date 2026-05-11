@@ -11,26 +11,26 @@
 //! inline-asm headers) instead of `aws-lc-sys`. The public surface of
 //! this module is identical either way.
 
-#[cfg(not(feature = "md5-asm"))]
+#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
 use std::mem::MaybeUninit;
 
-#[cfg(not(feature = "md5-asm"))]
+#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
 use aws_lc_sys::{MD5_Final, MD5_Init, MD5_Transform, MD5_Update, MD5, MD5_CTX};
 
 /// MD5 block size in bytes.
-#[cfg(not(feature = "md5-asm"))]
+#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
 pub(crate) const BLOCK_SIZE: usize = aws_lc_sys::MD5_CBLOCK as usize;
-#[cfg(feature = "md5-asm")]
+#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
 pub(crate) const BLOCK_SIZE: usize = md5_asm::BLOCK_SIZE;
 
 /// MD5 digest length in bytes.
-#[cfg(not(feature = "md5-asm"))]
+#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
 pub(crate) const DIGEST_LENGTH: usize = aws_lc_sys::MD5_DIGEST_LENGTH as usize;
-#[cfg(feature = "md5-asm")]
+#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
 pub(crate) const DIGEST_LENGTH: usize = 16;
 
 /// Hashes `data` and returns the 16-byte MD5 digest.
-#[cfg(not(feature = "md5-asm"))]
+#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
 pub(crate) fn digest(data: &[u8]) -> [u8; DIGEST_LENGTH] {
     let mut out = [0u8; DIGEST_LENGTH];
     // SAFETY: data is a valid slice for data.len() bytes. out is exactly
@@ -42,7 +42,7 @@ pub(crate) fn digest(data: &[u8]) -> [u8; DIGEST_LENGTH] {
 }
 
 /// Hashes `data` and returns the 16-byte MD5 digest (asm backend).
-#[cfg(feature = "md5-asm")]
+#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
 pub(crate) fn digest(data: &[u8]) -> [u8; DIGEST_LENGTH] {
     let mut h = Md5::new();
     h.update(data);
@@ -57,12 +57,12 @@ pub(crate) fn digest(data: &[u8]) -> [u8; DIGEST_LENGTH] {
 ///
 /// Call [`update`][Md5::update] one or more times, then [`finalize`][Md5::finalize].
 /// `finalize` consumes `self` to prevent reuse.
-#[cfg(not(feature = "md5-asm"))]
+#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
 pub(crate) struct Md5 {
     ctx: MD5_CTX,
 }
 
-#[cfg(not(feature = "md5-asm"))]
+#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
 impl Md5 {
     /// Initializes a new MD5 context.
     pub(crate) fn new() -> Self {
@@ -125,7 +125,7 @@ impl Md5 {
 /// The compressor is FFI; the rest of the state machine (padding,
 /// length encoding, buffering) is plain Rust. No allocation on
 /// the steady-state path.
-#[cfg(feature = "md5-asm")]
+#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
 pub(crate) struct Md5 {
     state: [u32; 4],
     buf: [u8; BLOCK_SIZE],
@@ -135,7 +135,7 @@ pub(crate) struct Md5 {
     total_len: u64,
 }
 
-#[cfg(feature = "md5-asm")]
+#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
 impl Md5 {
     pub(crate) fn new() -> Self {
         Self {
@@ -150,14 +150,14 @@ impl Md5 {
     /// `md5-asm-avx512` feature enabled and an AVX512-capable CPU,
     /// returns `true`; otherwise the scalar `block_std` path is
     /// used. Plain `md5-asm` always returns `false`.
-    #[cfg(feature = "md5-asm-avx512")]
+    #[cfg(all(feature = "md5-asm-avx512", not(target_env = "msvc")))]
     #[inline]
     fn use_avx512() -> bool {
         use std::sync::OnceLock;
         static CACHED: OnceLock<bool> = OnceLock::new();
         *CACHED.get_or_init(md5_asm::is_avx512_supported)
     }
-    #[cfg(not(feature = "md5-asm-avx512"))]
+    #[cfg(any(not(feature = "md5-asm-avx512"), target_env = "msvc"))]
     #[inline]
     fn use_avx512() -> bool {
         false
@@ -165,25 +165,33 @@ impl Md5 {
 
     #[inline]
     fn compress_block(state: &mut [u32; 4], block: &[u8; BLOCK_SIZE]) {
-        #[cfg(all(feature = "md5-asm-avx512", target_arch = "x86_64"))]
+        #[cfg(all(
+            feature = "md5-asm-avx512",
+            target_arch = "x86_64",
+            not(target_env = "msvc")
+        ))]
         if Self::use_avx512() {
             // SAFETY: `use_avx512` only returns true if
             // `is_avx512_supported()` was true.
             unsafe { md5_asm::block_avx512(state, block) };
             return;
         }
-        md5_asm::block_std(state, block);
+        md5_asm::block(state, block);
     }
 
     #[inline]
     fn compress_blocks(state: &mut [u32; 4], blocks: &[u8]) {
-        #[cfg(all(feature = "md5-asm-avx512", target_arch = "x86_64"))]
+        #[cfg(all(
+            feature = "md5-asm-avx512",
+            target_arch = "x86_64",
+            not(target_env = "msvc")
+        ))]
         if Self::use_avx512() {
             // SAFETY: as above.
             unsafe { md5_asm::blocks_avx512(state, blocks) };
             return;
         }
-        md5_asm::blocks_std(state, blocks);
+        md5_asm::blocks(state, blocks);
     }
 
     pub(crate) fn update(&mut self, mut data: &[u8]) {

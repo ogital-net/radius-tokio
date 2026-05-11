@@ -95,7 +95,7 @@ radius-dict = { path = "crates/radius-dict", version = "0.1.0" }
 # force consumers onto our exact bump cadence for no real reason.
 aws-lc-sys = ">=0.40, <2"
 # Optional experimental MD5 backend. Gated by the `md5-asm` feature.
-md5-asm = { path = "crates/md5-asm", optional = true }
+md5-asm = { path = "crates/md5-asm", version = "0.1.0", optional = true }
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
 # Optional structured logging. Gated by the `tracing` feature so the
 # default build keeps zero non-aws-lc / non-tokio dependencies. With

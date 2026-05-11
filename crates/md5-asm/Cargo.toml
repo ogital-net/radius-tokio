@@ -1,14 +1,30 @@
 [package]
 name = "md5-asm"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.79"
-publish = false
-description = "Experimental: vendored animetosho/md5-optimisation block compressor exposed via a C++ shim built with `cc`."
-# Wrapper code (src/) is BSD-2-Clause; vendored upstream headers in
-# vendor/ are public-domain / CC0-1.0 per
+description = "MD5 block compressor backed by the vendored animetosho/md5-optimisation inline-asm headers, exposed via a thin C++ shim."
+# Wrapper code (src/, build.rs) is BSD-2-Clause; vendored upstream
+# headers in vendor/ are public-domain / CC0-1.0 per
 # https://github.com/animetosho/md5-optimisation/discussions/4.
 license = "BSD-2-Clause AND CC0-1.0"
+repository = "https://github.com/example/radius-tokio"
+keywords = ["md5", "crypto", "hash", "asm", "simd"]
+categories = ["cryptography", "no-std"]
+readme = "README.md"
+# Restrict the package contents to what's actually built or
+# referenced. `cargo package` would otherwise pick up everything in
+# the crate dir.
+include = [
+    "src/**/*.rs",
+    "src/**/*.cpp",
+    "vendor/md5-arm64-asm.h",
+    "vendor/md5-x86-asm.h",
+    "vendor/LICENSE",
+    "build.rs",
+    "Cargo.toml",
+    "README.md",
+]
 
 [lib]
 path = "src/lib.rs"

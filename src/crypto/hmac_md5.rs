@@ -15,19 +15,19 @@
 //!   block compressor. The public surface is identical either way.
 
 /// HMAC-MD5 tag length in bytes. Equal to the MD5 digest length.
-#[cfg(not(feature = "md5-asm"))]
+#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
 pub(crate) const TAG_LEN: usize = aws_lc_sys::MD5_DIGEST_LENGTH as usize;
-#[cfg(feature = "md5-asm")]
+#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
 pub(crate) const TAG_LEN: usize = super::md5::DIGEST_LENGTH;
 
 // ---------------------------------------------------------------------------
 // aws-lc-sys backend (default)
 // ---------------------------------------------------------------------------
 
-#[cfg(not(feature = "md5-asm"))]
+#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
 use std::mem::MaybeUninit;
 
-#[cfg(not(feature = "md5-asm"))]
+#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
 use aws_lc_sys::{HMAC_CTX_cleanup, HMAC_Final, HMAC_Init_ex, HMAC_Update, HMAC_CTX};
 
 /// Incremental HMAC-MD5 context backed by a stack-allocated `HMAC_CTX`.
@@ -35,12 +35,12 @@ use aws_lc_sys::{HMAC_CTX_cleanup, HMAC_Final, HMAC_Init_ex, HMAC_Update, HMAC_C
 /// Call [`update`][HmacMd5::update] one or more times, then
 /// [`finalize`][HmacMd5::finalize]. `finalize` consumes `self` to
 /// prevent reuse after the context is cleaned up.
-#[cfg(not(feature = "md5-asm"))]
+#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
 pub(crate) struct HmacMd5 {
     ctx: HMAC_CTX,
 }
 
-#[cfg(not(feature = "md5-asm"))]
+#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
 impl HmacMd5 {
     /// Initializes a new HMAC-MD5 context with the given `key`.
     pub(crate) fn new(key: &[u8]) -> Self {
@@ -86,7 +86,7 @@ impl HmacMd5 {
     }
 }
 
-#[cfg(not(feature = "md5-asm"))]
+#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
 impl Drop for HmacMd5 {
     fn drop(&mut self) {
         // SAFETY: ctx is initialized. HMAC_CTX_cleanup is idempotent and
@@ -99,7 +99,7 @@ impl Drop for HmacMd5 {
 // md5-asm backend (RFC 2104 layered on the in-tree Md5 wrapper)
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "md5-asm")]
+#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
 use super::md5::{Md5, BLOCK_SIZE};
 
 /// Incremental HMAC-MD5 context backed by the in-tree [`Md5`] wrapper.
@@ -111,14 +111,14 @@ use super::md5::{Md5, BLOCK_SIZE};
 /// The ipad-prefixed inner state is precomputed at construction time so
 /// `update` only feeds the message and `finalize` runs the outer hash.
 /// No allocation on the steady-state path.
-#[cfg(feature = "md5-asm")]
+#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
 pub(crate) struct HmacMd5 {
     inner: Md5,
     /// `K' ⊕ opad`, ready to feed into the outer MD5. Zeroized on drop.
     opad: [u8; BLOCK_SIZE],
 }
 
-#[cfg(feature = "md5-asm")]
+#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
 impl HmacMd5 {
     /// Initializes a new HMAC-MD5 context with the given `key`.
     pub(crate) fn new(key: &[u8]) -> Self {
@@ -182,7 +182,7 @@ impl HmacMd5 {
     }
 }
 
-#[cfg(feature = "md5-asm")]
+#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
 impl Drop for HmacMd5 {
     fn drop(&mut self) {
         // `opad` holds `K' XOR 0x5c`, which trivially reveals K. Wipe

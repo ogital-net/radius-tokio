@@ -1,10 +1,20 @@
 // Vendored from https://github.com/animetosho/md5-optimisation
-// (master @ 6641015). Local patch: every occurrence of the GCC-
-// only `"Ump"` inline-asm memory constraint has been replaced
-// with `"Q"`, which clang accepts and is the AArch64 constraint
-// for "memory operand with no offset" — the addressing mode the
-// surrounding `ldp` instructions actually require. No semantic
-// change on GCC (GCC accepts `Q` as well).
+// (master @ 6641015). Local patches:
+//
+//   1. Every occurrence of the GCC-only `"Ump"` inline-asm memory
+//      constraint has been replaced with `"Q"`, which clang accepts
+//      and is the AArch64 constraint for "memory operand with no
+//      offset" — the addressing mode the surrounding `ldp`
+//      instructions actually require. No semantic change on GCC
+//      (GCC accepts `Q` as well).
+//
+//   2. The upstream `template<typename HT> struct MD5_STATE { HT A,
+//      B, C, D; };` has been replaced with a plain C `typedef struct
+//      { uint32_t A, B, C, D; } md5_state_u32;` (the only
+//      instantiation the AArch64 path uses), and every
+//      `md5_state_u32*` parameter has been retyped to
+//      `md5_state_u32*`. This lets the file be compiled by a plain
+//      C compiler — no C++ frontend, STL, or runtime needed.
 
 #ifndef STR
 # define STR_HELPER(x) #x
@@ -44,12 +54,11 @@ static const uint64_t md5_constants_aarch64[32] __attribute__((aligned(8))) = {
 	0xbd3af235f7537e82ULL, 0xeb86d3912ad7d2bbULL
 };
 
-template<typename HT>
-struct MD5_STATE {
-	HT A, B, C, D;
-};
+typedef struct {
+	uint32_t A, B, C, D;
+} md5_state_u32;
 
-static inline __attribute__((always_inline)) void md5_block_std(MD5_STATE<uint32_t>* __restrict__ state, const void* __restrict__ data) {
+static inline __attribute__((always_inline)) void md5_block_std(md5_state_u32* __restrict__ state, const void* __restrict__ data) {
 	uint32_t A;
 	uint32_t B;
 	uint32_t C;

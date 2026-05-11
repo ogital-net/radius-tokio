@@ -24,15 +24,22 @@
 
 #ifdef PLATFORM_X86
 
-template<typename HT>
-struct MD5_STATE {
-	HT A, B, C, D;
-};
+// Local patch (radius-tokio): the upstream
+// `template<typename HT> struct MD5_STATE { HT A, B, C, D; };` has
+// been replaced with two concrete C typedefs (one per instantiation
+// the file actually uses) and every `MD5_STATE<...>*` parameter has
+// been retyped accordingly. This lets the file be compiled by a
+// plain C compiler. The `md5_state_m128i` typedef is gated to the
+// AVX-512 build (the only place `<immintrin.h>` is in scope and the
+// only place `__m128i` is referenced).
+typedef struct {
+	uint32_t A, B, C, D;
+} md5_state_u32;
 
 // GCC insanity [https://gcc.gnu.org/legacy-ml/gcc-help/2011-04/msg00566.html]
 #define ASM_INPUTS [input0]"m"(_in[0]), [input1]"m"(_in[1]), [input2]"m"(_in[2]), [input3]"m"(_in[3]), [input4]"m"(_in[4]), [input5]"m"(_in[5]), [input6]"m"(_in[6]), [input7]"m"(_in[7]), [input8]"m"(_in[8]), [input9]"m"(_in[9]), [input10]"m"(_in[10]), [input11]"m"(_in[11]), [input12]"m"(_in[12]), [input13]"m"(_in[13]), [input14]"m"(_in[14]), [input15]"m"(_in[15])
 
-static inline __attribute__((always_inline)) void md5_block_std(MD5_STATE<uint32_t>* __restrict__ state, const void* __restrict__ data) {
+static inline __attribute__((always_inline)) void md5_block_std(md5_state_u32* __restrict__ state, const void* __restrict__ data) {
 	uint32_t A;
 	uint32_t B;
 	uint32_t C;
@@ -198,7 +205,7 @@ static inline __attribute__((always_inline)) void md5_block_std(MD5_STATE<uint32
 }
 #undef ROUND_G
 
-static inline __attribute__((always_inline)) void md5_block_gopt(MD5_STATE<uint32_t>* __restrict__ state, const void* __restrict__ data) {
+static inline __attribute__((always_inline)) void md5_block_gopt(md5_state_u32* __restrict__ state, const void* __restrict__ data) {
 	uint32_t A;
 	uint32_t B;
 	uint32_t C;
@@ -303,7 +310,7 @@ static inline __attribute__((always_inline)) void md5_block_gopt(MD5_STATE<uint3
 
 #undef ROUND_H
 
-static inline __attribute__((always_inline)) void md5_block_ghopt(MD5_STATE<uint32_t>* __restrict__ state, const void* __restrict__ data) {
+static inline __attribute__((always_inline)) void md5_block_ghopt(md5_state_u32* __restrict__ state, const void* __restrict__ data) {
 	uint32_t A;
 	uint32_t B;
 	uint32_t C;
@@ -401,7 +408,7 @@ static inline __attribute__((always_inline)) void md5_block_ghopt(MD5_STATE<uint
 #ifdef __BMI__
 #undef ROUND_G
 
-static inline __attribute__((always_inline)) void md5_block_ghbmi(MD5_STATE<uint32_t>* __restrict__ state, const void* __restrict__ data) {
+static inline __attribute__((always_inline)) void md5_block_ghbmi(md5_state_u32* __restrict__ state, const void* __restrict__ data) {
 	uint32_t A;
 	uint32_t B;
 	uint32_t C;
@@ -580,7 +587,7 @@ static inline __attribute__((always_inline)) void md5_block_ghbmi(MD5_STATE<uint
 
 
 
-static inline __attribute__((always_inline)) void md5_block_nolea(MD5_STATE<uint32_t>* __restrict__ state, const void* __restrict__ data) {
+static inline __attribute__((always_inline)) void md5_block_nolea(md5_state_u32* __restrict__ state, const void* __restrict__ data) {
 	uint32_t A;
 	uint32_t B;
 	uint32_t C;
@@ -711,7 +718,7 @@ static inline __attribute__((always_inline)) void md5_block_nolea(MD5_STATE<uint
 }
 #undef ROUND_G
 
-static inline __attribute__((always_inline)) void md5_block_noleag(MD5_STATE<uint32_t>* __restrict__ state, const void* __restrict__ data) {
+static inline __attribute__((always_inline)) void md5_block_noleag(md5_state_u32* __restrict__ state, const void* __restrict__ data) {
 	uint32_t A;
 	uint32_t B;
 	uint32_t C;
@@ -781,7 +788,7 @@ static inline __attribute__((always_inline)) void md5_block_noleag(MD5_STATE<uin
 
 #undef ROUND_H
 
-static inline __attribute__((always_inline)) void md5_block_noleagh(MD5_STATE<uint32_t>* __restrict__ state, const void* __restrict__ data) {
+static inline __attribute__((always_inline)) void md5_block_noleagh(md5_state_u32* __restrict__ state, const void* __restrict__ data) {
 	uint32_t A;
 	uint32_t B;
 	uint32_t C;
@@ -872,7 +879,7 @@ static inline __attribute__((always_inline)) void md5_block_noleagh(MD5_STATE<ui
 #undef RI4
 
 
-static inline __attribute__((always_inline)) void md5_block_cache4(MD5_STATE<uint32_t>* __restrict__ state, const void* __restrict__ data) {
+static inline __attribute__((always_inline)) void md5_block_cache4(md5_state_u32* __restrict__ state, const void* __restrict__ data) {
 	uint32_t A = state->A;
 	uint32_t B = state->B;
 	uint32_t C = state->C;
@@ -1033,7 +1040,7 @@ static inline __attribute__((always_inline)) void md5_block_cache4(MD5_STATE<uin
 
 
 
-static inline __attribute__((always_inline)) void md5_block_cache8(MD5_STATE<uint32_t>* __restrict__ state, const void* __restrict__ data) {
+static inline __attribute__((always_inline)) void md5_block_cache8(md5_state_u32* __restrict__ state, const void* __restrict__ data) {
 	uint32_t A = state->A;
 	uint32_t B = state->B;
 	uint32_t C = state->C;
@@ -1197,7 +1204,7 @@ static inline __attribute__((always_inline)) void md5_block_cache8(MD5_STATE<uin
 
 #undef ROUND_G
 
-static inline __attribute__((always_inline)) void md5_block_cache_gopt(MD5_STATE<uint32_t>* __restrict__ state, const void* __restrict__ data) {
+static inline __attribute__((always_inline)) void md5_block_cache_gopt(md5_state_u32* __restrict__ state, const void* __restrict__ data) {
 	uint32_t A = state->A;
 	uint32_t B = state->B;
 	uint32_t C = state->C;
@@ -1287,6 +1294,14 @@ static inline __attribute__((always_inline)) void md5_block_cache_gopt(MD5_STATE
 
 #if defined(__AVX512VL__) && defined(PLATFORM_AMD64)
 #include <immintrin.h>
+
+// Local patch (radius-tokio): the AVX-512 instantiation of the
+// upstream `MD5_STATE` template, gated to the only build where
+// `__m128i` is in scope.
+typedef struct {
+	__m128i A, B, C, D;
+} md5_state_m128i;
+
 static const uint32_t md5_constants[64] __attribute__((aligned(16))) = {
 	// F
 	0xd76aa478L, 0xe8c7b756L, 0x242070dbL, 0xc1bdceeeL,
@@ -1313,7 +1328,7 @@ static const uint32_t md5_constants[64] __attribute__((aligned(16))) = {
 	0x7e7fbfdeL, 0x256c92dbL, 0xadaeeb9bL, 0xde8a69e8L
 };
 
-static inline __attribute__((always_inline)) void md5_block_avx512(MD5_STATE<__m128i>* __restrict__ state, const void* __restrict__ data) {
+static inline __attribute__((always_inline)) void md5_block_avx512(md5_state_m128i* __restrict__ state, const void* __restrict__ data) {
 	__m128i A;
 	__m128i B;
 	__m128i C;

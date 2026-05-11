@@ -633,10 +633,13 @@ Order within a phase is a suggestion, not a contract; expect iteration.
       explicit `version = "0.1.0"` so the real publish chain works.
 - [ ] Publish 0.1.0. Pre-publish checklist:
   1. Replace `https://github.com/example/radius-tokio` with the real
-     repository URL in all three `Cargo.toml` files.
+     repository URL in all four `Cargo.toml` files (root,
+     `crates/radius-dict-codegen`, `crates/radius-dict`,
+     `crates/md5-asm`).
   2. `cargo publish -p radius-dict-codegen`
   3. `cargo publish -p radius-dict`
-  4. `cargo publish` (root)
+  4. `cargo publish -p md5-asm`
+  5. `cargo publish` (root)
 
 ### Post-0.1 candidates (deferred)
 
