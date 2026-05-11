@@ -383,7 +383,7 @@ mod tests {
 
         // Locate the Tunnel-Password attribute (type 69).
         let attr = attributes::iter(pkt.attributes())
-            .filter_map(|r| r.ok())
+            .filter_map(Result::ok)
             .find(|r| r.attribute_type() == TUNNEL_PASSWORD_TYPE)
             .expect("Tunnel-Password attribute present");
 
@@ -413,7 +413,7 @@ mod tests {
             .unwrap();
         let pkt = reply.seal_for(&req_auth, secret);
         let attr = attributes::iter(pkt.attributes())
-            .filter_map(|r| r.ok())
+            .filter_map(Result::ok)
             .find(|r| r.attribute_type() == TUNNEL_PASSWORD_TYPE)
             .expect("present");
         assert_eq!(attr.value()[0], 0u8, "tag byte is 0");
@@ -438,8 +438,7 @@ mod tests {
             assert_eq!(
                 result.map(|_| ()),
                 Err(CodecError::WrongPacketType),
-                "expected WrongPacketType for code {:?}",
-                code,
+                "expected WrongPacketType for code {code:?}",
             );
         }
     }

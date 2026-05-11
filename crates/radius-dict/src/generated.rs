@@ -149,6 +149,14 @@ pub mod ruckus {
     include!(concat!(env!("OUT_DIR"), "/dict_ruckus.rs"));
 }
 
+#[cfg(feature = "dict-tplink")]
+#[allow(missing_docs)]
+pub mod tplink {
+    //! TP-Link VSAs (PEN 11863).
+    use super::{AttributeEntry, ValueEntry, VendorEntry};
+    include!(concat!(env!("OUT_DIR"), "/dict_tplink.rs"));
+}
+
 #[cfg(feature = "dict-wispr")]
 #[allow(missing_docs)]
 pub mod wispr {
