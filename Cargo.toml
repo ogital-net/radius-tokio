@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/radius-dict-codegen",
     "crates/radius-dict",
+    "crates/md5-asm",
 ]
 resolver = "2"
 
@@ -22,7 +23,7 @@ categories = ["network-programming", "asynchronous"]
 exclude = ["CLAUDE.md", "dhat-heap.json"]
 
 [features]
-default = ["dict-rfc"]
+default = ["dict-rfc", "md5-asm"]
 # Emit `tracing` spans/events around accept, decode, dispatch, reply,
 # and CoA lifecycle. Off by default — pulls in the `tracing` crate.
 tracing = ["dep:tracing"]
@@ -34,6 +35,17 @@ metrics = ["dep:metrics"]
 # bindgen at build time and adds ~30s to a cold build. Build deps
 # (cmake + clang + libclang) become required. Off by default.
 radsec = ["aws-lc-sys/ssl", "tokio/io-util"]
+# Experimental: swap the MD5 block compressor from aws-lc-sys to the
+# in-tree `md5-asm` crate (a C++ shim around the vendored
+# `animetosho/md5-optimisation` inline-asm headers). On by default.
+# Pulls in a build-time C++ toolchain (`cc` + `c++`).
+md5-asm = ["dep:md5-asm"]
+# Experimental: opt into the AVX512 single-buffer variant from the
+# `md5-asm` crate. Implies `md5-asm`. x86_64-only at runtime
+# (no-op fallback to the std variant on non-AVX512 CPUs); on
+# non-x86_64 builds the extra entry points compile to nothing and
+# behaviour is identical to plain `md5-asm`.
+md5-asm-avx512 = ["md5-asm", "md5-asm/avx512"]
 # IETF / RFC dictionaries (always recommended; small).
 # These forward the feature flag to the radius-dict crate.
 dict-rfc = ["radius-dict/dict-rfc"]
@@ -82,6 +94,8 @@ radius-dict = { path = "crates/radius-dict", version = "0.1.0" }
 # to a single 0.x minor (Cargo's default `^0.40` behaviour) would
 # force consumers onto our exact bump cadence for no real reason.
 aws-lc-sys = ">=0.40, <2"
+# Optional experimental MD5 backend. Gated by the `md5-asm` feature.
+md5-asm = { path = "crates/md5-asm", optional = true }
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
 # Optional structured logging. Gated by the `tracing` feature so the
 # default build keeps zero non-aws-lc / non-tokio dependencies. With

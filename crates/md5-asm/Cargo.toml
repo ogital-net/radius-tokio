@@ -1,0 +1,35 @@
+[package]
+name = "md5-asm"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.79"
+publish = false
+description = "Experimental: vendored animetosho/md5-optimisation block compressor exposed via a C++ shim built with `cc`."
+# Wrapper code (src/) is BSD-2-Clause; vendored upstream headers in
+# vendor/ are public-domain / CC0-1.0 per
+# https://github.com/animetosho/md5-optimisation/discussions/4.
+license = "BSD-2-Clause AND CC0-1.0"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Compile the AVX512 single-buffer block compressor
+# (`md5_block_avx512` from the vendored animetosho header).
+# x86_64-only; the build script silently no-ops on other arches
+# so the feature can be enabled unconditionally by a downstream
+# `cfg(target_arch = "x86_64")` consumer. Callers must verify
+# `is_avx512_supported()` at runtime before invoking the entry
+# points.
+avx512 = []
+
+[build-dependencies]
+cc = "1"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+# Vendored upstream headers; no need to demand internal docs.
+missing_docs = "allow"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
