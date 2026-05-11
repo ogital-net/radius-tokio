@@ -50,7 +50,7 @@ pub const STATE_WORDS: usize = 4;
 // not being delivered on that target. For asm-grade performance
 // on Windows, build with `x86_64-pc-windows-gnu` or `clang-cl`.
 #[cfg(not(target_env = "msvc"))]
-unsafe extern "C" {
+extern "C" {
     fn md5_asm_block_std(state: *mut u32, block: *const u8);
     fn md5_asm_blocks_std(state: *mut u32, data: *const u8, nblocks: usize);
 
@@ -425,7 +425,7 @@ pub const IV: [u32; STATE_WORDS] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x103
 // additional vendor check for Zen workloads.
 
 #[cfg(all(feature = "avx512", target_arch = "x86_64", not(target_env = "msvc")))]
-unsafe extern "C" {
+extern "C" {
     fn md5_asm_block_avx512(state: *mut u32, block: *const u8);
     fn md5_asm_blocks_avx512(state: *mut u32, data: *const u8, nblocks: usize);
 }
@@ -441,6 +441,12 @@ unsafe extern "C" {
 pub fn is_avx512_supported() -> bool {
     #[cfg(all(feature = "avx512", target_arch = "x86_64", not(target_env = "msvc")))]
     {
+        // `is_x86_feature_detected!` is std-only because it relies
+        // on the OS-assisted CPUID runtime probe. The crate is
+        // otherwise `#![no_std]`, so pull `std` in only on this
+        // path; downstream targets that don't enable the `avx512`
+        // feature still get a no-std build.
+        extern crate std;
         std::arch::is_x86_feature_detected!("avx512vl")
             && std::arch::is_x86_feature_detected!("avx512f")
     }
@@ -499,6 +505,9 @@ mod tests {
     // on every call; this is intentional for downstream callers
     // but noisy inside the crate's own tests.
     #![allow(deprecated)]
+    // Tests use `eprintln!` for skip diagnostics; the crate is
+    // otherwise `#![no_std]`, so pull `std` in here.
+    extern crate std;
     use super::*;
 
     // Known-answer: empty message.
