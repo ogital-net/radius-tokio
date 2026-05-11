@@ -311,6 +311,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
+name = "fast-md5"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d5eae88ed9322ba43db8f1ce3214050d9dea7730f44b2de0769604526b8d584"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -472,13 +478,6 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
-
-[[package]]
-name = "md5-asm"
-version = "0.1.0"
-dependencies = [
- "cc",
-]
 
 [[package]]
 name = "memchr"
@@ -662,8 +661,8 @@ dependencies = [
  "aws-lc-sys",
  "criterion",
  "dhat",
+ "fast-md5",
  "libc",
- "md5-asm",
  "metrics",
  "radius-dict",
  "rusqlite",

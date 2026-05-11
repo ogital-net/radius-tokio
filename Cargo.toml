@@ -3,7 +3,6 @@ members = [
     ".",
     "crates/radius-dict-codegen",
     "crates/radius-dict",
-    "crates/md5-asm",
 ]
 resolver = "2"
 
@@ -23,7 +22,7 @@ categories = ["network-programming", "asynchronous"]
 exclude = ["CLAUDE.md", "dhat-heap.json"]
 
 [features]
-default = ["dict-rfc", "md5-asm"]
+default = ["dict-rfc", "fast-md5"]
 # Emit `tracing` spans/events around accept, decode, dispatch, reply,
 # and CoA lifecycle. Off by default — pulls in the `tracing` crate.
 tracing = ["dep:tracing"]
@@ -35,17 +34,11 @@ metrics = ["dep:metrics"]
 # bindgen at build time and adds ~30s to a cold build. Build deps
 # (cmake + clang + libclang) become required. Off by default.
 radsec = ["aws-lc-sys/ssl", "tokio/io-util"]
-# Experimental: swap the MD5 block compressor from aws-lc-sys to the
-# in-tree `md5-asm` crate (a C++ shim around the vendored
-# `animetosho/md5-optimisation` inline-asm headers). On by default.
-# Pulls in a build-time C++ toolchain (`cc` + `c++`).
-md5-asm = ["dep:md5-asm"]
-# Experimental: opt into the AVX512 single-buffer variant from the
-# `md5-asm` crate. Implies `md5-asm`. x86_64-only at runtime
-# (no-op fallback to the std variant on non-AVX512 CPUs); on
-# non-x86_64 builds the extra entry points compile to nothing and
-# behaviour is identical to plain `md5-asm`.
-md5-asm-avx512 = ["md5-asm", "md5-asm/avx512"]
+# Swap the MD5 block compressor from aws-lc-sys to the published
+# `fast-md5` crate (hand-written x86_64 / aarch64 assembly cores,
+# portable Rust fallback, pure-Rust no_std). On by default.
+# Falls back to `aws-lc-sys`'s MD5 when disabled.
+fast-md5 = ["dep:fast-md5"]
 # IETF / RFC dictionaries (always recommended; small).
 # These forward the feature flag to the radius-dict crate.
 dict-rfc = ["radius-dict/dict-rfc"]
@@ -91,11 +84,12 @@ radius-dict = { path = "crates/radius-dict", version = "0.1.0" }
 # Version: floor at the release we built and tested against, ceiling
 # below 2.0. aws-lc-sys is a thin shim over an OpenSSL-1.1-shaped C
 # API and has been API-stable across its 0.x line in practice; pinning
-# to a single 0.x minor (Cargo's default `^0.40` behaviour) would
+# to a single 0.x minor (Cargo's default `^0.40` behavior) would
 # force consumers onto our exact bump cadence for no real reason.
 aws-lc-sys = ">=0.40, <2"
-# Optional experimental MD5 backend. Gated by the `md5-asm` feature.
-md5-asm = { path = "crates/md5-asm", version = "0.1.0", optional = true }
+# Optimized MD5 backend (hand-written x86_64/aarch64 assembly + portable
+# Rust fallback). Gated by the `fast-md5` feature; enabled by default.
+fast-md5 = { version = "1", optional = true }
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
 # Optional structured logging. Gated by the `tracing` feature so the
 # default build keeps zero non-aws-lc / non-tokio dependencies. With
@@ -178,6 +172,10 @@ harness = false
 
 [[bench]]
 name = "server_udp"
+harness = false
+
+[[bench]]
+name = "md5_backends"
 harness = false
 
 [lints.rust]

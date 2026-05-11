@@ -5,28 +5,38 @@
 //! 1. Reads a datagram into a reusable scratch buffer.
 //! 2. Resolves the source to a [`Client`] via the
 //!    [`ClientStore`](super::ClientStore). Unknown sources are dropped
-//!    before any allocation beyond the receive buffer.
-//! 3. Parses the header and verifies code-appropriate authenticators
-//!    (Acct/CoA/Disconnect: zeroed-request; M-A: when present).
-//! 4. Consults the dedup cache; on hit, replays the cached reply
-//!    bytes inline.
-//! 5. **On miss**, copies the attribute bytes out of the shared
-//!    scratch buffer and spawns a Tokio task to run the
-//!    [`Handler`](super::Handler), seal the reply, cache it, and
-//!    send it.
+//!    before any allocation beyond the receive buffer — this is the
+//!    inline admission gate.
+//! 3. **Spawns** a Tokio task that owns the datagram bytes and runs
+//!    the rest of the pipeline: header parse, authenticator
+//!    verification (Acct/CoA/Disconnect zeroed-request and
+//!    Message-Authenticator), dedup cache lookup, handler dispatch,
+//!    reply seal, cache insert, and `send_to`.
 //!
-//! # Why spawn only at handler dispatch?
+//! # Why spawn just past the admission gate?
 //!
-//! Steps 1–4 are bounded, allocation-free, and constant-time
-//! relative to packet size — doing them inline keeps the noise floor
-//! (unknown clients, malformed packets, replays) off the runtime's
-//! task scheduler entirely. The handler is the one step the library
-//! cannot bound: a [`ClientStore`] returning a slow lookup is a
-//! deliberate operator choice, but the [`Handler`] runs arbitrary
-//! consumer code (DB writes, EAP method state machines, accounting
-//! fan-out). Spawning there matches the pattern Hyper recommends
-//! for HTTP and ensures one slow handler invocation cannot
-//! head-of-line block other clients.
+//! Profiling shows ~90 % of per-packet cycles are in MD5 / HMAC-MD5:
+//! one HMAC over the inbound Message-Authenticator, one HMAC over
+//! the sealed reply's Message-Authenticator, and one MD5 for the
+//! Response Authenticator. With everything serialized on the recv
+//! task, throughput is capped at single-core HMAC speed regardless
+//! of how many runtime workers Tokio has. Spawning right after the
+//! admission check lets a multi-thread runtime fan that crypto out
+//! across cores.
+//!
+//! The admission lookup itself stays inline so an unknown-source
+//! flood costs zero spawns and zero allocations beyond the receive
+//! buffer — the single most important DoS property of the recv loop.
+//! Operators with expensive [`ClientStore`] backends (DB, network)
+//! are expected to wrap them in
+//! [`CachedStore`](super::CachedStore) so the inline lookup stays
+//! O(1); that is documented on the trait.
+//!
+//! Note that this design assumes a multi-thread Tokio runtime. On a
+//! `current_thread` runtime, spawned tasks still share the recv
+//! task's thread — there is no parallelism win, only a small
+//! per-packet scheduling cost. Consumers running single-threaded
+//! workloads on hot hardware should pick the `multi_thread` flavor.
 //!
 //! Send and receive share the single `UdpSocket` — Tokio's
 //! [`UdpSocket`] supports concurrent `send_to` from many tasks on
@@ -34,12 +44,14 @@
 //!
 //! # Allocations
 //!
-//! Drops (unknown client, bad authenticator, dedup hit) cost zero
-//! allocations on the hot path. A dispatched packet costs one
-//! `Vec<u8>` for the attribute bytes (sized to the wire length minus
-//! the 20-byte header) plus the spawned task itself. Outbound bytes
-//! are produced into the [`PacketBuffer`]'s `Vec`, which the dedup
-//! cache clones into its own boxed slice for retransmit storage.
+//! Unknown-client drops cost zero allocations. Every admitted packet
+//! costs one `Vec<u8>` for the datagram copy (so the recv buffer can
+//! be reused for the next packet) plus the spawned task itself.
+//! Subsequent drops (malformed header, bad authenticator, dedup hit)
+//! happen inside that task and add no further allocations beyond the
+//! datagram copy. Outbound bytes are produced into the
+//! [`PacketBuffer`]'s `Vec`, which the dedup cache clones into its
+//! own boxed slice for retransmit storage.
 
 use std::io;
 use std::net::SocketAddr;
@@ -49,12 +61,11 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 
-use crate::codec::header::{Code, Header, MAX_PACKET_LEN};
-use crate::codec::message_authenticator::Verification;
-use crate::codec::{authenticator, message_authenticator};
+use crate::codec::header::MAX_PACKET_LEN;
 
-use super::dedup::{DedupCache, Key as DedupKey};
-use super::handler::{Handler, HandlerResult, Request};
+use super::dedup::DedupCache;
+use super::handler::Handler;
+use super::pipeline::{self, Dispatched, Validated};
 use super::store::ClientStore;
 
 /// Default lifetime for an entry in the dedup / retransmit cache.
@@ -90,51 +101,57 @@ where
                 // internally, so any error surfaced here is terminal
                 // for the socket (e.g. ENOTCONN, EBADF). Bubble it up.
                 let (len, src) = res?;
-                inspect_and_dispatch(
-                    &socket,
-                    &buf[..len],
-                    src,
-                    store.as_ref(),
-                    &handler,
-                    &cache,
-                ).await;
+
+                // Inline admission gate: identify the peer before any
+                // allocation beyond the receive buffer. Unknown sources
+                // are dropped here; flood traffic never reaches the
+                // scheduler.
+                let Some(client) = store.lookup_udp(src).await else {
+                    warn_!(event = "drop", reason = "unknown_client", %src, len);
+                    count!("radius_tokio.packets_dropped", "reason" => "unknown_client");
+                    continue;
+                };
+
+                // Copy the datagram out of the shared scratch buffer
+                // so the next recv_from can overwrite it, then spawn
+                // the parse / verify / dispatch / seal / send pipeline
+                // so MD5 / HMAC-MD5 (the dominant cost) can scale
+                // across runtime workers on a multi-thread runtime.
+                let datagram = buf[..len].to_vec();
+                let socket = Arc::clone(&socket);
+                let handler = Arc::clone(&handler);
+                let cache = Arc::clone(&cache);
+                tokio::spawn(async move {
+                    process_packet(&socket, datagram, src, client, &handler, &cache).await;
+                });
             }
         }
     }
 }
 
-/// Inline portion of the pipeline: identify the peer, validate
-/// authenticators, consult the dedup cache. Bounded and
-/// allocation-free; runs on the receive task so noise (unknown
-/// clients, replays, bad MACs) never reaches the scheduler.
-///
-/// On a clean miss, copies the attribute bytes into an owned `Vec`
-/// and spawns the handler dispatch as a separate task — see the
-/// module doc for the rationale.
+/// Spawned per-packet pipeline: parse the header, validate
+/// authenticators, consult the dedup cache, and on a clean miss
+/// invoke the handler and send the sealed reply. Owns the datagram
+/// `Vec` produced by the recv loop.
 #[allow(clippy::too_many_lines, clippy::used_underscore_binding)]
-async fn inspect_and_dispatch<S, H>(
+async fn process_packet<H>(
     socket: &Arc<UdpSocket>,
-    datagram: &[u8],
+    datagram: Vec<u8>,
     src: SocketAddr,
-    store: &S,
+    client: Arc<super::client::Client>,
     handler: &Arc<H>,
     cache: &Arc<DedupCache>,
 ) where
-    S: ClientStore,
     H: Handler,
 {
-    // Step 1: identify the peer. Unknown sources are dropped before
-    // we touch the packet beyond the receive buffer.
-    let Some(client) = store.lookup_udp(src).await else {
-        warn_!(event = "drop", reason = "unknown_client", %src, len = datagram.len());
-        count!("radius_tokio.packets_dropped", "reason" => "unknown_client");
-        return;
-    };
+    let datagram = datagram.as_slice();
 
-    // Step 2: parse the fixed header. Malformed datagrams are dropped.
-    let (header, attrs) = match Header::parse(datagram) {
-        Ok(parsed) => parsed,
-        Err(_e) => {
+    // Steps 2–4: header parse, request-authenticator check,
+    // Message-Authenticator check. All transport-agnostic; the
+    // shared pipeline returns a single verdict we trace + act on.
+    let (header, attrs) = match pipeline::validate(datagram, &client) {
+        Validated::Ok { header, attrs } => (header, attrs),
+        Validated::MalformedHeader(_e) => {
             warn_!(
                 event = "drop",
                 reason = "malformed_header",
@@ -145,106 +162,49 @@ async fn inspect_and_dispatch<S, H>(
             count!("radius_tokio.packets_dropped", "reason" => "malformed_header");
             return;
         }
-    };
-
-    // Step 3: code-appropriate authenticator validation.
-    if !validate_request_authenticator(header.code, datagram, client.secret()) {
-        warn_!(
-            event = "drop",
-            reason = "bad_request_authenticator",
-            %src,
-            client = ?client.id(),
-            code = header.code.0,
-            id = header.identifier,
-        );
-        count!("radius_tokio.packets_dropped", "reason" => "bad_request_authenticator");
-        return;
-    }
-
-    // Step 4: Message-Authenticator (when present). Mismatch is a
-    // silent drop per RFC 3579 §3.2.
-    //
-    // The "Request Authenticator" the M-A formula substitutes into
-    // bytes 4..20 differs by code:
-    //
-    // * Access-Request carries a random Request Authenticator; that
-    //   value IS what the NAS used when computing the M-A, so we
-    //   substitute the wire bytes back in.
-    // * Accounting-Request / CoA-Request / Disconnect-Request derive
-    //   the Authenticator from the rest of the packet, so the NAS
-    //   computed M-A *before* the Authenticator existed — with the
-    //   field treated as 16 zero octets. The verifier must do the
-    //   same; substituting the wire authenticator here would never
-    //   match.
-    let ma_substitute = match header.code {
-        Code::ACCOUNTING_REQUEST | Code::COA_REQUEST | Code::DISCONNECT_REQUEST => [0u8; 16],
-        _ => header.authenticator,
-    };
-    match message_authenticator::verify(datagram, &ma_substitute, client.secret()) {
-        Verification::Valid => {}
-        Verification::Absent => {
-            // RFC 5080 §2.2.2 / RFC 3579 §3.2: Access-Request
-            // packets must carry Message-Authenticator if the
-            // operator has opted in to the strict policy (which
-            // is the default — see [`Client::require_message_authenticator`]).
-            // Accounting-Request / CoA-Request / Disconnect-Request
-            // are exempt: they authenticate via the Request
-            // Authenticator over the packet body and have never
-            // been required to carry M-A; forcing it would break
-            // the installed base for no security gain.
-            let strict_code = matches!(header.code, Code::ACCESS_REQUEST);
-            if strict_code && client.require_message_authenticator() {
-                warn_!(
-                    event = "drop",
-                    reason = "missing_message_authenticator",
-                    %src,
-                    client = ?client.id(),
-                    code = header.code.0,
-                    id = header.identifier,
-                );
-                count!(
-                    "radius_tokio.packets_dropped",
-                    "reason" => "missing_message_authenticator"
-                );
-                return;
-            }
+        Validated::BadRequestAuthenticator { code, identifier } => {
+            warn_!(
+                event = "drop",
+                reason = "bad_request_authenticator",
+                %src,
+                client = ?client.id(),
+                code = code.0,
+                id = identifier,
+            );
+            count!("radius_tokio.packets_dropped", "reason" => "bad_request_authenticator");
+            return;
         }
-        Verification::Invalid => {
+        Validated::MissingMessageAuthenticator { code, identifier } => {
+            warn_!(
+                event = "drop",
+                reason = "missing_message_authenticator",
+                %src,
+                client = ?client.id(),
+                code = code.0,
+                id = identifier,
+            );
+            count!(
+                "radius_tokio.packets_dropped",
+                "reason" => "missing_message_authenticator"
+            );
+            return;
+        }
+        Validated::BadMessageAuthenticator { code, identifier } => {
             warn_!(
                 event = "drop",
                 reason = "bad_message_authenticator",
                 %src,
                 client = ?client.id(),
-                code = header.code.0,
-                id = header.identifier,
+                code = code.0,
+                id = identifier,
             );
             count!("radius_tokio.packets_dropped", "reason" => "bad_message_authenticator");
             return;
         }
-    }
-
-    // Step 5: dedup. A hit replays the previously-sent reply inline;
-    // no spawn, no handler invocation.
-    let dedup_key = DedupKey {
-        src,
-        code: header.code.0,
-        identifier: header.identifier,
-        request_authenticator: header.authenticator,
     };
-    if let Some(cached) = cache.lookup(&dedup_key) {
-        debug!(
-            event = "dedup_hit",
-            %src,
-            client = ?client.id(),
-            code = header.code.0,
-            id = header.identifier,
-            reply_len = cached.len(),
-        );
-        count!("radius_tokio.dedup_hits");
-        let _ = socket.send_to(&cached, src).await;
-        return;
-    }
 
+    // Steps 5–6: dedup lookup + (on miss) handler dispatch + seal +
+    // cache insert. All transport-agnostic.
     debug!(
         event = "request",
         %src,
@@ -255,135 +215,72 @@ async fn inspect_and_dispatch<S, H>(
     );
     count!("radius_tokio.requests_dispatched", "code" => header.code.0.to_string());
 
-    // Step 6+: hand off to a spawned task. Copy the attribute slice
-    // out of the shared receive buffer (the next loop iteration will
-    // overwrite it) and clone the Arcs into the task.
-    let attrs_owned = attrs.to_vec();
-    let socket = Arc::clone(socket);
-    let handler = Arc::clone(handler);
-    let cache = Arc::clone(cache);
-    let code = header.code;
-    let identifier = header.identifier;
-    let request_authenticator = header.authenticator;
-    tokio::spawn(async move {
-        dispatch_handler(
-            socket,
-            client,
-            handler,
-            cache,
-            dedup_key,
-            code,
-            identifier,
-            request_authenticator,
-            attrs_owned,
-            src,
-        )
-        .await;
-    });
-}
+    let outcome =
+        pipeline::dispatch_validated(header, attrs, src, &client, handler.as_ref(), cache).await;
 
-/// Spawned portion of the pipeline: invoke the handler, seal the
-/// reply against the request's authenticator + client secret, store
-/// it in the dedup cache for retransmit, and send it.
-#[allow(clippy::too_many_arguments, clippy::used_underscore_binding)]
-async fn dispatch_handler<H>(
-    socket: Arc<UdpSocket>,
-    client: Arc<super::client::Client>,
-    handler: Arc<H>,
-    cache: Arc<DedupCache>,
-    dedup_key: DedupKey,
-    code: Code,
-    identifier: u8,
-    request_authenticator: [u8; 16],
-    attrs: Vec<u8>,
-    src: SocketAddr,
-) where
-    H: Handler,
-{
-    let request = Request::new(
-        code,
-        identifier,
-        request_authenticator,
-        &attrs,
-        &client,
-        src,
-    );
-
-    #[cfg(feature = "metrics")]
-    let handler_t0 = std::time::Instant::now();
-    let result = handler.handle(request).await;
-    #[cfg(feature = "metrics")]
-    observe!(
-        "radius_tokio.handler_duration_seconds",
-        handler_t0.elapsed().as_secs_f64()
-    );
-
-    let reply = match result {
-        HandlerResult::Reply(reply) => reply,
-        HandlerResult::Drop => {
-            debug!(event = "handler_drop", code = code.0, id = identifier);
-            count!("radius_tokio.packets_dropped", "reason" => "handler_drop");
-            return;
-        }
-    };
-
-    // Seal against the request's Authenticator + client secret.
-    let sealed = reply.seal_for(&request_authenticator, client.secret());
-    let bytes = sealed.as_bytes();
-
-    // Cache for retransmit, then send.
-    cache.insert(dedup_key, bytes);
-    let _reply_code = bytes.first().copied().unwrap_or(0);
-    match socket.send_to(bytes, src).await {
-        Ok(_n) => {
+    match outcome {
+        Dispatched::Replay {
+            bytes,
+            code: _code,
+            identifier: _identifier,
+        } => {
             debug!(
-                event = "reply_sent",
-                code = code.0,
-                reply_code = _reply_code,
-                id = identifier,
-                len = _n,
+                event = "dedup_hit",
+                %src,
+                client = ?client.id(),
+                code = _code.0,
+                id = _identifier,
+                reply_len = bytes.len(),
             );
-            count!("radius_tokio.replies_sent", "code" => _reply_code.to_string());
+            count!("radius_tokio.dedup_hits");
+            let _ = socket.send_to(&bytes, src).await;
         }
-        Err(_e) => {
-            warn_!(
-                event = "reply_send_error",
-                code = code.0,
-                id = identifier,
-                error = %_e,
-            );
-            count!("radius_tokio.send_errors");
+        Dispatched::Reply {
+            sealed,
+            code: _code,
+            identifier: _identifier,
+        } => {
+            let bytes = sealed.as_bytes();
+            let _reply_code = bytes.first().copied().unwrap_or(0);
+            match socket.send_to(bytes, src).await {
+                Ok(_n) => {
+                    debug!(
+                        event = "reply_sent",
+                        code = _code.0,
+                        reply_code = _reply_code,
+                        id = _identifier,
+                        len = _n,
+                    );
+                    count!("radius_tokio.replies_sent", "code" => _reply_code.to_string());
+                }
+                Err(_e) => {
+                    warn_!(
+                        event = "reply_send_error",
+                        code = _code.0,
+                        id = _identifier,
+                        error = %_e,
+                    );
+                    count!("radius_tokio.send_errors");
+                }
+            }
         }
-    }
-}
-
-/// Returns `true` if the packet's Authenticator field is acceptable
-/// for its code. Access-Request authenticators are random and cannot
-/// be checked on their own; for everything else we recompute
-/// `MD5(packet-with-zeros || secret)` and compare.
-fn validate_request_authenticator(code: Code, datagram: &[u8], secret: &[u8]) -> bool {
-    match code {
-        // Accounting-Request (RFC 2866 §3), CoA-Request /
-        // Disconnect-Request (RFC 5176): authenticator is
-        // MD5(packet-with-zeros || secret) — verify in place.
-        Code::ACCOUNTING_REQUEST | Code::COA_REQUEST | Code::DISCONNECT_REQUEST => {
-            authenticator::verify_zeroed_request(datagram, secret)
+        Dispatched::HandlerDrop {
+            code: _code,
+            identifier: _identifier,
+        } => {
+            debug!(event = "handler_drop", code = _code.0, id = _identifier);
+            count!("radius_tokio.packets_dropped", "reason" => "handler_drop");
         }
-        // Access-Request (RFC 2865 §3) carries a random authenticator;
-        // its integrity is bound by the Message-Authenticator (when
-        // present) and by the response auth on the reply.
-        // Status-Server / Status-Client follow the same shape; defer
-        // to the M-A check (which the pipeline runs unconditionally)
-        // for integrity.
-        _ => true,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::header::Code;
+    use crate::codec::header::{Code, Header};
+    use crate::codec::{authenticator, message_authenticator};
     use crate::server::client::Client;
+    use crate::server::handler::{HandlerResult, Request};
     use crate::server::store::{IpCidr, StaticClients};
     use std::net::Ipv4Addr;
     use std::sync::Mutex;

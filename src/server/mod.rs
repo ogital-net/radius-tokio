@@ -7,6 +7,7 @@ pub mod client;
 pub mod coa;
 mod dedup;
 pub mod handler;
+mod pipeline;
 #[cfg(feature = "radsec")]
 mod radsec;
 mod runtime;

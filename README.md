@@ -163,8 +163,7 @@ See [`examples/`](examples/) for richer scenarios:
 | `dict-wispr`      | no      | WISPr VSAs.                                         |
 | `dict-vendor-all` | no      | Umbrella enabling every vendored vendor dictionary. |
 | `radsec`          | no      | RADIUS-over-TLS (RFC 6614) listener + `tls` and `pki` modules. |
-| `md5-asm`         | **yes** | Swap the MD5 block compressor from `aws-lc-sys` to the in-tree [`md5-asm`](crates/md5-asm) crate (a C++ shim around the vendored [`animetosho/md5-optimisation`](https://github.com/animetosho/md5-optimisation) inline-asm headers). x86_64 + aarch64; ~9% off the codec/crypto hot path on Apple Silicon, smaller wins on larger inputs. |
-| `md5-asm-avx512`  | no      | Opt into the AVX512 single-buffer variant on top of `md5-asm`. x86_64 only; runtime-detected, no-op fallback to the scalar path on non-AVX512 CPUs. |
+| `fast-md5`        | **yes** | Swap the MD5 block compressor from `aws-lc-sys` to the [`fast-md5`](https://crates.io/crates/fast-md5) crate (hand-written x86_64 + aarch64 assembly, portable Rust fallback, `#![no_std]`). Disabling falls back to `aws-lc-sys`'s MD5, which is always available. |
 | `tracing`         | no      | Structured spans/events around accept and dispatch. |
 | `metrics`         | no      | Counters/histograms via the `metrics` facade.       |
 
@@ -175,12 +174,11 @@ The `radsec` feature pulls in `aws-lc-sys`'s `ssl` build, which runs
 `bindgen` and adds ~30s to a cold build (and requires `cmake` +
 `clang`/`libclang`).
 
-`md5-asm` is on by default. It pulls in a build-time C++ toolchain
-(`cc` + a `c++` compiler — `g++`, Apple Clang, or MSVC `cl.exe`),
-which every mainstream Linux/macOS/Windows CI image already provides.
-If you need a C++-toolchain-free build (or are targeting an arch
-other than x86, x86_64, or aarch64), turn it off with
-`--no-default-features --features dict-rfc`; the public API is
+`fast-md5` is on by default. It is a pure-Rust crate with no native
+build dependency — it uses Rust inline assembly for x86_64 and aarch64,
+and a portable fallback for every other target.
+If you need a build that avoids all optional dependencies, disable it
+with `--no-default-features --features dict-rfc`; the public API is
 identical and you fall back to `aws-lc-sys`'s MD5.
 
 ## RadSec (RFC 6614)

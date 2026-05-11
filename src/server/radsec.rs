@@ -73,14 +73,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, watch};
 
-use crate::codec::header::{Code, Header, MAX_PACKET_LEN, MIN_PACKET_LEN};
-use crate::codec::message_authenticator::Verification;
-use crate::codec::{authenticator, message_authenticator};
+use crate::codec::header::{MAX_PACKET_LEN, MIN_PACKET_LEN};
 use crate::tls::{HandshakeState, TlsConnection, TlsContext, TlsError};
 
 use super::client::{Client, ClientId};
-use super::dedup::{DedupCache, Key as DedupKey};
-use super::handler::{Handler, HandlerResult, Request};
+use super::dedup::DedupCache;
+use super::handler::Handler;
+use super::pipeline::{self, Dispatched, Validated};
 use super::store::ClientStore;
 
 /// How long a connection-level read may stall before we treat it
@@ -537,9 +536,15 @@ async fn process_frame<H: Handler>(
     handler: &H,
     cache: &DedupCache,
 ) -> io::Result<()> {
-    let (header, attrs) = match Header::parse(datagram) {
-        Ok(parsed) => parsed,
-        Err(_e) => {
+    // Steps 1–3: transport-agnostic header + authenticator
+    // validation. Inside an authenticated TLS session, any
+    // validation failure is a teardown condition rather than a
+    // drop-and-continue: matches `radsecproxy`'s `tlsserverrd`
+    // policy. (UDP, by contrast, legitimately drops the offending
+    // datagram.)
+    let (header, attrs) = match pipeline::validate(datagram, client) {
+        Validated::Ok { header, attrs } => (header, attrs),
+        Validated::MalformedHeader(_e) => {
             warn_!(
                 event = "radsec_drop",
                 reason = "malformed_header",
@@ -548,113 +553,60 @@ async fn process_frame<H: Handler>(
                 error = %_e,
             );
             count!("radius_tokio.packets_dropped", "reason" => "malformed_header");
-            // Bad framing on a TLS-protected connection means we
-            // can't trust subsequent bytes; close.
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "malformed header",
             ));
         }
-    };
-
-    if !validate_request_authenticator(header.code, datagram, client.secret()) {
-        warn_!(
-            event = "radsec_drop",
-            reason = "bad_request_authenticator",
-            %peer,
-            client = ?client.id(),
-            code = header.code.0,
-            id = header.identifier,
-        );
-        count!("radius_tokio.packets_dropped", "reason" => "bad_request_authenticator");
-        // Inside an authenticated TLS session, a bad RADIUS
-        // authenticator means either a misconfigured shared secret
-        // or something tampering inside the authenticated peer.
-        // Either way, continuing to read frames on this connection
-        // is unsafe — tear it down. Matches `radsecproxy`'s
-        // `tlsserverrd` policy. (UDP transport, by contrast,
-        // legitimately drops just the offending datagram.)
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "bad request authenticator",
-        ));
-    }
-
-    let ma_substitute = match header.code {
-        Code::ACCOUNTING_REQUEST | Code::COA_REQUEST | Code::DISCONNECT_REQUEST => [0u8; 16],
-        _ => header.authenticator,
-    };
-    match message_authenticator::verify(datagram, &ma_substitute, client.secret()) {
-        Verification::Valid => {}
-        Verification::Absent => {
-            // RFC 5080 §2.2.2 / RFC 3579 §3.2: Access-Request
-            // packets must carry Message-Authenticator if the
-            // operator has opted in to the strict policy
-            // (default — see [`Client::require_message_authenticator`]).
-            // Accounting / CoA / Disconnect are exempt; see
-            // the matching block in `server::udp` for the
-            // reasoning. On RadSec a missing-MA inside an
-            // authenticated TLS session is still a teardown
-            // condition under strict policy: it indicates a
-            // misconfigured peer that should be reconciled
-            // before more frames flow.
-            let strict_code = matches!(header.code, Code::ACCESS_REQUEST);
-            if strict_code && client.require_message_authenticator() {
-                warn_!(
-                    event = "radsec_drop",
-                    reason = "missing_message_authenticator",
-                    %peer,
-                    client = ?client.id(),
-                    code = header.code.0,
-                    id = header.identifier,
-                );
-                count!(
-                    "radius_tokio.packets_dropped",
-                    "reason" => "missing_message_authenticator"
-                );
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "missing message authenticator",
-                ));
-            }
+        Validated::BadRequestAuthenticator { code, identifier } => {
+            warn_!(
+                event = "radsec_drop",
+                reason = "bad_request_authenticator",
+                %peer,
+                client = ?client.id(),
+                code = code.0,
+                id = identifier,
+            );
+            count!("radius_tokio.packets_dropped", "reason" => "bad_request_authenticator");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad request authenticator",
+            ));
         }
-        Verification::Invalid => {
+        Validated::MissingMessageAuthenticator { code, identifier } => {
+            warn_!(
+                event = "radsec_drop",
+                reason = "missing_message_authenticator",
+                %peer,
+                client = ?client.id(),
+                code = code.0,
+                id = identifier,
+            );
+            count!(
+                "radius_tokio.packets_dropped",
+                "reason" => "missing_message_authenticator"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing message authenticator",
+            ));
+        }
+        Validated::BadMessageAuthenticator { code, identifier } => {
             warn_!(
                 event = "radsec_drop",
                 reason = "bad_message_authenticator",
                 %peer,
                 client = ?client.id(),
-                code = header.code.0,
-                id = header.identifier,
+                code = code.0,
+                id = identifier,
             );
             count!("radius_tokio.packets_dropped", "reason" => "bad_message_authenticator");
-            // See above: bad MA on a TLS-authenticated connection
-            // is a teardown condition, not a drop-and-continue.
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "bad message authenticator",
             ));
         }
-    }
-
-    let dedup_key = DedupKey {
-        src: peer,
-        code: header.code.0,
-        identifier: header.identifier,
-        request_authenticator: header.authenticator,
     };
-    if let Some(cached) = cache.lookup(&dedup_key) {
-        debug!(
-            event = "radsec_dedup_hit",
-            %peer,
-            client = ?client.id(),
-            id = header.identifier,
-            reply_len = cached.len(),
-        );
-        count!("radius_tokio.dedup_hits");
-        conn.write_all(&cached).await?;
-        return Ok(());
-    }
 
     debug!(
         event = "radsec_request",
@@ -666,74 +618,67 @@ async fn process_frame<H: Handler>(
     );
     count!("radius_tokio.requests_dispatched", "code" => header.code.0.to_string());
 
-    let request = Request::new(
-        header.code,
-        header.identifier,
-        header.authenticator,
-        attrs,
-        client,
-        peer,
-    );
+    // Steps 4–5: dedup-aware dispatch. Cache hit replays the
+    // previously-sent reply; cache miss runs the handler, seals,
+    // caches, and returns the sealed bytes.
+    let outcome = pipeline::dispatch_validated(header, attrs, peer, client, handler, cache).await;
 
-    #[cfg(feature = "metrics")]
-    let handler_t0 = std::time::Instant::now();
-    let result = handler.handle(request).await;
-    #[cfg(feature = "metrics")]
-    observe!(
-        "radius_tokio.handler_duration_seconds",
-        handler_t0.elapsed().as_secs_f64()
-    );
-
-    let reply = match result {
-        HandlerResult::Reply(reply) => reply,
-        HandlerResult::Drop => {
+    match outcome {
+        Dispatched::Replay {
+            bytes,
+            code: _code,
+            identifier: _identifier,
+        } => {
             debug!(
-                event = "handler_drop",
-                code = header.code.0,
-                id = header.identifier
+                event = "radsec_dedup_hit",
+                %peer,
+                client = ?client.id(),
+                id = _identifier,
+                reply_len = bytes.len(),
             );
-            count!("radius_tokio.packets_dropped", "reason" => "handler_drop");
-            return Ok(());
-        }
-    };
-
-    let sealed = reply.seal_for(&header.authenticator, client.secret());
-    let bytes = sealed.as_bytes();
-    cache.insert(dedup_key, bytes);
-    let _reply_code = bytes.first().copied().unwrap_or(0);
-    match conn.write_all(bytes).await {
-        Ok(()) => {
-            debug!(
-                event = "radsec_reply_sent",
-                code = header.code.0,
-                reply_code = _reply_code,
-                id = header.identifier,
-                len = bytes.len(),
-            );
-            count!("radius_tokio.replies_sent", "code" => _reply_code.to_string());
+            count!("radius_tokio.dedup_hits");
+            conn.write_all(&bytes).await?;
             Ok(())
         }
-        Err(e) => {
-            warn_!(
-                event = "radsec_reply_send_error",
-                code = header.code.0,
-                id = header.identifier,
-                error = %e,
-            );
-            count!("radius_tokio.send_errors");
-            Err(e)
+        Dispatched::Reply {
+            sealed,
+            code: _code,
+            identifier: _identifier,
+        } => {
+            let bytes = sealed.as_bytes();
+            let _reply_code = bytes.first().copied().unwrap_or(0);
+            match conn.write_all(bytes).await {
+                Ok(()) => {
+                    debug!(
+                        event = "radsec_reply_sent",
+                        code = _code.0,
+                        reply_code = _reply_code,
+                        id = _identifier,
+                        len = bytes.len(),
+                    );
+                    count!("radius_tokio.replies_sent", "code" => _reply_code.to_string());
+                    Ok(())
+                }
+                Err(e) => {
+                    warn_!(
+                        event = "radsec_reply_send_error",
+                        code = _code.0,
+                        id = _identifier,
+                        error = %e,
+                    );
+                    count!("radius_tokio.send_errors");
+                    Err(e)
+                }
+            }
         }
-    }
-}
-
-/// Same logic as the UDP transport — kept private here to avoid
-/// reaching into a sibling module's internals.
-fn validate_request_authenticator(code: Code, datagram: &[u8], secret: &[u8]) -> bool {
-    match code {
-        Code::ACCOUNTING_REQUEST | Code::COA_REQUEST | Code::DISCONNECT_REQUEST => {
-            authenticator::verify_zeroed_request(datagram, secret)
+        Dispatched::HandlerDrop {
+            code: _code,
+            identifier: _identifier,
+        } => {
+            debug!(event = "handler_drop", code = _code.0, id = _identifier,);
+            count!("radius_tokio.packets_dropped", "reason" => "handler_drop");
+            Ok(())
         }
-        _ => true,
     }
 }
 
@@ -953,7 +898,7 @@ mod tests {
     use crate::codec::PacketBuffer;
     use crate::crypto::tls::test_client::{build_pki, client_side};
     use crate::server::client::Client;
-    use crate::server::handler::HandlerResult;
+    use crate::server::handler::{HandlerResult, Request};
     use crate::server::store::{IpCidr, StaticClients};
     use crate::server::Server;
     use std::net::Ipv4Addr;

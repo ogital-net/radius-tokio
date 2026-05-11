@@ -1,36 +1,44 @@
-//! Safe wrappers for the MD5 functions in `aws-lc-sys`.
+//! Safe wrappers for MD5.
 //!
 //! MD5 is cryptographically broken. Its use here is limited to the RADIUS
 //! wire format (RFC 2865 authenticators, User-Password obfuscation) where
 //! the protocol mandates it.
 //!
-//! When the optional `md5-asm` Cargo feature is enabled the per-block
-//! compressor is sourced from the [`md5-asm`] workspace crate (a C++
-//! shim around the vendored
-//! [`animetosho/md5-optimisation`](https://github.com/animetosho/md5-optimisation)
-//! inline-asm headers) instead of `aws-lc-sys`. The public surface of
-//! this module is identical either way.
+//! Two backends are available:
+//!
+//! * `fast-md5` feature (default): delegates to the `fast-md5` crate,
+//!   which uses hand-written `x86_64`/`aarch64` assembly with a portable
+//!   Rust fallback.
+//! * Default (aws-lc-sys): always available, FIPS-validatable.
+//!
+//! The public surface of this module is identical for both backends.
 
-#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
+#[cfg(not(feature = "fast-md5"))]
 use std::mem::MaybeUninit;
 
-#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
+#[cfg(not(feature = "fast-md5"))]
 use aws_lc_sys::{MD5_Final, MD5_Init, MD5_Transform, MD5_Update, MD5, MD5_CTX};
 
 /// MD5 block size in bytes.
-#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
+#[cfg(feature = "fast-md5")]
+pub(crate) const BLOCK_SIZE: usize = fast_md5::BLOCK_SIZE;
+#[cfg(not(feature = "fast-md5"))]
 pub(crate) const BLOCK_SIZE: usize = aws_lc_sys::MD5_CBLOCK as usize;
-#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
-pub(crate) const BLOCK_SIZE: usize = md5_asm::BLOCK_SIZE;
 
 /// MD5 digest length in bytes.
-#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
+#[cfg(feature = "fast-md5")]
+pub(crate) const DIGEST_LENGTH: usize = fast_md5::DIGEST_LENGTH;
+#[cfg(not(feature = "fast-md5"))]
 pub(crate) const DIGEST_LENGTH: usize = aws_lc_sys::MD5_DIGEST_LENGTH as usize;
-#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
-pub(crate) const DIGEST_LENGTH: usize = 16;
+
+/// Hashes `data` and returns the 16-byte MD5 digest (fast-md5 backend).
+#[cfg(feature = "fast-md5")]
+pub(crate) fn digest(data: &[u8]) -> [u8; DIGEST_LENGTH] {
+    fast_md5::digest(data)
+}
 
 /// Hashes `data` and returns the 16-byte MD5 digest.
-#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
+#[cfg(not(feature = "fast-md5"))]
 pub(crate) fn digest(data: &[u8]) -> [u8; DIGEST_LENGTH] {
     let mut out = [0u8; DIGEST_LENGTH];
     // SAFETY: data is a valid slice for data.len() bytes. out is exactly
@@ -41,14 +49,6 @@ pub(crate) fn digest(data: &[u8]) -> [u8; DIGEST_LENGTH] {
     out
 }
 
-/// Hashes `data` and returns the 16-byte MD5 digest (asm backend).
-#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
-pub(crate) fn digest(data: &[u8]) -> [u8; DIGEST_LENGTH] {
-    let mut h = Md5::new();
-    h.update(data);
-    h.finalize()
-}
-
 // ---------------------------------------------------------------------------
 // aws-lc-sys backend (default)
 // ---------------------------------------------------------------------------
@@ -57,12 +57,12 @@ pub(crate) fn digest(data: &[u8]) -> [u8; DIGEST_LENGTH] {
 ///
 /// Call [`update`][Md5::update] one or more times, then [`finalize`][Md5::finalize].
 /// `finalize` consumes `self` to prevent reuse.
-#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
+#[cfg(not(feature = "fast-md5"))]
 pub(crate) struct Md5 {
     ctx: MD5_CTX,
 }
 
-#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
+#[cfg(not(feature = "fast-md5"))]
 impl Md5 {
     /// Initializes a new MD5 context.
     pub(crate) fn new() -> Self {
@@ -116,153 +116,42 @@ impl Md5 {
 }
 
 // ---------------------------------------------------------------------------
-// md5-asm backend (experimental, opt-in via `md5-asm` feature)
+// fast-md5 backend (default, opt-out via disabling the `fast-md5` feature)
 // ---------------------------------------------------------------------------
 
-/// Incremental MD5 digest context, backed by the vendored
-/// `animetosho/md5-optimisation` inline-asm block compressor.
+/// Incremental MD5 digest context, backed by the `fast-md5` crate.
 ///
-/// The compressor is FFI; the rest of the state machine (padding,
-/// length encoding, buffering) is plain Rust. No allocation on
-/// the steady-state path.
-#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
+/// Call [`update`][Md5::update] one or more times, then [`finalize`][Md5::finalize].
+/// `finalize` consumes `self` to prevent reuse.
+#[cfg(feature = "fast-md5")]
 pub(crate) struct Md5 {
-    state: [u32; 4],
-    buf: [u8; BLOCK_SIZE],
-    /// Number of bytes currently held in `buf` (`0..BLOCK_SIZE`).
-    buf_len: usize,
-    /// Total bytes consumed via `update`.
-    total_len: u64,
+    inner: fast_md5::Md5,
 }
 
-#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
+#[cfg(feature = "fast-md5")]
 impl Md5 {
     pub(crate) fn new() -> Self {
         Self {
-            state: md5_asm::IV,
-            buf: [0u8; BLOCK_SIZE],
-            buf_len: 0,
-            total_len: 0,
+            inner: fast_md5::Md5::new(),
         }
     }
 
-    /// One-time runtime backend selection. With the
-    /// `md5-asm-avx512` feature enabled and an AVX512-capable CPU,
-    /// returns `true`; otherwise the scalar `block_std` path is
-    /// used. Plain `md5-asm` always returns `false`.
-    #[cfg(all(feature = "md5-asm-avx512", not(target_env = "msvc")))]
-    #[inline]
-    fn use_avx512() -> bool {
-        use std::sync::OnceLock;
-        static CACHED: OnceLock<bool> = OnceLock::new();
-        *CACHED.get_or_init(md5_asm::is_avx512_supported)
-    }
-    #[cfg(any(not(feature = "md5-asm-avx512"), target_env = "msvc"))]
-    #[inline]
-    fn use_avx512() -> bool {
-        false
+    pub(crate) fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
     }
 
-    #[inline]
-    fn compress_block(state: &mut [u32; 4], block: &[u8; BLOCK_SIZE]) {
-        #[cfg(all(
-            feature = "md5-asm-avx512",
-            target_arch = "x86_64",
-            not(target_env = "msvc")
-        ))]
-        if Self::use_avx512() {
-            // SAFETY: `use_avx512` only returns true if
-            // `is_avx512_supported()` was true.
-            unsafe { md5_asm::block_avx512(state, block) };
-            return;
-        }
-        md5_asm::block(state, block);
+    pub(crate) fn finalize(self) -> [u8; DIGEST_LENGTH] {
+        self.inner.finalize()
     }
 
-    #[inline]
-    fn compress_blocks(state: &mut [u32; 4], blocks: &[u8]) {
-        #[cfg(all(
-            feature = "md5-asm-avx512",
-            target_arch = "x86_64",
-            not(target_env = "msvc")
-        ))]
-        if Self::use_avx512() {
-            // SAFETY: as above.
-            unsafe { md5_asm::blocks_avx512(state, blocks) };
-            return;
-        }
-        md5_asm::blocks(state, blocks);
-    }
-
-    pub(crate) fn update(&mut self, mut data: &[u8]) {
-        self.total_len = self
-            .total_len
-            .checked_add(data.len() as u64)
-            .expect("MD5 input length overflowed u64");
-
-        // Top up a partially-filled buffer first.
-        if self.buf_len > 0 {
-            let need = BLOCK_SIZE - self.buf_len;
-            let take = need.min(data.len());
-            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
-            self.buf_len += take;
-            data = &data[take..];
-            if self.buf_len == BLOCK_SIZE {
-                Self::compress_block(&mut self.state, &self.buf);
-                self.buf_len = 0;
-            }
-        }
-
-        // Compress full blocks directly out of `data` (zero-copy).
-        let full = data.len() / BLOCK_SIZE * BLOCK_SIZE;
-        if full > 0 {
-            Self::compress_blocks(&mut self.state, &data[..full]);
-            data = &data[full..];
-        }
-
-        // Stash the remainder.
-        if !data.is_empty() {
-            self.buf[..data.len()].copy_from_slice(data);
-            self.buf_len = data.len();
-        }
-    }
-
-    pub(crate) fn finalize(mut self) -> [u8; DIGEST_LENGTH] {
-        let bit_len = self.total_len.wrapping_mul(8);
-
-        // Append 0x80, then zero-pad so the length field falls in the
-        // last 8 bytes of a 64-byte block. RFC 1321 §3.1.
-        self.buf[self.buf_len] = 0x80;
-        self.buf_len += 1;
-        if self.buf_len > BLOCK_SIZE - 8 {
-            // Not enough room for the length; flush this block first.
-            for b in &mut self.buf[self.buf_len..] {
-                *b = 0;
-            }
-            Self::compress_block(&mut self.state, &self.buf);
-            self.buf_len = 0;
-        }
-        for b in &mut self.buf[self.buf_len..BLOCK_SIZE - 8] {
-            *b = 0;
-        }
-        self.buf[BLOCK_SIZE - 8..].copy_from_slice(&bit_len.to_le_bytes());
-        Self::compress_block(&mut self.state, &self.buf);
-
-        let mut out = [0u8; DIGEST_LENGTH];
-        out[0..4].copy_from_slice(&self.state[0].to_le_bytes());
-        out[4..8].copy_from_slice(&self.state[1].to_le_bytes());
-        out[8..12].copy_from_slice(&self.state[2].to_le_bytes());
-        out[12..16].copy_from_slice(&self.state[3].to_le_bytes());
-        out
-    }
-
-    /// Applies a single 64-byte block transformation. Mirrors the
-    /// `aws-lc-sys` backend's `MD5_Transform`-shaped escape hatch:
-    /// callers that use this **must not** mix it with `update` /
-    /// `finalize` on the same instance; it bypasses the buffered
-    /// streaming state.
+    /// Applies a single 64-byte block transformation.
+    ///
+    /// `fast-md5` does not expose a raw block compressor; this delegates to
+    /// [`update`][Md5::update], which compresses the block and increments the
+    /// byte count. Only used by the smoke test; do not mix with normal
+    /// `update`/`finalize` sequences.
     pub(crate) fn transform(&mut self, block: &[u8; BLOCK_SIZE]) {
-        Self::compress_block(&mut self.state, block);
+        self.inner.update(block);
     }
 }
 

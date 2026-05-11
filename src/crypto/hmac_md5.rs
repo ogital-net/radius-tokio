@@ -7,27 +7,25 @@
 //!
 //! Two backends are available:
 //!
+//! * `fast-md5` feature (default) — delegates directly to
+//!   `fast_md5::HmacMd5`, which precomputes the ipad/opad states at
+//!   construction time.
 //! * Default — `aws-lc-sys`'s `HMAC_*` interface.
-//! * `md5-asm` feature — pure-Rust HMAC construction (RFC 2104)
-//!   layered on top of the in-tree [`Md5`][super::md5::Md5] wrapper,
-//!   which itself dispatches to the vendored
-//!   [`animetosho/md5-optimisation`](https://github.com/animetosho/md5-optimisation)
-//!   block compressor. The public surface is identical either way.
 
 /// HMAC-MD5 tag length in bytes. Equal to the MD5 digest length.
-#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
+#[cfg(not(feature = "fast-md5"))]
 pub(crate) const TAG_LEN: usize = aws_lc_sys::MD5_DIGEST_LENGTH as usize;
-#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
+#[cfg(feature = "fast-md5")]
 pub(crate) const TAG_LEN: usize = super::md5::DIGEST_LENGTH;
 
 // ---------------------------------------------------------------------------
 // aws-lc-sys backend (default)
 // ---------------------------------------------------------------------------
 
-#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
+#[cfg(not(feature = "fast-md5"))]
 use std::mem::MaybeUninit;
 
-#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
+#[cfg(not(feature = "fast-md5"))]
 use aws_lc_sys::{HMAC_CTX_cleanup, HMAC_Final, HMAC_Init_ex, HMAC_Update, HMAC_CTX};
 
 /// Incremental HMAC-MD5 context backed by a stack-allocated `HMAC_CTX`.
@@ -35,12 +33,12 @@ use aws_lc_sys::{HMAC_CTX_cleanup, HMAC_Final, HMAC_Init_ex, HMAC_Update, HMAC_C
 /// Call [`update`][HmacMd5::update] one or more times, then
 /// [`finalize`][HmacMd5::finalize]. `finalize` consumes `self` to
 /// prevent reuse after the context is cleaned up.
-#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
+#[cfg(not(feature = "fast-md5"))]
 pub(crate) struct HmacMd5 {
     ctx: HMAC_CTX,
 }
 
-#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
+#[cfg(not(feature = "fast-md5"))]
 impl HmacMd5 {
     /// Initializes a new HMAC-MD5 context with the given `key`.
     pub(crate) fn new(key: &[u8]) -> Self {
@@ -86,7 +84,7 @@ impl HmacMd5 {
     }
 }
 
-#[cfg(any(not(feature = "md5-asm"), target_env = "msvc"))]
+#[cfg(not(feature = "fast-md5"))]
 impl Drop for HmacMd5 {
     fn drop(&mut self) {
         // SAFETY: ctx is initialized. HMAC_CTX_cleanup is idempotent and
@@ -96,109 +94,34 @@ impl Drop for HmacMd5 {
 }
 
 // ---------------------------------------------------------------------------
-// md5-asm backend (RFC 2104 layered on the in-tree Md5 wrapper)
+// fast-md5 native backend (highest priority when feature = "fast-md5")
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
-use super::md5::{Md5, BLOCK_SIZE};
-
-/// Incremental HMAC-MD5 context backed by the in-tree [`Md5`] wrapper.
+/// Incremental HMAC-MD5 context backed by `fast_md5::HmacMd5`.
 ///
-/// Plain RFC 2104 construction: `HMAC(K, m) = H((K' ⊕ opad) || H((K' ⊕ ipad) || m))`,
-/// where `K'` is `K` truncated by `H` if `len(K) > B`, else `K` zero-padded
-/// to `B = 64` bytes.
-///
-/// The ipad-prefixed inner state is precomputed at construction time so
-/// `update` only feeds the message and `finalize` runs the outer hash.
-/// No allocation on the steady-state path.
-#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
+/// Precomputes the ipad/opad MD5 states at construction time (two
+/// 64-byte block compressions, done once per key), so `update` and
+/// `finalize` carry no key-schedule overhead.
+#[cfg(feature = "fast-md5")]
 pub(crate) struct HmacMd5 {
-    inner: Md5,
-    /// `K' ⊕ opad`, ready to feed into the outer MD5. Zeroized on drop.
-    opad: [u8; BLOCK_SIZE],
+    inner: fast_md5::HmacMd5,
 }
 
-#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
+#[cfg(feature = "fast-md5")]
 impl HmacMd5 {
-    /// Initializes a new HMAC-MD5 context with the given `key`.
     pub(crate) fn new(key: &[u8]) -> Self {
-        // RFC 2104 §2: if the key is longer than the block size, hash
-        // it first; otherwise zero-pad to the block size.
-        let mut k_prime = [0u8; BLOCK_SIZE];
-        if key.len() > BLOCK_SIZE {
-            let h = super::md5::digest(key);
-            k_prime[..h.len()].copy_from_slice(&h);
-        } else {
-            k_prime[..key.len()].copy_from_slice(key);
+        Self {
+            inner: fast_md5::HmacMd5::new(key),
         }
-
-        let mut ipad = [0u8; BLOCK_SIZE];
-        let mut opad = [0u8; BLOCK_SIZE];
-        for i in 0..BLOCK_SIZE {
-            ipad[i] = k_prime[i] ^ 0x36;
-            opad[i] = k_prime[i] ^ 0x5c;
-        }
-        // Wipe the derived key material; ipad/opad still encode it,
-        // but `k_prime` itself is no longer needed.
-        for b in &mut k_prime {
-            // SAFETY: `b` is a live, properly aligned u8 in `k_prime`.
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
-
-        let mut inner = Md5::new();
-        inner.update(&ipad);
-        // ipad held key-derived bytes; clear it before it leaves scope.
-        for b in &mut ipad {
-            // SAFETY: `b` is a live, properly aligned u8 in `ipad`.
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
-
-        Self { inner, opad }
     }
 
-    /// Feeds `data` into the running HMAC. May be called multiple times.
     #[inline]
     pub(crate) fn update(&mut self, data: &[u8]) {
         self.inner.update(data);
     }
 
-    /// Finalizes the HMAC and returns the 16-byte tag.
-    pub(crate) fn finalize(mut self) -> [u8; TAG_LEN] {
-        // Take the inner Md5 out so we can `finalize` it (which is
-        // by-value); replace it with a fresh, throwaway context so
-        // `Drop` has a valid `Md5` to drop.
-        let inner_digest = core::mem::replace(&mut self.inner, Md5::new()).finalize();
-        let mut outer = Md5::new();
-        outer.update(&self.opad);
-        // opad encodes the key; clear it now that the outer hash has
-        // absorbed it. Drop will run its own clear too, but doing it
-        // here narrows the live window.
-        for b in &mut self.opad {
-            // SAFETY: `b` is a live, properly aligned u8 in `self.opad`.
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
-        outer.update(&inner_digest);
-        outer.finalize()
-    }
-}
-
-#[cfg(all(feature = "md5-asm", not(target_env = "msvc")))]
-impl Drop for HmacMd5 {
-    fn drop(&mut self) {
-        // `opad` holds `K' XOR 0x5c`, which trivially reveals K. Wipe
-        // it on drop so a freed stack frame doesn't leak key material.
-        // Volatile writes prevent the optimizer from eliding the clear
-        // for a value about to go out of scope.
-        for b in &mut self.opad {
-            // SAFETY: `b` points to a live, properly aligned u8 inside
-            // `self.opad`; volatile access through a unique reference
-            // is always sound.
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
-        // `inner` carries an MD5 state derived from `K' XOR ipad`. Its
-        // wrapper has no public clearing hook; the buffered bytes were
-        // wiped in `new`/`finalize`, and the running A/B/C/D words are
-        // 16 bytes that go out of scope with this drop.
+    pub(crate) fn finalize(self) -> [u8; TAG_LEN] {
+        self.inner.finalize()
     }
 }
 
@@ -277,6 +200,6 @@ mod tests {
 
     #[test]
     fn drop_without_finalize() {
-        drop(HmacMd5::new(b"key"));
+        let _ctx = HmacMd5::new(b"key");
     }
 }
