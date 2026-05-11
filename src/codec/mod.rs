@@ -244,8 +244,8 @@ impl<'a> TlvWriter<'a> {
         }
         self.out.push(sub_type);
         // Cast safe: bounds check above keeps `value.len() + 2` <= 255.
-        self.out
-            .push(u8::try_from(value.len() + 2).expect("checked above"));
+        #[allow(clippy::cast_possible_truncation)]
+        self.out.push((value.len() + 2) as u8);
         self.out.extend_from_slice(value);
         Ok(self)
     }
