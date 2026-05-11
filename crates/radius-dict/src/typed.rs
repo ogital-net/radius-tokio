@@ -348,6 +348,84 @@ impl<T: WireType> VsaAttr<T> {
     }
 }
 
+/// Typed handle to a TLV sub-attribute living inside a top-level
+/// `tlv`-typed parent (e.g. `IPv6-6rd-Configuration` from RFC 6930
+/// → `IPv6-6rd-IPv4MaskLen` at OID `173.1`).
+///
+/// Records the parent's attribute type byte and the child's sub-type
+/// byte. The wire layout inside the parent's value bytes is a flat
+/// sequence of `sub_type (1) || sub_length (1) || data` triples —
+/// i.e. the same framing as a top-level RADIUS attribute, just nested
+/// one level. Multi-level nesting (parent → child → grandchild) is
+/// not modelled; no current vendored dictionary uses it for this
+/// shape.
+#[derive(Debug)]
+pub struct TlvAttr<T: WireType> {
+    /// Top-level attribute type code of the TLV parent.
+    pub parent: u8,
+    /// Sub-type code of this child within the parent's value.
+    pub child: u8,
+    _wire: PhantomData<fn() -> T>,
+}
+
+impl<T: WireType> Copy for TlvAttr<T> {}
+impl<T: WireType> Clone for TlvAttr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: WireType> TlvAttr<T> {
+    /// Build a handle for `parent.child`. Used by codegen.
+    #[must_use]
+    pub const fn new(parent: u8, child: u8) -> Self {
+        Self {
+            parent,
+            child,
+            _wire: PhantomData,
+        }
+    }
+}
+
+/// Typed handle to a TLV sub-attribute living inside a vendor-specific
+/// `tlv`-typed parent (e.g. `Ruckus-TC-Attr-Ids-With-Quota` at vendor
+/// PEN 25053 vendor-type 146 → `Ruckus-TC-Name-Quota` at OID `146.1`).
+///
+/// On the wire the parent is wrapped in the standard VSA envelope —
+/// `26 || total-len || vendor-id (4) || vendor-type || vendor-len ||
+/// data` — and `data` is a flat sequence of `sub_type (1) ||
+/// sub_length (1) || value` triples.
+#[derive(Debug)]
+pub struct VsaTlvAttr<T: WireType> {
+    /// IANA Private Enterprise Number of the owning vendor.
+    pub vendor: u32,
+    /// Vendor-type byte of the TLV parent within the VSA envelope.
+    pub parent: u8,
+    /// Sub-type byte of this child within the parent's value.
+    pub child: u8,
+    _wire: PhantomData<fn() -> T>,
+}
+
+impl<T: WireType> Copy for VsaTlvAttr<T> {}
+impl<T: WireType> Clone for VsaTlvAttr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: WireType> VsaTlvAttr<T> {
+    /// Build a handle for `vendor / parent.child`. Used by codegen.
+    #[must_use]
+    pub const fn new(vendor: u32, parent: u8, child: u8) -> Self {
+        Self {
+            vendor,
+            parent,
+            child,
+            _wire: PhantomData,
+        }
+    }
+}
+
 // ---------- encode side -----------------------------------------------
 
 /// Conversion from a Rust value into the wire-format value bytes of a

@@ -100,11 +100,26 @@ fn write_values(out: &mut String, dict: &Dictionary) {
 /// Emit `pub mod attrs { ... }` with one typed const per attribute.
 ///
 /// Top-level attributes become `Attr<T>`; vendor attributes become
-/// `VsaAttr<T>`. Children with multi-component OIDs (TLV / extended
-/// children) are skipped — they need a navigation API the codec does
-/// not yet expose. Each emitted const inherits its `T` from the
-/// dictionary's wire type via [`wire_marker`].
+/// `VsaAttr<T>`. Children of `tlv`-typed parents (2-component OIDs,
+/// e.g. `173.1`, `146.1`) become `TlvAttr<T>` (top-level parent) or
+/// `VsaTlvAttr<T>` (vendor parent). Deeper nesting and children of
+/// non-`tlv` parents (RFC 6929 `extended` / `long-extended`) are
+/// skipped — those framings need a separate API. Each emitted const
+/// inherits its `T` from the dictionary's wire type via
+/// [`wire_marker`].
 fn write_attrs_module(out: &mut String, dict: &Dictionary) {
+    // Build a quick lookup so we can validate that a 2-component
+    // child's parent is a `tlv` container before emitting a TLV
+    // handle for it. Keyed by `(vendor, root_oid)` so non-vendor and
+    // vendor namespaces don't collide.
+    use std::collections::HashMap;
+    let mut parents: HashMap<(Option<u32>, u32), Type> = HashMap::new();
+    for a in &dict.attributes {
+        if a.oid.0.len() == 1 {
+            parents.insert((a.vendor, a.oid.0[0]), a.typ);
+        }
+    }
+
     writeln!(
         out,
         "/// Typed handles for every attribute in this dictionary group."
@@ -118,12 +133,22 @@ fn write_attrs_module(out: &mut String, dict: &Dictionary) {
     .unwrap();
     writeln!(
         out,
-        "/// `BEGIN-VENDOR` block are exposed as `VsaAttr<T>`. Use them with"
+        "/// `BEGIN-VENDOR` block are exposed as `VsaAttr<T>`. TLV sub-attributes"
     )
     .unwrap();
     writeln!(
         out,
-        "/// `RawAttribute::get` / `RawAttribute::get_vsa` (in `radius_tokio::attributes`)."
+        "/// (children of a `tlv`-typed parent) are exposed as `TlvAttr<T>` or"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "/// `VsaTlvAttr<T>`. Use them with `RawAttribute::get` / `get_vsa` /"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "/// `get_tlv` / `get_vsa_tlv` (in `radius_tokio::attributes`)."
     )
     .unwrap();
     writeln!(
@@ -135,28 +160,58 @@ fn write_attrs_module(out: &mut String, dict: &Dictionary) {
     writeln!(out, "    use crate::typed::*;").unwrap();
     writeln!(out).unwrap();
     for a in &dict.attributes {
-        // Sub-attributes need a TLV walker; skip until that lands.
-        if a.oid.0.len() != 1 {
-            continue;
-        }
-        let Ok(code) = u8::try_from(a.oid.0[0]) else {
-            // Out-of-range top-level codes (shouldn't happen in any
-            // current dictionary, but guard anyway).
-            continue;
-        };
-        let marker = wire_marker(a.typ, a.flags);
         let ident = const_ident(&a.name);
-        match a.vendor {
-            None => writeln!(
-                out,
-                "    pub const {ident}: Attr<{marker}> = Attr::new({code});",
-            )
-            .unwrap(),
-            Some(pen) => writeln!(
-                out,
-                "    pub const {ident}: VsaAttr<{marker}> = VsaAttr::new({pen}, {code});",
-            )
-            .unwrap(),
+        match a.oid.0.as_slice() {
+            // Top-level attribute.
+            [root] => {
+                let Ok(code) = u8::try_from(*root) else {
+                    continue;
+                };
+                let marker = wire_marker(a.typ, a.flags);
+                match a.vendor {
+                    None => writeln!(
+                        out,
+                        "    pub const {ident}: Attr<{marker}> = Attr::new({code});",
+                    )
+                    .unwrap(),
+                    Some(pen) => writeln!(
+                        out,
+                        "    pub const {ident}: VsaAttr<{marker}> = VsaAttr::new({pen}, {code});",
+                    )
+                    .unwrap(),
+                }
+            }
+            // 2-component child (`parent.child`). Emit only when the
+            // parent is a `tlv` container; the `extended` /
+            // `long-extended` framings (RFC 6929) are out of scope
+            // for the current TLV walker.
+            [parent_root, child_sub] => {
+                let Ok(parent_code) = u8::try_from(*parent_root) else {
+                    continue;
+                };
+                let Ok(child_code) = u8::try_from(*child_sub) else {
+                    continue;
+                };
+                if parents.get(&(a.vendor, *parent_root)) != Some(&Type::Tlv) {
+                    continue;
+                }
+                let marker = wire_marker(a.typ, a.flags);
+                match a.vendor {
+                    None => writeln!(
+                        out,
+                        "    pub const {ident}: TlvAttr<{marker}> = TlvAttr::new({parent_code}, {child_code});",
+                    )
+                    .unwrap(),
+                    Some(pen) => writeln!(
+                        out,
+                        "    pub const {ident}: VsaTlvAttr<{marker}> = VsaTlvAttr::new({pen}, {parent_code}, {child_code});",
+                    )
+                    .unwrap(),
+                }
+            }
+            // Deeper nesting (3+ components) — RFC 6929 extended
+            // children. Out of scope for now.
+            _ => {}
         }
     }
     writeln!(out, "}}").unwrap();
@@ -428,5 +483,84 @@ mod tests {
         assert!(s.contains("pub const TUNNEL_TYPE: Attr<WTaggedInteger>"));
         assert!(s.contains("pub const TUNNEL_CLIENT_ENDPOINT: Attr<WTaggedText>"));
         assert!(s.contains("pub const TUNNEL_PASSWORD: Attr<WBytes>"));
+    }
+
+    #[test]
+    fn tlv_children_emit_typed_handles() {
+        let d = Dictionary {
+            vendors: vec![Vendor {
+                name: "Ruckus".into(),
+                id: 25053,
+                type_len: 1,
+                length_len: 1,
+                has_continuation: false,
+            }],
+            attributes: vec![
+                // Top-level `tlv` parent (RFC 6930 IPv6-6rd-Configuration).
+                Attribute {
+                    name: "IPv6-6rd-Configuration".into(),
+                    oid: Oid(vec![173]),
+                    vendor: None,
+                    typ: Type::Tlv,
+                    flags: Flags::default(),
+                },
+                // Child of the top-level parent.
+                Attribute {
+                    name: "IPv6-6rd-IPv4MaskLen".into(),
+                    oid: Oid(vec![173, 1]),
+                    vendor: None,
+                    typ: Type::Integer,
+                    flags: Flags::default(),
+                },
+                // Vendor TLV parent.
+                Attribute {
+                    name: "Ruckus-TC-Attr-Ids-With-Quota".into(),
+                    oid: Oid(vec![146]),
+                    vendor: Some(25053),
+                    typ: Type::Tlv,
+                    flags: Flags::default(),
+                },
+                // Vendor TLV child.
+                Attribute {
+                    name: "Ruckus-TC-Name-Quota".into(),
+                    oid: Oid(vec![146, 1]),
+                    vendor: Some(25053),
+                    typ: Type::String,
+                    flags: Flags::default(),
+                },
+                // Child of a non-tlv parent — must be skipped.
+                Attribute {
+                    name: "Skip-Me".into(),
+                    oid: Oid(vec![200]),
+                    vendor: None,
+                    typ: Type::Extended,
+                    flags: Flags::default(),
+                },
+                Attribute {
+                    name: "Skip-Me-Child".into(),
+                    oid: Oid(vec![200, 1]),
+                    vendor: None,
+                    typ: Type::Integer,
+                    flags: Flags::default(),
+                },
+            ],
+            values: vec![],
+        };
+        let s = render("test", &d);
+        // Top-level TLV child gets a `TlvAttr<T>`.
+        assert!(
+            s.contains("pub const IPV6_6RD_IPV4MASKLEN: TlvAttr<WInteger> = TlvAttr::new(173, 1);")
+        );
+        // Vendor TLV child gets a `VsaTlvAttr<T>` carrying PEN +
+        // parent type + child sub-type.
+        assert!(s.contains(
+            "pub const RUCKUS_TC_NAME_QUOTA: VsaTlvAttr<WText> = VsaTlvAttr::new(25053, 146, 1);"
+        ));
+        // Children of non-`tlv` parents (e.g. `extended`) are not
+        // emitted yet.
+        assert!(
+            !s.contains("SKIP_ME_CHILD"),
+            "non-tlv extended children must be skipped",
+        );
     }
 }

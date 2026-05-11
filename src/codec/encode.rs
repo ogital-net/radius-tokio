@@ -26,7 +26,7 @@
 
 use super::header::Code;
 use super::typed::{Attr, IntoWire, VsaAttr, WireType};
-use super::{authenticator, message_authenticator, CodecError, PacketBuffer};
+use super::{authenticator, message_authenticator, CodecError, PacketBuffer, TlvWriter};
 
 /// Attribute type code for `Tunnel-Password` (RFC 2868 §3.5).
 const TUNNEL_PASSWORD_TYPE: u8 = 69;
@@ -210,6 +210,59 @@ impl Reply {
         V: IntoWire<T>,
     {
         self.buf.add_vsa(attr, value)?;
+        Ok(self)
+    }
+
+    /// Append a top-level TLV-typed parent attribute, building its
+    /// children inside the supplied closure.
+    ///
+    /// Mirrors [`PacketBuffer::add_tlv`]. Use the typed
+    /// [`super::typed::TlvAttr`] handles emitted by the dictionary
+    /// codegen for child entries:
+    ///
+    /// ```ignore
+    /// use radius_tokio::dict::generated::rfc::attrs;
+    /// reply.add_tlv(attrs::IPV6_6RD_CONFIGURATION.code, |t| {
+    ///     t.add(attrs::IPV6_6RD_IPV4MASKLEN, 32u8)?;
+    ///     t.add(attrs::IPV6_6RD_BR_IPV4_ADDRESS,
+    ///           std::net::Ipv4Addr::new(192, 0, 2, 1))?;
+    ///     Ok(())
+    /// })?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Forwards every [`CodecError`] surfaced by
+    /// [`PacketBuffer::add_tlv`].
+    pub fn add_tlv<F>(&mut self, parent_type: u8, build: F) -> Result<&mut Self, CodecError>
+    where
+        F: FnOnce(&mut TlvWriter<'_>) -> Result<(), CodecError>,
+    {
+        self.buf.add_tlv(parent_type, build)?;
+        Ok(self)
+    }
+
+    /// Append a vendor-specific TLV-typed parent attribute, building
+    /// its children inside the supplied closure.
+    ///
+    /// Mirrors [`PacketBuffer::add_vsa_tlv`]. Use the typed
+    /// [`super::typed::VsaTlvAttr`] handles emitted by the dictionary
+    /// codegen.
+    ///
+    /// # Errors
+    ///
+    /// Forwards every [`CodecError`] surfaced by
+    /// [`PacketBuffer::add_vsa_tlv`].
+    pub fn add_vsa_tlv<F>(
+        &mut self,
+        vendor: u32,
+        vendor_type: u8,
+        build: F,
+    ) -> Result<&mut Self, CodecError>
+    where
+        F: FnOnce(&mut TlvWriter<'_>) -> Result<(), CodecError>,
+    {
+        self.buf.add_vsa_tlv(vendor, vendor_type, build)?;
         Ok(self)
     }
 

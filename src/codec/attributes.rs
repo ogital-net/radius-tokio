@@ -25,7 +25,7 @@
 
 use std::fmt;
 
-use super::typed::{Attr, VsaAttr, WireType};
+use super::typed::{Attr, TlvAttr, VsaAttr, VsaTlvAttr, WireType};
 
 /// Smallest legal attribute on the wire: 1-byte type + 1-byte length
 /// (with no value). RFC 2865 §5 sets `Length >= 2`.
@@ -158,6 +158,93 @@ impl<'a> RawAttribute<'a> {
         let data = data.get(..data_len)?;
         T::decode(data)
     }
+
+    /// Walk this attribute's value bytes as a sequence of TLV
+    /// sub-attributes (each `sub_type (1) || sub_length (1) || data`).
+    ///
+    /// Suitable for top-level `tlv`-typed parents (e.g.
+    /// `IPv6-6rd-Configuration` from RFC 6930). The iterator is the
+    /// same flat walker [`iter`] uses for the outer attribute region;
+    /// errors and fusing behave identically.
+    #[inline]
+    #[must_use]
+    pub fn tlv_children(&self) -> AttributesIter<'a> {
+        iter(self.value())
+    }
+
+    /// If this attribute is a Vendor-Specific Attribute (type 26)
+    /// matching `vendor` / `vendor_type`, walk the per-vendor data
+    /// region as a sequence of TLV sub-attributes.
+    ///
+    /// Returns `None` on a type or vendor mismatch, on a truncated
+    /// VSA envelope, or on a vendor-length that overruns the value
+    /// bytes — in every case there is no valid TLV region to walk.
+    #[inline]
+    #[must_use]
+    pub fn vsa_tlv_children(&self, vendor: u32, vendor_type: u8) -> Option<AttributesIter<'a>> {
+        if self.attribute_type() != 26 {
+            return None;
+        }
+        let val = self.value();
+        let (pen_bytes, rest) = val.split_first_chunk::<4>()?;
+        if u32::from_be_bytes(*pen_bytes) != vendor {
+            return None;
+        }
+        let (&[v_type, v_len], data) = rest.split_first_chunk::<2>()?;
+        if v_type != vendor_type {
+            return None;
+        }
+        let data_len = (v_len as usize).checked_sub(2)?;
+        let data = data.get(..data_len)?;
+        Some(iter(data))
+    }
+
+    /// Match this attribute against a TLV child handle and decode the
+    /// sub-attribute value.
+    ///
+    /// Returns `Some(view)` only when the parent attribute type
+    /// matches `attr.parent`, the parent's value walks cleanly under
+    /// [`tlv_children`](Self::tlv_children), the requested child
+    /// sub-type appears, *and* its bytes decode cleanly under `T`.
+    /// Anything else — wrong parent, malformed inner TLV, missing or
+    /// undecodable child — yields `None` so callers can iterate-and-
+    /// match without distinguishing reasons.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn get_tlv<T: WireType>(&self, attr: TlvAttr<T>) -> Option<T::View<'a>> {
+        if self.attribute_type() != attr.parent {
+            return None;
+        }
+        for slot in self.tlv_children() {
+            let child = slot.ok()?;
+            if child.attribute_type() == attr.child {
+                return T::decode(child.value());
+            }
+        }
+        None
+    }
+
+    /// VSA equivalent of [`get_tlv`](Self::get_tlv): match a
+    /// vendor-specific TLV child handle.
+    ///
+    /// On the wire the parent must be type 26 carrying the supplied
+    /// vendor PEN + vendor-type; its data region is then walked as
+    /// nested TLV sub-attributes. Failure modes mirror
+    /// [`get_tlv`](Self::get_tlv).
+    #[inline]
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn get_vsa_tlv<T: WireType>(&self, attr: VsaTlvAttr<T>) -> Option<T::View<'a>> {
+        let inner = self.vsa_tlv_children(attr.vendor, attr.parent)?;
+        for slot in inner {
+            let child = slot.ok()?;
+            if child.attribute_type() == attr.child {
+                return T::decode(child.value());
+            }
+        }
+        None
+    }
 }
 
 /// Iterator over the attribute slots in a packet's attribute region.
@@ -245,6 +332,40 @@ pub fn first_vsa<T: WireType>(attrs: &[u8], attr: VsaAttr<T>) -> Option<T::View<
     for slot in iter(attrs) {
         let raw = slot.ok()?;
         if let Some(v) = raw.get_vsa(attr) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Find the first TLV sub-attribute matching a typed child handle.
+///
+/// Walks the attribute region for any slot whose top-level type
+/// matches the parent, then inspects that parent's TLV children for
+/// the requested sub-type. Stops at the first match or the first
+/// malformed slot — whichever comes first.
+#[inline]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+pub fn first_tlv<T: WireType>(attrs: &[u8], attr: TlvAttr<T>) -> Option<T::View<'_>> {
+    for slot in iter(attrs) {
+        let raw = slot.ok()?;
+        if let Some(v) = raw.get_tlv(attr) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// VSA equivalent of [`first_tlv`]: find the first vendor-specific
+/// TLV sub-attribute matching `attr`.
+#[inline]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+pub fn first_vsa_tlv<T: WireType>(attrs: &[u8], attr: VsaTlvAttr<T>) -> Option<T::View<'_>> {
+    for slot in iter(attrs) {
+        let raw = slot.ok()?;
+        if let Some(v) = raw.get_vsa_tlv(attr) {
             return Some(v);
         }
     }
@@ -415,5 +536,140 @@ mod tests {
             ),
             None,
         );
+    }
+
+    /// Build a TLV value region: a flat sequence of
+    /// `[sub_type, sub_length, value...]` triples — same framing as
+    /// the outer attribute region. Used by the TLV-walker tests
+    /// below.
+    fn tlv_region(children: &[(u8, &[u8])]) -> Vec<u8> {
+        region(children)
+    }
+
+    #[test]
+    fn tlv_children_walks_value_bytes() {
+        // Top-level attribute 173 (IPv6-6rd-Configuration) carrying
+        // two children: 173.1 = 32 (1-byte mask len) and 173.3 =
+        // 192.0.2.1.
+        use super::super::typed::{TlvAttr, WByte, WIpv4};
+        let children = tlv_region(&[(1, &[32]), (3, &[192, 0, 2, 1])]);
+        let bytes = region(&[(173, &children)]);
+        let parent = iter(&bytes).next().unwrap().unwrap();
+        // Iterator yields the two children in order.
+        let kids: Vec<u8> = parent
+            .tlv_children()
+            .map(|r| r.unwrap().attribute_type())
+            .collect();
+        assert_eq!(kids, vec![1, 3]);
+        // Typed lookups decode each child.
+        assert_eq!(parent.get_tlv(TlvAttr::<WByte>::new(173, 1)), Some(32));
+        assert_eq!(
+            parent.get_tlv(TlvAttr::<WIpv4>::new(173, 3)),
+            Some(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+        );
+        // Wrong parent → None.
+        assert_eq!(parent.get_tlv(TlvAttr::<WByte>::new(174, 1)), None);
+        // Missing child → None.
+        assert_eq!(parent.get_tlv(TlvAttr::<WByte>::new(173, 9)), None);
+    }
+
+    #[test]
+    fn vsa_tlv_children_walks_inner_data() {
+        use super::super::typed::{VsaTlvAttr, WInteger, WText};
+        // Vendor 25053 (Ruckus), vendor-type 146 (TLV parent), with
+        // children 146.1 = "tc-name" and 146.2 = 7.
+        let inner = tlv_region(&[(1, b"tc-name"), (2, &[0, 0, 0, 7])]);
+        let mut value = Vec::new();
+        value.extend_from_slice(&25053u32.to_be_bytes());
+        value.push(146); // vendor-type
+                         // vendor-len = 2 (vtype + vlen) + inner.len()
+        value.push(u8::try_from(2 + inner.len()).unwrap());
+        value.extend_from_slice(&inner);
+        let bytes = region(&[(26, &value)]);
+        let parent = iter(&bytes).next().unwrap().unwrap();
+
+        // Typed lookups.
+        assert_eq!(
+            parent.get_vsa_tlv(VsaTlvAttr::<WText>::new(25053, 146, 1)),
+            Some("tc-name"),
+        );
+        assert_eq!(
+            parent.get_vsa_tlv(VsaTlvAttr::<WInteger>::new(25053, 146, 2)),
+            Some(7),
+        );
+        // Wrong vendor / parent / child → None.
+        assert_eq!(
+            parent.get_vsa_tlv(VsaTlvAttr::<WText>::new(9, 146, 1)),
+            None,
+        );
+        assert_eq!(
+            parent.get_vsa_tlv(VsaTlvAttr::<WText>::new(25053, 99, 1)),
+            None,
+        );
+        assert_eq!(
+            parent.get_vsa_tlv(VsaTlvAttr::<WText>::new(25053, 146, 9)),
+            None,
+        );
+        // Iterator over the inner region.
+        let kids: Vec<u8> = parent
+            .vsa_tlv_children(25053, 146)
+            .unwrap()
+            .map(|r| r.unwrap().attribute_type())
+            .collect();
+        assert_eq!(kids, vec![1, 2]);
+        // Mismatch → no iterator.
+        assert!(parent.vsa_tlv_children(9, 146).is_none());
+    }
+
+    #[test]
+    fn first_tlv_finds_match_across_outer_attributes() {
+        use super::super::typed::{TlvAttr, WByte};
+        let kids = tlv_region(&[(1, &[7])]);
+        // Decoy attribute first, then the parent.
+        let bytes = region(&[(2, b"x"), (173, &kids)]);
+        assert_eq!(first_tlv(&bytes, TlvAttr::<WByte>::new(173, 1)), Some(7),);
+        assert_eq!(first_tlv(&bytes, TlvAttr::<WByte>::new(173, 9)), None);
+    }
+
+    #[test]
+    fn first_vsa_tlv_finds_match() {
+        use super::super::typed::{VsaTlvAttr, WText};
+        let inner = tlv_region(&[(1, b"hello")]);
+        let mut value = Vec::new();
+        value.extend_from_slice(&25053u32.to_be_bytes());
+        value.push(146);
+        value.push(u8::try_from(2 + inner.len()).unwrap());
+        value.extend_from_slice(&inner);
+        let bytes = region(&[(26, &value)]);
+        assert_eq!(
+            first_vsa_tlv(&bytes, VsaTlvAttr::<WText>::new(25053, 146, 1)),
+            Some("hello"),
+        );
+    }
+
+    #[test]
+    fn tlv_children_propagates_inner_corruption() {
+        // Outer attribute 173 with a malformed inner TLV: sub-length
+        // byte 1 is below the 2-byte minimum. The walker yields the
+        // error, then fuses.
+        let bytes = region(&[(173, &[5u8, 1u8])]);
+        let parent = iter(&bytes).next().unwrap().unwrap();
+        let mut it = parent.tlv_children();
+        assert!(matches!(
+            it.next(),
+            Some(Err(AttributeError::LengthUnderflow { length: 1 })),
+        ));
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn vsa_tlv_children_rejects_short_envelope() {
+        // VSA with vendor + vendor-type but no vendor-length byte.
+        let mut value = Vec::new();
+        value.extend_from_slice(&25053u32.to_be_bytes());
+        value.push(146);
+        let bytes = region(&[(26, &value)]);
+        let parent = iter(&bytes).next().unwrap().unwrap();
+        assert!(parent.vsa_tlv_children(25053, 146).is_none());
     }
 }

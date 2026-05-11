@@ -139,6 +139,118 @@ pub struct PacketBuffer {
     inner: Vec<u8>,
 }
 
+/// Builder handed to the closure passed to
+/// [`PacketBuffer::add_tlv`] / [`PacketBuffer::add_vsa_tlv`].
+///
+/// Each call appends one sub-attribute as
+/// `sub_type (1) || sub_length (1) || value` directly into the parent
+/// attribute's value region. Values larger than 253 bytes are
+/// rejected with [`CodecError::AttributeValueTooLong`]; the parent
+/// attribute is rolled back wholesale by the caller on any error so
+/// the wire never sees a half-written TLV. Multi-level nesting
+/// (TLV inside TLV) is not supported here.
+#[derive(Debug)]
+pub struct TlvWriter<'a> {
+    out: &'a mut Vec<u8>,
+}
+
+impl<'a> TlvWriter<'a> {
+    fn new(out: &'a mut Vec<u8>) -> Self {
+        Self { out }
+    }
+
+    /// Append a typed TLV child by handle.
+    ///
+    /// The `attr.parent` field is **not** validated against the
+    /// enclosing parent's type byte — it is the caller's job to use
+    /// matching handles. Mixing children from different parents
+    /// silently produces a packet that is well-framed but does not
+    /// match any dictionary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::AttributeValueTooLong`] when the
+    /// encoded value exceeds 253 bytes.
+    pub fn add<T, V>(&mut self, attr: typed::TlvAttr<T>, value: V) -> Result<&mut Self, CodecError>
+    where
+        T: typed::WireType,
+        V: typed::IntoWire<T>,
+    {
+        self.write_child(attr.child, value)
+    }
+
+    /// Vendor TLV equivalent of [`add`](Self::add): emit a child
+    /// described by a [`typed::VsaTlvAttr`] handle.
+    ///
+    /// Inside [`PacketBuffer::add_vsa_tlv`] the writer is already
+    /// scoped to a specific vendor and parent, so only the handle's
+    /// `child` byte is consulted. The `vendor` and `parent` fields
+    /// are not cross-checked against the enclosing envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::AttributeValueTooLong`] when the
+    /// encoded value exceeds 253 bytes.
+    pub fn add_vsa<T, V>(
+        &mut self,
+        attr: typed::VsaTlvAttr<T>,
+        value: V,
+    ) -> Result<&mut Self, CodecError>
+    where
+        T: typed::WireType,
+        V: typed::IntoWire<T>,
+    {
+        self.write_child(attr.child, value)
+    }
+
+    /// Inner shared encoder used by both typed entry points.
+    fn write_child<T, V>(&mut self, sub_type: u8, value: V) -> Result<&mut Self, CodecError>
+    where
+        T: typed::WireType,
+        V: typed::IntoWire<T>,
+    {
+        let header_pos = self.out.len();
+        self.out.push(sub_type);
+        self.out.push(0); // length placeholder
+        let val_start = self.out.len();
+        value.write_value(self.out);
+        let val_len = self.out.len() - val_start;
+        if val_len > MAX_ATTRIBUTE_VALUE_LEN {
+            // Roll back this child only; the outer machinery will
+            // truncate the whole parent when we propagate the error.
+            self.out.truncate(header_pos);
+            return Err(CodecError::AttributeValueTooLong { len: val_len });
+        }
+        // u8 cast safe: val_len <= 253, so val_len + 2 <= 255.
+        self.out[header_pos + 1] =
+            u8::try_from(val_len + 2).expect("val_len + 2 <= 255 by checks above");
+        Ok(self)
+    }
+
+    /// Append a TLV child by raw `(sub_type, value)`.
+    ///
+    /// Escape hatch for sub-attributes that have no typed handle
+    /// (custom vendor extensions, opaque blobs, future dictionary
+    /// entries). Validates the sub-length budget the same way
+    /// [`add`](Self::add) does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::AttributeValueTooLong`] when `value`
+    /// exceeds 253 bytes.
+    pub fn add_raw(&mut self, sub_type: u8, value: &[u8]) -> Result<&mut Self, CodecError> {
+        if value.len() > MAX_ATTRIBUTE_VALUE_LEN {
+            return Err(CodecError::AttributeValueTooLong { len: value.len() });
+        }
+        self.out.push(sub_type);
+        // Cast safe: bounds check above keeps `value.len() + 2` <= 255.
+        self.out
+            .push(u8::try_from(value.len() + 2).expect("checked above"));
+        self.out.extend_from_slice(value);
+        Ok(self)
+    }
+}
+
 impl PacketBuffer {
     /// Build a fresh buffer pre-loaded with a 20-byte header.
     ///
@@ -420,6 +532,107 @@ impl PacketBuffer {
         })
     }
 
+    /// Append a top-level TLV-typed parent attribute, building its
+    /// nested sub-attributes through a closure.
+    ///
+    /// `parent_type` is the parent's attribute type byte
+    /// (e.g. 173 for `IPv6-6rd-Configuration`). The closure receives
+    /// a [`TlvWriter`] for emitting children with either a typed
+    /// [`TlvAttr`] handle ([`TlvWriter::add`]) or a raw
+    /// `(sub_type, value)` pair ([`TlvWriter::add_raw`]). Each child
+    /// is framed as `sub_type (1) || sub_length (1) || value` inside
+    /// the parent's value bytes.
+    ///
+    /// Children write straight into the parent's value region with
+    /// no intermediate buffer. On any error the underlying buffer is
+    /// rolled back to its pre-call state, so partial writes never
+    /// reach the wire.
+    ///
+    /// [`TlvAttr`]: typed::TlvAttr
+    ///
+    /// # Errors
+    ///
+    /// - [`CodecError::AttributeValueTooLong`] — a single child's
+    ///   bytes would not fit in one sub-length byte (`> 253`), or
+    ///   the assembled parent value exceeds 253 bytes.
+    /// - [`CodecError::PacketTooLarge`] — appending would push the
+    ///   packet past 4 096 bytes.
+    pub fn add_tlv<F>(&mut self, parent_type: u8, build: F) -> Result<(), CodecError>
+    where
+        F: FnOnce(&mut TlvWriter<'_>) -> Result<(), CodecError>,
+    {
+        // Snapshot for closure-error rollback. `add_attribute_with`
+        // handles its own length-overflow rollback, but a child
+        // returning `Err` partway through leaves the outer attribute
+        // committed; we undo that by truncating back to here.
+        let snapshot = self.inner.len();
+        let mut child_err: Option<CodecError> = None;
+        self.add_attribute_with(parent_type, |out| {
+            let mut w = TlvWriter::new(out);
+            if let Err(e) = build(&mut w) {
+                child_err = Some(e);
+            }
+        })?;
+        if let Some(e) = child_err {
+            self.inner.truncate(snapshot);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Append a Vendor-Specific Attribute whose body is a TLV parent.
+    ///
+    /// Wraps the standard VSA envelope —
+    /// `26 || total-len || vendor-id (4) || vendor-type ||
+    /// vendor-len || data` — around a TLV region built by `build`.
+    /// Inside `data`, each child the closure adds is laid out as
+    /// `sub_type (1) || sub_length (1) || value`, matching
+    /// [`add_tlv`](Self::add_tlv).
+    ///
+    /// # Errors
+    ///
+    /// - [`CodecError::AttributeValueTooLong`] — a single child
+    ///   exceeds the 253-byte sub-length limit, or the assembled
+    ///   parent value (vendor envelope + TLV region) exceeds 253
+    ///   bytes. The effective TLV-region budget is 247 bytes
+    ///   (253 − 6 for the vendor envelope).
+    /// - [`CodecError::PacketTooLarge`] — appending would push the
+    ///   packet past 4 096 bytes.
+    pub fn add_vsa_tlv<F>(
+        &mut self,
+        vendor: u32,
+        vendor_type: u8,
+        build: F,
+    ) -> Result<(), CodecError>
+    where
+        F: FnOnce(&mut TlvWriter<'_>) -> Result<(), CodecError>,
+    {
+        let snapshot = self.inner.len();
+        let mut child_err: Option<CodecError> = None;
+        self.add_attribute_with(VENDOR_SPECIFIC_TYPE, |out| {
+            out.extend_from_slice(&vendor.to_be_bytes());
+            out.push(vendor_type);
+            let len_pos = out.len();
+            out.push(0); // vendor-length placeholder
+            let val_start = out.len();
+            {
+                let mut w = TlvWriter::new(out);
+                if let Err(e) = build(&mut w) {
+                    child_err = Some(e);
+                }
+            }
+            let vsa_len = out.len() - val_start + 2;
+            // Saturate; if the inner exceeds 255 the outer length
+            // check fails too and rolls everything back.
+            out[len_pos] = u8::try_from(vsa_len).unwrap_or(u8::MAX);
+        })?;
+        if let Some(e) = child_err {
+            self.inner.truncate(snapshot);
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Patch the Length field in the header to match the current
     /// buffer size. Called by [`encode::seal`] before the
     /// Authenticator is computed.
@@ -637,6 +850,129 @@ mod tests {
         let payload = vec![0u8; 248];
         let err = pkt.add_vsa(BIG_VSA, &payload[..]).unwrap_err();
         assert!(matches!(err, CodecError::AttributeValueTooLong { .. }));
+        assert_eq!(pkt.as_bytes().len(), before);
+    }
+
+    // ── TLV encoder ────────────────────────────────────────────────
+
+    #[test]
+    fn add_tlv_writes_nested_children() {
+        use crate::codec::attributes;
+        use crate::codec::typed::{TlvAttr, WByte, WIpv4};
+        // Synthetic top-level TLV parent at type 173 with two
+        // typed children. Decode side then walks them back.
+        const MASK: TlvAttr<WByte> = TlvAttr::new(173, 1);
+        const ADDR: TlvAttr<WIpv4> = TlvAttr::new(173, 3);
+
+        let mut pkt = PacketBuffer::new(Code::ACCESS_ACCEPT, 1);
+        pkt.add_tlv(173, |t| {
+            t.add(MASK, 32u8)?;
+            t.add(ADDR, std::net::Ipv4Addr::new(192, 0, 2, 1))?;
+            Ok(())
+        })
+        .unwrap();
+
+        let parent = attributes::iter(pkt.attributes()).next().unwrap().unwrap();
+        assert_eq!(parent.attribute_type(), 173);
+        assert_eq!(parent.get_tlv(MASK), Some(32));
+        assert_eq!(
+            parent.get_tlv(ADDR),
+            Some(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+        );
+    }
+
+    #[test]
+    fn add_tlv_rolls_back_on_oversize_child() {
+        use crate::codec::typed::{TlvAttr, WBytes};
+        const CHILD: TlvAttr<WBytes> = TlvAttr::new(173, 1);
+        let mut pkt = PacketBuffer::new(Code::ACCESS_ACCEPT, 1);
+        let before = pkt.as_bytes().len();
+        let big = vec![0u8; MAX_ATTRIBUTE_VALUE_LEN + 1];
+        let err = pkt
+            .add_tlv(173, |t| {
+                t.add(CHILD, &big[..])?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(err, CodecError::AttributeValueTooLong { .. }));
+        assert_eq!(pkt.as_bytes().len(), before, "buffer must be restored");
+    }
+
+    #[test]
+    fn add_tlv_rolls_back_on_oversize_parent() {
+        // Several children whose sum overflows the 253-byte parent
+        // value budget. The outer `add_attribute_with` length cap
+        // catches this and rolls back.
+        let mut pkt = PacketBuffer::new(Code::ACCESS_ACCEPT, 1);
+        let before = pkt.as_bytes().len();
+        let chunk = vec![0u8; 100];
+        let err = pkt
+            .add_tlv(173, |t| {
+                t.add_raw(1, &chunk)?;
+                t.add_raw(2, &chunk)?;
+                t.add_raw(3, &chunk)?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(err, CodecError::AttributeValueTooLong { .. }));
+        assert_eq!(pkt.as_bytes().len(), before);
+    }
+
+    #[test]
+    fn add_vsa_tlv_round_trip() {
+        use crate::codec::attributes;
+        use crate::codec::typed::{VsaTlvAttr, WInteger, WText};
+        // Vendor 25053 (Ruckus), parent vendor-type 146 with two
+        // children: 146.1 (string), 146.2 (integer).
+        const NAME: VsaTlvAttr<WText> = VsaTlvAttr::new(25053, 146, 1);
+        const QUOTA: VsaTlvAttr<WInteger> = VsaTlvAttr::new(25053, 146, 2);
+
+        let mut pkt = PacketBuffer::new(Code::ACCESS_ACCEPT, 1);
+        pkt.add_vsa_tlv(25053, 146, |t| {
+            t.add_vsa(NAME, "tc-name")?;
+            t.add_vsa(QUOTA, 7u32)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let parent = attributes::iter(pkt.attributes()).next().unwrap().unwrap();
+        assert_eq!(parent.attribute_type(), VENDOR_SPECIFIC_TYPE);
+        assert_eq!(parent.get_vsa_tlv(NAME), Some("tc-name"));
+        assert_eq!(parent.get_vsa_tlv(QUOTA), Some(7));
+    }
+
+    #[test]
+    fn add_vsa_tlv_rolls_back_on_oversize_value() {
+        use crate::codec::typed::{VsaTlvAttr, WBytes};
+        const CHILD: VsaTlvAttr<WBytes> = VsaTlvAttr::new(25053, 146, 1);
+        let mut pkt = PacketBuffer::new(Code::ACCESS_ACCEPT, 1);
+        let before = pkt.as_bytes().len();
+        // 250-byte child + 2-byte sub-TLV header + 6-byte vendor
+        // envelope > 253 — outer cap catches this.
+        let big = vec![0u8; 250];
+        let err = pkt
+            .add_vsa_tlv(25053, 146, |t| {
+                t.add_vsa(CHILD, &big[..])?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(err, CodecError::AttributeValueTooLong { .. }));
+        assert_eq!(pkt.as_bytes().len(), before);
+    }
+
+    #[test]
+    fn add_tlv_propagates_explicit_closure_error() {
+        // A closure that fails on its own (no length issue) must
+        // still leave the buffer untouched.
+        let mut pkt = PacketBuffer::new(Code::ACCESS_ACCEPT, 1);
+        let before = pkt.as_bytes().len();
+        let err = pkt
+            .add_tlv(173, |t| {
+                t.add_raw(1, b"ok")?;
+                Err(CodecError::WrongPacketType)
+            })
+            .unwrap_err();
+        assert!(matches!(err, CodecError::WrongPacketType));
         assert_eq!(pkt.as_bytes().len(), before);
     }
 }

@@ -187,4 +187,31 @@ mod tests {
             .iter()
             .any(|a| a.name == "Cisco-AVPair"));
     }
+
+    /// `IPv6-6rd-Configuration` (RFC 6930) is a `tlv` parent at OID
+    /// 173 with three children. The codegen must emit a `TlvAttr<T>`
+    /// const for each child, with the parent type encoded as 173.
+    #[cfg(feature = "dict-rfc")]
+    #[test]
+    fn rfc_tlv_children_have_typed_handles() {
+        use crate::typed::{TlvAttr, WInteger};
+        // Compile-time check: the generated const exists with the
+        // right shape and is reachable from the public path.
+        const _MASK: TlvAttr<WInteger> = super::rfc::attrs::IPV6_6RD_IPV4MASKLEN;
+        assert_eq!(_MASK.parent, 173);
+        assert_eq!(_MASK.child, 1);
+    }
+
+    /// Vendor-block TLV: Ruckus PEN 25053 vendor-type 146 is `tlv`,
+    /// child `Ruckus-TC-Name-Quota` (146.1) must surface as a
+    /// `VsaTlvAttr<T>`.
+    #[cfg(feature = "dict-ruckus")]
+    #[test]
+    fn ruckus_vsa_tlv_children_have_typed_handles() {
+        use crate::typed::{VsaTlvAttr, WText};
+        const _NAME: VsaTlvAttr<WText> = super::ruckus::attrs::RUCKUS_TC_NAME_QUOTA;
+        assert_eq!(_NAME.vendor, 25053);
+        assert_eq!(_NAME.parent, 146);
+        assert_eq!(_NAME.child, 1);
+    }
 }
