@@ -44,6 +44,7 @@ use crate::codec::{authenticator, message_authenticator, PacketBuffer};
 use super::client::Client;
 use super::dedup::{DedupCache, Key as DedupKey};
 use super::handler::{Handler, HandlerResult, Request};
+use super::status::{self, ListenerRole, StatusServerPolicy, StatusTransport};
 
 /// Verdict produced by [`validate`].
 ///
@@ -86,13 +87,20 @@ pub(crate) fn validate<'a>(datagram: &'a [u8], client: &Client) -> Validated<'a>
             // RFC 5080 §2.2.2 / RFC 3579 §3.2: Access-Request packets
             // must carry Message-Authenticator under the strict policy
             // (default — see [`Client::require_message_authenticator`]).
+            // RFC 5997 §6: Status-Server packets MUST carry it,
+            // unconditionally — the per-client legacy opt-out does
+            // not apply.
             // Accounting-Request / CoA-Request / Disconnect-Request
             // are exempt: they authenticate via the Request
             // Authenticator over the packet body and have never been
             // required to carry M-A; forcing it would break the
             // installed base for no security gain.
-            let strict_code = matches!(header.code, Code::ACCESS_REQUEST);
-            if strict_code && client.require_message_authenticator() {
+            let strict_required = match header.code {
+                Code::STATUS_SERVER => true,
+                Code::ACCESS_REQUEST => client.require_message_authenticator(),
+                _ => false,
+            };
+            if strict_required {
                 return Validated::MissingMessageAuthenticator {
                     code: header.code,
                     identifier: header.identifier,
@@ -149,6 +157,22 @@ pub(crate) fn ma_substitute(code: Code, header_auth: &[u8; 16]) -> [u8; 16] {
     }
 }
 
+/// Listener context for the built-in Status-Server (RFC 5997)
+/// responder. The transport supplies one of these to
+/// [`dispatch_validated`] so the pipeline can short-circuit
+/// Status-Server probes without dispatching to the consumer's
+/// [`Handler`].
+pub(crate) struct StatusServerContext<'a> {
+    /// Role of the listener that received the probe — determines
+    /// the reply code per RFC 5997 §6.
+    pub role: ListenerRole,
+    /// Transport the probe arrived on — surfaced to a custom
+    /// [`StatusResponder`](super::status::StatusResponder).
+    pub transport: StatusTransport,
+    /// Server-wide Status-Server policy.
+    pub policy: &'a StatusServerPolicy,
+}
+
 /// Action returned by [`dispatch_validated`]. The transport reads
 /// off this enum to decide what (if anything) to put on the wire.
 pub(crate) enum Dispatched {
@@ -168,6 +192,21 @@ pub(crate) enum Dispatched {
     },
     /// Handler returned [`HandlerResult::Drop`]; produce no reply.
     HandlerDrop { code: Code, identifier: u8 },
+    /// Built-in Status-Server reply produced by the listener's
+    /// configured policy. Already inserted into the dedup cache.
+    StatusServerReply {
+        sealed: PacketBuffer,
+        identifier: u8,
+        role: ListenerRole,
+    },
+    /// Status-Server probe rejected because the resolved client
+    /// has [`Client::status_server_enabled`] set to `false`.
+    StatusServerDisabledPerClient { identifier: u8 },
+    /// Status-Server probe dropped because the active
+    /// [`StatusServerPolicy`] (or a custom
+    /// [`StatusResponder`](super::status::StatusResponder))
+    /// declined to produce a reply.
+    StatusServerDisabled { identifier: u8 },
 }
 
 impl Dispatched {
@@ -175,14 +214,20 @@ impl Dispatched {
     pub(crate) fn bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Replay { bytes, .. } => Some(bytes),
-            Self::Reply { sealed, .. } => Some(sealed.as_bytes()),
-            Self::HandlerDrop { .. } => None,
+            Self::Reply { sealed, .. } | Self::StatusServerReply { sealed, .. } => {
+                Some(sealed.as_bytes())
+            }
+            Self::HandlerDrop { .. }
+            | Self::StatusServerDisabledPerClient { .. }
+            | Self::StatusServerDisabled { .. } => None,
         }
     }
 }
 
-/// Look up the dedup cache; on a miss invoke `handler`, seal the
-/// reply, insert into the cache, and return [`Dispatched::Reply`].
+/// Look up the dedup cache; on a miss either (a) short-circuit
+/// Status-Server probes through the built-in responder when
+/// `status` is `Some`, or (b) invoke `handler`. In either case the
+/// sealed reply is inserted into the cache before return.
 ///
 /// Assumes the caller has already validated the packet via
 /// [`validate`]; in particular `header` and `attrs` must refer to
@@ -194,6 +239,7 @@ pub(crate) async fn dispatch_validated<H: Handler>(
     client: &Arc<Client>,
     handler: &H,
     cache: &DedupCache,
+    status: Option<StatusServerContext<'_>>,
 ) -> Dispatched {
     let dedup_key = DedupKey {
         src: peer,
@@ -207,6 +253,42 @@ pub(crate) async fn dispatch_validated<H: Handler>(
             code: header.code,
             identifier: header.identifier,
         };
+    }
+
+    // Status-Server short-circuit (RFC 5997). Built-in responder
+    // runs inline — no handler dispatch — so a keepalive flood can
+    // never queue behind application logic. The reply is cached
+    // for retransmit just like any other reply.
+    if header.code == Code::STATUS_SERVER {
+        if let Some(ctx) = status {
+            if !client.status_server_enabled() {
+                return Dispatched::StatusServerDisabledPerClient {
+                    identifier: header.identifier,
+                };
+            }
+            let Some(reply) = status::build_status_reply(
+                ctx.policy,
+                ctx.role,
+                ctx.transport,
+                header.identifier,
+                client,
+                peer,
+            ) else {
+                return Dispatched::StatusServerDisabled {
+                    identifier: header.identifier,
+                };
+            };
+            let sealed = reply.seal_for(&header.authenticator, client.secret());
+            cache.insert(dedup_key, sealed.as_bytes());
+            return Dispatched::StatusServerReply {
+                sealed,
+                identifier: header.identifier,
+                role: ctx.role,
+            };
+        }
+        // No status context (transport doesn't enable Status-Server
+        // for this listener at all) — fall through to handler
+        // dispatch so the consumer can decide.
     }
 
     let request = Request::new(

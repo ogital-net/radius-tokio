@@ -690,6 +690,34 @@ impl PacketBuffer {
         self.set_authenticator(auth);
         self
     }
+
+    /// Finalize this buffer as an outbound RFC 2865 Access-Request
+    /// (or RFC 5997 Status-Server) frame: install the supplied
+    /// random Request Authenticator, append a `Message-Authenticator`
+    /// (RFC 3579 §3.2) signed against the final packet bytes, and
+    /// patch the Length field.
+    ///
+    /// Used for Status-Server probes and by test / fuzz harnesses
+    /// that craft Access-Request frames. The server pipeline
+    /// receives Access-Requests; it does not originate them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::PacketTooLarge`] if appending the
+    /// 18-byte Message-Authenticator slot would push the packet
+    /// past the 4 096-byte cap.
+    pub fn seal_as_random_authenticator_request(
+        mut self,
+        request_authenticator: &[u8; 16],
+        secret: &[u8],
+    ) -> Result<Self, CodecError> {
+        self.set_authenticator(*request_authenticator);
+        let value_off = message_authenticator::append_zeroed_slot(&mut self)?;
+        self.patch_length();
+        let tag = message_authenticator::compute(self.as_bytes(), request_authenticator, secret);
+        message_authenticator::patch(&mut self, value_off, &tag);
+        Ok(self)
+    }
 }
 
 #[cfg(test)]

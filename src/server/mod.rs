@@ -11,6 +11,7 @@ mod pipeline;
 #[cfg(feature = "radsec")]
 mod radsec;
 mod runtime;
+pub mod status;
 pub mod store;
 mod udp;
 
@@ -20,6 +21,9 @@ pub use client::{Client, ClientId, SecretBytes};
 pub use coa::{CoaConfig, CoaError, CoaOriginator, CoaOutcome};
 pub use handler::{Handler, HandlerError, HandlerResult, Request};
 pub use runtime::{Server, ServerBuilder, ShutdownHandle};
+pub use status::{
+    ListenerRole, StatusAction, StatusContext, StatusResponder, StatusServerPolicy, StatusTransport,
+};
 pub use store::{CidrError, ClientStore, IpCidr, StaticClients, StaticClientsBuilder};
 
 #[cfg(feature = "radsec")]

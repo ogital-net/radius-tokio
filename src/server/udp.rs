@@ -65,7 +65,8 @@ use crate::codec::header::MAX_PACKET_LEN;
 
 use super::dedup::DedupCache;
 use super::handler::Handler;
-use super::pipeline::{self, Dispatched, Validated};
+use super::pipeline::{self, Dispatched, StatusServerContext, Validated};
+use super::status::{ListenerRole, StatusServerPolicy, StatusTransport};
 use super::store::ClientStore;
 
 /// Default lifetime for an entry in the dedup / retransmit cache.
@@ -75,11 +76,14 @@ pub(crate) const DEFAULT_DEDUP_TTL: Duration = Duration::from_secs(30);
 
 /// Run the UDP receive loop on `socket` until `shutdown` flips to
 /// `true`. Owned by [`Server::run`](super::Server::run).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_udp<S, H>(
     socket: UdpSocket,
     store: Arc<S>,
     handler: Arc<H>,
     cache: Arc<DedupCache>,
+    role: ListenerRole,
+    status_policy: Arc<StatusServerPolicy>,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()>
 where
@@ -121,8 +125,19 @@ where
                 let socket = Arc::clone(&socket);
                 let handler = Arc::clone(&handler);
                 let cache = Arc::clone(&cache);
+                let status_policy = Arc::clone(&status_policy);
                 tokio::spawn(async move {
-                    process_packet(&socket, datagram, src, client, &handler, &cache).await;
+                    process_packet(
+                        &socket,
+                        datagram,
+                        src,
+                        client,
+                        &handler,
+                        &cache,
+                        role,
+                        &status_policy,
+                    )
+                    .await;
                 });
             }
         }
@@ -131,9 +146,14 @@ where
 
 /// Spawned per-packet pipeline: parse the header, validate
 /// authenticators, consult the dedup cache, and on a clean miss
-/// invoke the handler and send the sealed reply. Owns the datagram
-/// `Vec` produced by the recv loop.
-#[allow(clippy::too_many_lines, clippy::used_underscore_binding)]
+/// either short-circuit a Status-Server probe through the
+/// configured policy or invoke the handler and send the sealed
+/// reply. Owns the datagram `Vec` produced by the recv loop.
+#[allow(
+    clippy::too_many_lines,
+    clippy::used_underscore_binding,
+    clippy::too_many_arguments
+)]
 async fn process_packet<H>(
     socket: &Arc<UdpSocket>,
     datagram: Vec<u8>,
@@ -141,6 +161,8 @@ async fn process_packet<H>(
     client: Arc<super::client::Client>,
     handler: &Arc<H>,
     cache: &Arc<DedupCache>,
+    role: ListenerRole,
+    status_policy: &StatusServerPolicy,
 ) where
     H: Handler,
 {
@@ -203,8 +225,9 @@ async fn process_packet<H>(
         }
     };
 
-    // Steps 5–6: dedup lookup + (on miss) handler dispatch + seal +
-    // cache insert. All transport-agnostic.
+    // Steps 5–6: dedup lookup + (on miss) Status-Server
+    // short-circuit or handler dispatch + seal + cache insert.
+    // All transport-agnostic.
     debug!(
         event = "request",
         %src,
@@ -215,8 +238,20 @@ async fn process_packet<H>(
     );
     count!("radius_tokio.requests_dispatched", "code" => header.code.0.to_string());
 
-    let outcome =
-        pipeline::dispatch_validated(header, attrs, src, &client, handler.as_ref(), cache).await;
+    let outcome = pipeline::dispatch_validated(
+        header,
+        attrs,
+        src,
+        &client,
+        handler.as_ref(),
+        cache,
+        Some(StatusServerContext {
+            role,
+            transport: StatusTransport::Udp,
+            policy: status_policy,
+        }),
+    )
+    .await;
 
     match outcome {
         Dispatched::Replay {
@@ -271,6 +306,74 @@ async fn process_packet<H>(
             debug!(event = "handler_drop", code = _code.0, id = _identifier);
             count!("radius_tokio.packets_dropped", "reason" => "handler_drop");
         }
+        Dispatched::StatusServerReply {
+            sealed,
+            identifier: _identifier,
+            role: _role,
+        } => {
+            let bytes = sealed.as_bytes();
+            let _reply_code = bytes.first().copied().unwrap_or(0);
+            match socket.send_to(bytes, src).await {
+                Ok(_n) => {
+                    debug!(
+                        event = "status_server_reply",
+                        %src,
+                        client = ?client.id(),
+                        role = ?_role,
+                        reply_code = _reply_code,
+                        id = _identifier,
+                        len = _n,
+                    );
+                    count!(
+                        "radius_tokio.status_server_replies",
+                        "transport" => "udp",
+                        "role" => match _role {
+                            ListenerRole::Auth => "auth",
+                            ListenerRole::Acct => "acct",
+                        },
+                    );
+                }
+                Err(_e) => {
+                    warn_!(
+                        event = "status_server_reply_send_error",
+                        %src,
+                        id = _identifier,
+                        error = %_e,
+                    );
+                    count!("radius_tokio.send_errors");
+                }
+            }
+        }
+        Dispatched::StatusServerDisabledPerClient {
+            identifier: _identifier,
+        } => {
+            debug!(
+                event = "drop",
+                reason = "status_server_disabled_per_client",
+                %src,
+                client = ?client.id(),
+                id = _identifier,
+            );
+            count!(
+                "radius_tokio.packets_dropped",
+                "reason" => "status_server_disabled_per_client",
+            );
+        }
+        Dispatched::StatusServerDisabled {
+            identifier: _identifier,
+        } => {
+            debug!(
+                event = "drop",
+                reason = "status_server_disabled",
+                %src,
+                client = ?client.id(),
+                id = _identifier,
+            );
+            count!(
+                "radius_tokio.packets_dropped",
+                "reason" => "status_server_disabled",
+            );
+        }
     }
 }
 
@@ -285,6 +388,33 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::sync::Mutex;
     use tokio::net::UdpSocket as TokioUdp;
+
+    /// Test-only wrapper that picks `ListenerRole::Auth` and the
+    /// default Status-Server policy. Keeps the existing test bodies
+    /// readable now that `serve_udp` carries listener role +
+    /// Status-Server policy.
+    async fn serve_udp_test<S, H>(
+        socket: UdpSocket,
+        store: Arc<S>,
+        handler: Arc<H>,
+        cache: Arc<DedupCache>,
+        rx: watch::Receiver<bool>,
+    ) -> io::Result<()>
+    where
+        S: ClientStore,
+        H: Handler,
+    {
+        serve_udp(
+            socket,
+            store,
+            handler,
+            cache,
+            ListenerRole::Auth,
+            Arc::new(StatusServerPolicy::Enabled),
+            rx,
+        )
+        .await
+    }
 
     /// A handler that always returns Access-Accept and counts calls.
     struct AcceptCounter {
@@ -354,7 +484,7 @@ mod tests {
         let cache = Arc::new(DedupCache::new(DEFAULT_DEDUP_TTL));
         let (tx, rx) = watch::channel(false);
 
-        let server = tokio::spawn(serve_udp(
+        let server = tokio::spawn(serve_udp_test(
             server_sock,
             store,
             Arc::clone(&handler),
@@ -400,7 +530,7 @@ mod tests {
         });
         let cache = Arc::new(DedupCache::new(DEFAULT_DEDUP_TTL));
         let (tx, rx) = watch::channel(false);
-        let server = tokio::spawn(serve_udp(server_sock, store, handler, cache, rx));
+        let server = tokio::spawn(serve_udp_test(server_sock, store, handler, cache, rx));
 
         let client_sock = TokioUdp::bind("127.0.0.1:0").await.unwrap();
         let (_, datagram) = build_access_request(1, b"shared");
@@ -433,7 +563,7 @@ mod tests {
         });
         let cache = Arc::new(DedupCache::new(DEFAULT_DEDUP_TTL));
         let (tx, rx) = watch::channel(false);
-        let server = tokio::spawn(serve_udp(
+        let server = tokio::spawn(serve_udp_test(
             server_sock,
             store,
             Arc::clone(&handler),
@@ -582,7 +712,7 @@ mod tests {
         });
         let cache = Arc::new(DedupCache::new(DEFAULT_DEDUP_TTL));
         let (tx, rx) = watch::channel(false);
-        let server = tokio::spawn(serve_udp(server_sock, store, handler, cache, rx));
+        let server = tokio::spawn(serve_udp_test(server_sock, store, handler, cache, rx));
 
         let client_sock = TokioUdp::bind("127.0.0.1:0").await.unwrap();
         let (_, datagram) = build_access_request(42, &secret);
@@ -616,7 +746,7 @@ mod tests {
         });
         let cache = Arc::new(DedupCache::new(DEFAULT_DEDUP_TTL));
         let (tx, rx) = watch::channel(false);
-        let server = tokio::spawn(serve_udp(server_sock, store, handler, cache, rx));
+        let server = tokio::spawn(serve_udp_test(server_sock, store, handler, cache, rx));
 
         let client_sock = TokioUdp::bind("127.0.0.1:0").await.unwrap();
         client_sock
@@ -671,7 +801,7 @@ mod tests {
         });
         let cache = Arc::new(DedupCache::new(DEFAULT_DEDUP_TTL));
         let (tx, rx) = watch::channel(false);
-        let server = tokio::spawn(serve_udp(server_sock, store, handler, cache, rx));
+        let server = tokio::spawn(serve_udp_test(server_sock, store, handler, cache, rx));
 
         let client_sock = TokioUdp::bind("127.0.0.1:0").await.unwrap();
         let (_, datagram) = build_access_request_no_ma(3);
@@ -706,7 +836,7 @@ mod tests {
         });
         let cache = Arc::new(DedupCache::new(DEFAULT_DEDUP_TTL));
         let (tx, rx) = watch::channel(false);
-        let server = tokio::spawn(serve_udp(
+        let server = tokio::spawn(serve_udp_test(
             server_sock,
             store,
             Arc::clone(&handler),
@@ -756,7 +886,7 @@ mod tests {
         });
         let cache = Arc::new(DedupCache::new(DEFAULT_DEDUP_TTL));
         let (tx, rx) = watch::channel(false);
-        let server = tokio::spawn(serve_udp(server_sock, store, handler, cache, rx));
+        let server = tokio::spawn(serve_udp_test(server_sock, store, handler, cache, rx));
 
         let client_sock = TokioUdp::bind("127.0.0.1:0").await.unwrap();
         // Build a properly-MA'd request, then corrupt the tag's

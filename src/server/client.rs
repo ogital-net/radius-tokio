@@ -110,6 +110,7 @@ pub struct Client {
     id: ClientId,
     secret: SecretBytes,
     require_message_authenticator: bool,
+    status_server_enabled: bool,
 }
 
 impl Client {
@@ -126,6 +127,7 @@ impl Client {
             id: ClientId::new(),
             secret: secret.into(),
             require_message_authenticator: true,
+            status_server_enabled: true,
         }
     }
 
@@ -177,6 +179,30 @@ impl Client {
     #[must_use]
     pub fn allow_missing_message_authenticator(mut self) -> Self {
         self.require_message_authenticator = false;
+        self
+    }
+
+    /// Whether the listener should answer Status-Server (RFC 5997)
+    /// probes for this client. Defaults to `true`.
+    ///
+    /// When `false`, validated Status-Server packets from this
+    /// client are silently dropped after authenticator checks —
+    /// the same wire-level outcome as if the server-wide policy
+    /// were [`StatusServerPolicy::Disabled`](crate::server::StatusServerPolicy),
+    /// but scoped to a single peer. Useful for muting a noisy or
+    /// misconfigured NAS without affecting the rest of the
+    /// deployment.
+    #[must_use]
+    pub fn status_server_enabled(&self) -> bool {
+        self.status_server_enabled
+    }
+
+    /// Disable Status-Server (RFC 5997) responses for this client.
+    ///
+    /// See [`Self::status_server_enabled`] for the semantics.
+    #[must_use]
+    pub fn disable_status_server(mut self) -> Self {
+        self.status_server_enabled = false;
         self
     }
 }

@@ -37,6 +37,33 @@ and deprecation precedes removal by at least one minor release.
 
 ### Added
 
+- **Status-Server (RFC 5997 / RFC 6614 §2.6).** Built-in keepalive
+  responder runs inline on every UDP and RadSec listener — no
+  consumer `Handler` invocation, no new task — so probe traffic
+  cannot queue behind application latency. Listener role
+  (`ListenerRole::Auth` → `Access-Accept`,
+  `ListenerRole::Acct` → `Accounting-Response`) selects the reply
+  code per RFC 5997 §6. Reply-side Message-Authenticator is always
+  emitted (already a project-wide secure default); request-side is
+  required unconditionally (RFC 5997 §6 mandates it regardless of
+  the per-`Client` strict-M-A toggle that governs Access-Request).
+  Server-wide policy via
+  `ServerBuilder::status_server_policy(StatusServerPolicy::{Disabled,Enabled,Custom})`;
+  per-client mute via `Client::disable_status_server()`. Custom
+  policy gets a synchronous `StatusResponder` callback that may
+  append a `Reply-Message` (helper:
+  `radius_tokio::server::status::append_reply_message`) or veto the
+  reply with `StatusAction::Drop`. Retransmits replay byte-identical
+  through the existing dedup cache.
+- `ServerBuilder::listen_udp_with(addr, role)` and
+  `ServerBuilder::listen_radsec_with(addr, tls, role)` for binding
+  a listener with an explicit `ListenerRole`. The default
+  `listen_udp` / `listen_radsec` retain `ListenerRole::Auth`.
+- `PacketBuffer::seal_as_random_authenticator_request(req_auth, secret)`
+  — public helper that finalises an Access-Request-shaped frame
+  (Status-Server probes, fuzz / test harnesses) by installing the
+  random Request Authenticator and an HMAC-MD5
+  Message-Authenticator computed against the final packet bytes.
 - `Client::require_message_authenticator()` accessor and
   `Client::allow_missing_message_authenticator()` builder method
   (see Security note above).

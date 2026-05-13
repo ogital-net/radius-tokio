@@ -273,6 +273,8 @@ pub(crate) async fn serve_radsec<S, H>(
     handler: Arc<H>,
     cache: Arc<DedupCache>,
     registry: Arc<ConnectionRegistry>,
+    role: super::status::ListenerRole,
+    status_policy: Arc<super::status::StatusServerPolicy>,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()>
 where
@@ -321,9 +323,11 @@ where
                 let cache = Arc::clone(&cache);
                 let registry = Arc::clone(&registry);
                 let tls_ctx = tls_ctx.clone();
+                let status_policy = Arc::clone(&status_policy);
                 tokio::spawn(async move {
                     if let Err(_e) = handle_connection(
                         stream, peer, tls_ctx, store, handler, cache, registry,
+                        role, status_policy,
                     ).await {
                         warn_!(event = "radsec_connection_error", %peer, error = ?_e);
                     }
@@ -345,6 +349,8 @@ async fn handle_connection<S, H>(
     handler: Arc<H>,
     cache: Arc<DedupCache>,
     registry: Arc<ConnectionRegistry>,
+    role: super::status::ListenerRole,
+    status_policy: Arc<super::status::StatusServerPolicy>,
 ) -> io::Result<()>
 where
     S: ClientStore,
@@ -404,6 +410,8 @@ where
         &client,
         handler.as_ref(),
         cache.as_ref(),
+        role,
+        status_policy.as_ref(),
         close_rx,
     )
     .await;
@@ -422,13 +430,15 @@ where
 /// closes, the connection is revoked, the idle timer fires, or a
 /// dispatch decision (bad authenticator, malformed framing) demands
 /// a teardown.
-#[allow(clippy::used_underscore_binding)]
+#[allow(clippy::used_underscore_binding, clippy::too_many_arguments)]
 async fn run_frame_loop<H: Handler>(
     conn: &mut AsyncTls,
     peer: SocketAddr,
     client: &Arc<Client>,
     handler: &H,
     cache: &DedupCache,
+    role: super::status::ListenerRole,
+    status_policy: &super::status::StatusServerPolicy,
     mut close_rx: oneshot::Receiver<()>,
 ) -> io::Result<()> {
     let mut frame = vec![0u8; MAX_PACKET_LEN];
@@ -486,6 +496,8 @@ async fn run_frame_loop<H: Handler>(
                     client,
                     handler,
                     cache,
+                    role,
+                    status_policy,
                 )
                 .await
                 {
@@ -527,7 +539,7 @@ async fn read_frame(conn: &mut AsyncTls, out: &mut [u8]) -> io::Result<Option<us
 
 /// Validate and dispatch one RADIUS frame, then write the sealed
 /// reply (if any) back over the TLS session.
-#[allow(clippy::used_underscore_binding)]
+#[allow(clippy::used_underscore_binding, clippy::too_many_arguments)]
 async fn process_frame<H: Handler>(
     conn: &mut AsyncTls,
     datagram: &[u8],
@@ -535,6 +547,8 @@ async fn process_frame<H: Handler>(
     client: &Arc<Client>,
     handler: &H,
     cache: &DedupCache,
+    role: super::status::ListenerRole,
+    status_policy: &super::status::StatusServerPolicy,
 ) -> io::Result<()> {
     // Steps 1–3: transport-agnostic header + authenticator
     // validation. Inside an authenticated TLS session, any
@@ -619,9 +633,23 @@ async fn process_frame<H: Handler>(
     count!("radius_tokio.requests_dispatched", "code" => header.code.0.to_string());
 
     // Steps 4–5: dedup-aware dispatch. Cache hit replays the
-    // previously-sent reply; cache miss runs the handler, seals,
-    // caches, and returns the sealed bytes.
-    let outcome = pipeline::dispatch_validated(header, attrs, peer, client, handler, cache).await;
+    // previously-sent reply; cache miss either short-circuits a
+    // Status-Server probe through the configured policy or runs
+    // the handler, seals, caches, and returns the sealed bytes.
+    let outcome = pipeline::dispatch_validated(
+        header,
+        attrs,
+        peer,
+        client,
+        handler,
+        cache,
+        Some(pipeline::StatusServerContext {
+            role,
+            transport: super::status::StatusTransport::Radsec,
+            policy: status_policy,
+        }),
+    )
+    .await;
 
     match outcome {
         Dispatched::Replay {
@@ -677,6 +705,75 @@ async fn process_frame<H: Handler>(
         } => {
             debug!(event = "handler_drop", code = _code.0, id = _identifier,);
             count!("radius_tokio.packets_dropped", "reason" => "handler_drop");
+            Ok(())
+        }
+        Dispatched::StatusServerReply {
+            sealed,
+            identifier: _identifier,
+            role: _role,
+        } => {
+            let bytes = sealed.as_bytes();
+            match conn.write_all(bytes).await {
+                Ok(()) => {
+                    debug!(
+                        event = "radsec_status_server_reply",
+                        %peer,
+                        client = ?client.id(),
+                        id = _identifier,
+                        len = bytes.len(),
+                    );
+                    count!(
+                        "radius_tokio.status_server_replies",
+                        "transport" => "radsec",
+                        "role" => match _role {
+                            super::status::ListenerRole::Auth => "auth",
+                            super::status::ListenerRole::Acct => "acct",
+                        },
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    warn_!(
+                        event = "radsec_status_server_reply_send_error",
+                        %peer,
+                        id = _identifier,
+                        error = %e,
+                    );
+                    count!("radius_tokio.send_errors");
+                    Err(e)
+                }
+            }
+        }
+        Dispatched::StatusServerDisabledPerClient {
+            identifier: _identifier,
+        } => {
+            debug!(
+                event = "radsec_drop",
+                reason = "status_server_disabled_per_client",
+                %peer,
+                client = ?client.id(),
+                id = _identifier,
+            );
+            count!(
+                "radius_tokio.packets_dropped",
+                "reason" => "status_server_disabled_per_client",
+            );
+            Ok(())
+        }
+        Dispatched::StatusServerDisabled {
+            identifier: _identifier,
+        } => {
+            debug!(
+                event = "radsec_drop",
+                reason = "status_server_disabled",
+                %peer,
+                client = ?client.id(),
+                id = _identifier,
+            );
+            count!(
+                "radius_tokio.packets_dropped",
+                "reason" => "status_server_disabled",
+            );
             Ok(())
         }
     }

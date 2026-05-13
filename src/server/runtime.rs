@@ -23,6 +23,7 @@ use super::dedup::DedupCache;
 use super::handler::Handler;
 #[cfg(feature = "radsec")]
 use super::radsec::{serve_radsec, ConnectionRegistry};
+use super::status::{ListenerRole, StatusServerPolicy};
 use super::store::ClientStore;
 use super::udp::{serve_udp, DEFAULT_DEDUP_TTL};
 
@@ -210,12 +211,13 @@ impl RadSecRevoker {
 pub struct Server<S, H> {
     store: Arc<S>,
     handler: Arc<H>,
-    udp_binds: Vec<SocketAddr>,
+    udp_binds: Vec<(SocketAddr, ListenerRole)>,
     #[cfg(feature = "radsec")]
-    radsec_binds: Vec<(SocketAddr, TlsContext)>,
+    radsec_binds: Vec<(SocketAddr, TlsContext, ListenerRole)>,
     #[cfg(feature = "radsec")]
     connections: Arc<ConnectionRegistry>,
     dedup_ttl: Duration,
+    status_policy: Arc<StatusServerPolicy>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 }
@@ -289,22 +291,24 @@ impl<S: ClientStore, H: Handler> Server<S, H> {
         let cache = Arc::new(DedupCache::new(self.dedup_ttl));
 
         let mut tasks = JoinSet::new();
-        for addr in &self.udp_binds {
+        for (addr, role) in &self.udp_binds {
             let socket = bind_udp(*addr)?;
-            info!(event = "udp_bind", %addr);
+            info!(event = "udp_bind", %addr, role = ?role);
             tasks.spawn(serve_udp(
                 socket,
                 Arc::clone(&self.store),
                 Arc::clone(&self.handler),
                 Arc::clone(&cache),
+                *role,
+                Arc::clone(&self.status_policy),
                 self.shutdown_rx.clone(),
             ));
         }
 
         #[cfg(feature = "radsec")]
-        for (addr, ctx) in &self.radsec_binds {
+        for (addr, ctx, role) in &self.radsec_binds {
             let listener = TcpListener::bind(addr).await?;
-            info!(event = "radsec_bind", %addr);
+            info!(event = "radsec_bind", %addr, role = ?role);
             tasks.spawn(serve_radsec(
                 listener,
                 ctx.clone(),
@@ -312,6 +316,8 @@ impl<S: ClientStore, H: Handler> Server<S, H> {
                 Arc::clone(&self.handler),
                 Arc::clone(&cache),
                 Arc::clone(&self.connections),
+                *role,
+                Arc::clone(&self.status_policy),
                 self.shutdown_rx.clone(),
             ));
         }
@@ -356,10 +362,11 @@ impl<S: ClientStore, H: Handler> Server<S, H> {
 pub struct ServerBuilder<S, H> {
     store: Option<Arc<S>>,
     handler: Option<Arc<H>>,
-    udp_binds: Vec<SocketAddr>,
+    udp_binds: Vec<(SocketAddr, ListenerRole)>,
     #[cfg(feature = "radsec")]
-    radsec_binds: Vec<(SocketAddr, TlsContext)>,
+    radsec_binds: Vec<(SocketAddr, TlsContext, ListenerRole)>,
     dedup_ttl: Duration,
+    status_policy: StatusServerPolicy,
 }
 
 impl<S, H> Default for ServerBuilder<S, H> {
@@ -371,6 +378,7 @@ impl<S, H> Default for ServerBuilder<S, H> {
             #[cfg(feature = "radsec")]
             radsec_binds: Vec::new(),
             dedup_ttl: DEFAULT_DEDUP_TTL,
+            status_policy: StatusServerPolicy::default(),
         }
     }
 }
@@ -392,9 +400,26 @@ impl<S: ClientStore, H: Handler> ServerBuilder<S, H> {
 
     /// Add a UDP listen address. May be called multiple times for
     /// auth + accounting, dual-stack, etc.
+    ///
+    /// Defaults to [`ListenerRole::Auth`]. Use
+    /// [`Self::listen_udp_with`] to bind an accounting listener
+    /// (which determines the reply code for inbound
+    /// Status-Server probes per RFC 5997).
     #[must_use]
     pub fn listen_udp(mut self, addr: SocketAddr) -> Self {
-        self.udp_binds.push(addr);
+        self.udp_binds.push((addr, ListenerRole::Auth));
+        self
+    }
+
+    /// Add a UDP listen address with an explicit listener role.
+    ///
+    /// The role determines the reply code emitted by the built-in
+    /// Status-Server (RFC 5997) responder — `Access-Accept` for
+    /// [`ListenerRole::Auth`], `Accounting-Response` for
+    /// [`ListenerRole::Acct`].
+    #[must_use]
+    pub fn listen_udp_with(mut self, addr: SocketAddr, role: ListenerRole) -> Self {
+        self.udp_binds.push((addr, role));
         self
     }
 
@@ -430,7 +455,31 @@ impl<S: ClientStore, H: Handler> ServerBuilder<S, H> {
     #[cfg(feature = "radsec")]
     #[must_use]
     pub fn listen_radsec(mut self, addr: SocketAddr, tls: TlsContext) -> Self {
-        self.radsec_binds.push((addr, tls));
+        self.radsec_binds.push((addr, tls, ListenerRole::Auth));
+        self
+    }
+
+    /// Like [`Self::listen_radsec`] but with an explicit listener
+    /// role for the built-in Status-Server (RFC 5997 / RFC 6614
+    /// §2.6) responder.
+    #[cfg(feature = "radsec")]
+    #[must_use]
+    pub fn listen_radsec_with(
+        mut self,
+        addr: SocketAddr,
+        tls: TlsContext,
+        role: ListenerRole,
+    ) -> Self {
+        self.radsec_binds.push((addr, tls, role));
+        self
+    }
+
+    /// Override the server-wide Status-Server (RFC 5997) policy.
+    /// Defaults to [`StatusServerPolicy::Enabled`] — every
+    /// listener answers probes with the role-derived reply code.
+    #[must_use]
+    pub fn status_server_policy(mut self, policy: StatusServerPolicy) -> Self {
+        self.status_policy = policy;
         self
     }
 
@@ -464,6 +513,7 @@ impl<S: ClientStore, H: Handler> ServerBuilder<S, H> {
             #[cfg(feature = "radsec")]
             connections: Arc::new(ConnectionRegistry::default()),
             dedup_ttl: self.dedup_ttl,
+            status_policy: Arc::new(self.status_policy),
             shutdown_tx,
             shutdown_rx,
         })

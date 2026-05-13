@@ -50,6 +50,7 @@ without deprecation cycles until a `1.0` release.
 | RFC 3580 | IEEE 802.1X RADIUS Usage Guidelines           | dictionaries  |
 | RFC 5080 | Common RADIUS Implementation Issues           | dedup cache   |
 | RFC 5176 | Dynamic Authorization (CoA / Disconnect)      | implemented   |
+| RFC 5997 | Status-Server                                 | implemented   |
 | RFC 6614 | RADIUS over TLS (RadSec)                      | implemented   |
 | RFC 8044 / RFC 6158 | Data type guidance                 | dict types    |
 
