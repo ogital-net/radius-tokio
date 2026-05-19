@@ -76,7 +76,7 @@ enum PacketSource<'a> {
     /// attribute region directly from the buffer's accessors so an
     /// unsealed (length-placeholder) buffer still dissects correctly.
     Buffer(&'a PacketBuffer),
-    /// Raw datagram bytes; the header is parsed on demand.
+    /// Raw packet bytes; the header is parsed on demand.
     Bytes(&'a [u8]),
 }
 
@@ -89,7 +89,7 @@ impl<'a> PacketDissect<'a> {
         }
     }
 
-    /// Build a dissector view directly from raw datagram bytes.
+    /// Build a dissector view directly from raw packet bytes.
     ///
     /// Useful for logging un-parsed input (e.g. on a header-validation
     /// failure path); the renderer falls back to a `<malformed
@@ -433,6 +433,13 @@ fn write_value(
             writeln!(f, " <{:?}>", entry.typ)?;
             let cont = format!("{indent}{INDENT}");
             write_raw_hex(f, &cont, val)
+        }
+        _ => {
+            // `Type` is `#[non_exhaustive]`. Unknown variants fall
+            // back to a raw hex dump rather than refusing to render.
+            write!(f, " val=")?;
+            write_hex_inline(f, val)?;
+            writeln!(f)
         }
     }
 }

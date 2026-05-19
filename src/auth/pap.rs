@@ -9,13 +9,11 @@
 //! `Vec<u8>` we would have to scrub.
 
 use crate::codec::attributes::AttributeError;
+use crate::codec::constants::USER_PASSWORD as USER_PASSWORD_TYPE;
 use crate::crypto::{ct_eq, password};
 use crate::server::Request;
 
 use super::VerifyOutcome;
-
-/// RFC 2865 §5.2: User-Password attribute type.
-const USER_PASSWORD_TYPE: u8 = 2;
 
 /// Maximum cleartext password length the helper will encrypt for the
 /// constant-time compare. Matches the RFC's 128-byte ciphertext cap.

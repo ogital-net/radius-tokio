@@ -110,7 +110,7 @@ fn set_v4_dontfrag(sock: &socket2::Socket) {
             )
         };
         if rc != 0 {
-            warn_!(
+            warn!(
                 event = "udp_bind_pmtud_failed",
                 errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
             );
@@ -147,7 +147,7 @@ fn set_v4_dontfrag(sock: &socket2::Socket) {
             )
         };
         if rc != 0 {
-            warn_!(
+            warn!(
                 event = "udp_bind_pmtud_failed",
                 errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
             );
@@ -348,7 +348,7 @@ impl<S: ClientStore, H: Handler> Server<S, H> {
         }
 
         if let Some(e) = first_err {
-            warn_!(event = "server_exit", error = %e);
+            warn!(event = "server_exit", error = %e);
             Err(e)
         } else {
             info!(event = "server_exit");

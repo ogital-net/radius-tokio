@@ -62,6 +62,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::watch;
 
 use crate::codec::header::MAX_PACKET_LEN;
+#[cfg(feature = "metrics")]
+use crate::obs::metrics;
 
 use super::dedup::DedupCache;
 use super::handler::Handler;
@@ -111,8 +113,8 @@ where
                 // are dropped here; flood traffic never reaches the
                 // scheduler.
                 let Some(client) = store.lookup_udp(src).await else {
-                    warn_!(event = "drop", reason = "unknown_client", %src, len);
-                    count!("radius_tokio.packets_dropped", "reason" => "unknown_client");
+                    warn!(event = "drop", reason = "unknown_client", %src, len);
+                    count!(metrics::PACKETS_DROPPED, "reason" => "unknown_client");
                     continue;
                 };
 
@@ -174,53 +176,62 @@ async fn process_packet<H>(
     let (header, attrs) = match pipeline::validate(datagram, &client) {
         Validated::Ok { header, attrs } => (header, attrs),
         Validated::MalformedHeader(_e) => {
-            warn_!(
+            warn!(
                 event = "drop",
                 reason = "malformed_header",
                 %src,
                 client = ?client.id(),
                 error = %_e,
             );
-            count!("radius_tokio.packets_dropped", "reason" => "malformed_header");
+            count!(metrics::PACKETS_DROPPED, "reason" => "malformed_header");
             return;
         }
-        Validated::BadRequestAuthenticator { code, identifier } => {
-            warn_!(
+        Validated::BadRequestAuthenticator {
+            code: _code,
+            identifier: _identifier,
+        } => {
+            warn!(
                 event = "drop",
                 reason = "bad_request_authenticator",
                 %src,
                 client = ?client.id(),
-                code = code.0,
-                id = identifier,
+                code = _code.0,
+                id = _identifier,
             );
-            count!("radius_tokio.packets_dropped", "reason" => "bad_request_authenticator");
+            count!(metrics::PACKETS_DROPPED, "reason" => "bad_request_authenticator");
             return;
         }
-        Validated::MissingMessageAuthenticator { code, identifier } => {
-            warn_!(
+        Validated::MissingMessageAuthenticator {
+            code: _code,
+            identifier: _identifier,
+        } => {
+            warn!(
                 event = "drop",
                 reason = "missing_message_authenticator",
                 %src,
                 client = ?client.id(),
-                code = code.0,
-                id = identifier,
+                code = _code.0,
+                id = _identifier,
             );
             count!(
-                "radius_tokio.packets_dropped",
+                metrics::PACKETS_DROPPED,
                 "reason" => "missing_message_authenticator"
             );
             return;
         }
-        Validated::BadMessageAuthenticator { code, identifier } => {
-            warn_!(
+        Validated::BadMessageAuthenticator {
+            code: _code,
+            identifier: _identifier,
+        } => {
+            warn!(
                 event = "drop",
                 reason = "bad_message_authenticator",
                 %src,
                 client = ?client.id(),
-                code = code.0,
-                id = identifier,
+                code = _code.0,
+                id = _identifier,
             );
-            count!("radius_tokio.packets_dropped", "reason" => "bad_message_authenticator");
+            count!(metrics::PACKETS_DROPPED, "reason" => "bad_message_authenticator");
             return;
         }
     };
@@ -236,7 +247,7 @@ async fn process_packet<H>(
         id = header.identifier,
         len = datagram.len(),
     );
-    count!("radius_tokio.requests_dispatched", "code" => header.code.0.to_string());
+    count!(metrics::REQUESTS_DISPATCHED, "code" => header.code.0.to_string());
 
     let outcome = pipeline::dispatch_validated(
         header,
@@ -267,7 +278,7 @@ async fn process_packet<H>(
                 id = _identifier,
                 reply_len = bytes.len(),
             );
-            count!("radius_tokio.dedup_hits");
+            count!(metrics::DEDUP_HITS);
             let _ = socket.send_to(&bytes, src).await;
         }
         Dispatched::Reply {
@@ -286,16 +297,16 @@ async fn process_packet<H>(
                         id = _identifier,
                         len = _n,
                     );
-                    count!("radius_tokio.replies_sent", "code" => _reply_code.to_string());
+                    count!(metrics::REPLIES_SENT, "code" => _reply_code.to_string());
                 }
                 Err(_e) => {
-                    warn_!(
+                    warn!(
                         event = "reply_send_error",
                         code = _code.0,
                         id = _identifier,
                         error = %_e,
                     );
-                    count!("radius_tokio.send_errors");
+                    count!(metrics::SEND_ERRORS);
                 }
             }
         }
@@ -304,7 +315,7 @@ async fn process_packet<H>(
             identifier: _identifier,
         } => {
             debug!(event = "handler_drop", code = _code.0, id = _identifier);
-            count!("radius_tokio.packets_dropped", "reason" => "handler_drop");
+            count!(metrics::PACKETS_DROPPED, "reason" => "handler_drop");
         }
         Dispatched::StatusServerReply {
             sealed,
@@ -325,7 +336,7 @@ async fn process_packet<H>(
                         len = _n,
                     );
                     count!(
-                        "radius_tokio.status_server_replies",
+                        metrics::STATUS_SERVER_REPLIES,
                         "transport" => "udp",
                         "role" => match _role {
                             ListenerRole::Auth => "auth",
@@ -334,13 +345,13 @@ async fn process_packet<H>(
                     );
                 }
                 Err(_e) => {
-                    warn_!(
+                    warn!(
                         event = "status_server_reply_send_error",
                         %src,
                         id = _identifier,
                         error = %_e,
                     );
-                    count!("radius_tokio.send_errors");
+                    count!(metrics::SEND_ERRORS);
                 }
             }
         }
@@ -355,7 +366,7 @@ async fn process_packet<H>(
                 id = _identifier,
             );
             count!(
-                "radius_tokio.packets_dropped",
+                metrics::PACKETS_DROPPED,
                 "reason" => "status_server_disabled_per_client",
             );
         }
@@ -370,7 +381,7 @@ async fn process_packet<H>(
                 id = _identifier,
             );
             count!(
-                "radius_tokio.packets_dropped",
+                metrics::PACKETS_DROPPED,
                 "reason" => "status_server_disabled",
             );
         }

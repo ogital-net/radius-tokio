@@ -38,12 +38,10 @@ use crate::codec::attributes::AttributeError;
 use crate::crypto::{cleanse, ct_eq, des::DesKey, md4, sha1::Sha1};
 use crate::server::Request;
 
+use crate::codec::constants::{USER_NAME as USER_NAME_TYPE, VENDOR_SPECIFIC as VSA_TYPE};
+
 /// Microsoft Private Enterprise Number (RFC 2548).
 const MS_VENDOR_ID: u32 = 311;
-/// `Vendor-Specific` attribute type (RFC 2865 §5.26).
-const VSA_TYPE: u8 = 26;
-/// `User-Name` attribute type (RFC 2865 §5.1).
-const USER_NAME_TYPE: u8 = 1;
 
 // Microsoft per-vendor type codes (RFC 2548).
 const VT_MS_CHAP_RESPONSE: u8 = 1;

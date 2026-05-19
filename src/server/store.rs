@@ -9,6 +9,18 @@
 //! `lookup_udp` is intentionally async: a database-backed store can
 //! await its query, and an in-memory store can return immediately
 //! (`async { … }` compiles to a no-op state machine).
+//!
+//! # Terminology
+//!
+//! * **Peer** — the unresolved inbound entity, identified by what
+//!   the transport hands us:
+//!   * for UDP, the source [`SocketAddr`];
+//!   * for `RadSec`, the source [`SocketAddr`] **and** the
+//!     validated leaf [`PeerCertificate`](crate::tls::PeerCertificate).
+//! * **Client** — the resolved record (shared secret, policy
+//!   flags, …) the store maps a peer to. Every value of [`Client`]
+//!   in this crate refers to an authorised configuration entry —
+//!   never to a raw wire address.
 
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -99,6 +111,7 @@ pub struct IpCidr {
 
 /// Errors that can arise when constructing an [`IpCidr`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CidrError {
     /// The prefix length exceeds the address width
     /// (32 for IPv4, 128 for IPv6).

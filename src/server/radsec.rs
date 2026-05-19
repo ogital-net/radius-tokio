@@ -74,6 +74,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, watch};
 
 use crate::codec::header::{MAX_PACKET_LEN, MIN_PACKET_LEN};
+#[cfg(feature = "metrics")]
+use crate::obs::metrics;
 use crate::tls::{HandshakeState, TlsConnection, TlsContext, TlsError};
 
 use super::client::{Client, ClientId};
@@ -152,7 +154,7 @@ fn apply_keepalive(stream: &TcpStream) {
     if let Err(_e) = SockRef::from(stream).set_tcp_keepalive(&ka) {
         #[allow(clippy::used_underscore_binding)]
         {
-            warn_!(event = "radsec_keepalive_failed", error = ?_e);
+            warn!(event = "radsec_keepalive_failed", error = ?_e);
         }
     }
 }
@@ -306,7 +308,7 @@ where
                 // own work internally.
                 if !store.admit_radsec(peer).await {
                     debug!(event = "radsec_admit_reject", %peer);
-                    count!("radius_tokio.radsec_admit_rejects");
+                    count!(metrics::RADSEC_ADMIT_REJECTS);
                     drop(stream);
                     continue;
                 }
@@ -329,7 +331,7 @@ where
                         stream, peer, tls_ctx, store, handler, cache, registry,
                         role, status_policy,
                     ).await {
-                        warn_!(event = "radsec_connection_error", %peer, error = ?_e);
+                        warn!(event = "radsec_connection_error", %peer, error = ?_e);
                     }
                 });
             }
@@ -361,8 +363,8 @@ where
     let tls = TlsConnection::accept(&tls_ctx).map_err(tls_to_io)?;
     let mut conn = AsyncTls::new(stream, tls);
     if let Err(_e) = conn.handshake().await {
-        warn_!(event = "radsec_handshake_failed", %peer, error = ?_e);
-        count!("radius_tokio.radsec_handshake_failures");
+        warn!(event = "radsec_handshake_failed", %peer, error = ?_e);
+        count!(metrics::RADSEC_HANDSHAKE_FAILURES);
         return Ok(());
     }
 
@@ -375,19 +377,19 @@ where
         // mTLS is mandatory in TlsContext::server; absence here
         // would mean libssl let a no-cert client through, which
         // it shouldn't. Defensive close.
-        warn_!(event = "radsec_cert_missing", %peer);
-        count!("radius_tokio.radsec_cert_lookup_failures", "reason" => "missing");
+        warn!(event = "radsec_cert_missing", %peer);
+        count!(metrics::RADSEC_CERT_LOOKUP_FAILURES, "reason" => "missing");
         let _ = conn.shutdown_clean().await;
         return Ok(());
     };
     let Some(client) = store.lookup_radsec_by_cert(peer, &peer_cert).await else {
-        warn_!(
+        warn!(
             event = "radsec_cert_lookup_reject",
             %peer,
             subject = %peer_cert.subject_display(),
         );
         count!(
-            "radius_tokio.radsec_cert_lookup_failures",
+            metrics::RADSEC_CERT_LOOKUP_FAILURES,
             "reason" => "unknown_cert",
         );
         let _ = conn.shutdown_clean().await;
@@ -395,7 +397,7 @@ where
     };
 
     info!(event = "radsec_connected", %peer, client = ?client.id());
-    count!("radius_tokio.radsec_connections");
+    count!(metrics::RADSEC_CONNECTIONS);
 
     // Register with the connection registry so a revocation can
     // tear the connection down. The guard removes the entry on
@@ -456,11 +458,11 @@ async fn run_frame_loop<H: Handler>(
                         %peer,
                         client = ?client.id(),
                     );
-                    count!("radius_tokio.radsec_key_updates");
+                    count!(metrics::RADSEC_KEY_UPDATES);
                 }
                 Ok(false) => {}
                 Err(_e) => {
-                    warn_!(
+                    warn!(
                         event = "radsec_key_update_failed",
                         %peer,
                         error = ?_e,
@@ -474,7 +476,7 @@ async fn run_frame_loop<H: Handler>(
             biased;
             _ = &mut close_rx => {
                 debug!(event = "radsec_revoked", %peer, client = ?client.id());
-                count!("radius_tokio.radsec_revocations_applied");
+                count!(metrics::RADSEC_REVOCATIONS_APPLIED);
                 return Ok(());
             }
             res = read_frame(conn, &mut frame) => {
@@ -485,7 +487,7 @@ async fn run_frame_loop<H: Handler>(
                         return Ok(());
                     }
                     Err(_e) => {
-                        warn_!(event = "radsec_read_error", %peer, error = ?_e);
+                        warn!(event = "radsec_read_error", %peer, error = ?_e);
                         return Ok(());
                     }
                 };
@@ -501,7 +503,7 @@ async fn run_frame_loop<H: Handler>(
                 )
                 .await
                 {
-                    warn_!(event = "radsec_dispatch_error", %peer, error = ?_e);
+                    warn!(event = "radsec_dispatch_error", %peer, error = ?_e);
                     return Ok(());
                 }
             }
@@ -559,45 +561,51 @@ async fn process_frame<H: Handler>(
     let (header, attrs) = match pipeline::validate(datagram, client) {
         Validated::Ok { header, attrs } => (header, attrs),
         Validated::MalformedHeader(_e) => {
-            warn_!(
+            warn!(
                 event = "radsec_drop",
                 reason = "malformed_header",
                 %peer,
                 client = ?client.id(),
                 error = %_e,
             );
-            count!("radius_tokio.packets_dropped", "reason" => "malformed_header");
+            count!(metrics::PACKETS_DROPPED, "reason" => "malformed_header");
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "malformed header",
             ));
         }
-        Validated::BadRequestAuthenticator { code, identifier } => {
-            warn_!(
+        Validated::BadRequestAuthenticator {
+            code: _code,
+            identifier: _identifier,
+        } => {
+            warn!(
                 event = "radsec_drop",
                 reason = "bad_request_authenticator",
                 %peer,
                 client = ?client.id(),
-                code = code.0,
-                id = identifier,
+                code = _code.0,
+                id = _identifier,
             );
-            count!("radius_tokio.packets_dropped", "reason" => "bad_request_authenticator");
+            count!(metrics::PACKETS_DROPPED, "reason" => "bad_request_authenticator");
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "bad request authenticator",
             ));
         }
-        Validated::MissingMessageAuthenticator { code, identifier } => {
-            warn_!(
+        Validated::MissingMessageAuthenticator {
+            code: _code,
+            identifier: _identifier,
+        } => {
+            warn!(
                 event = "radsec_drop",
                 reason = "missing_message_authenticator",
                 %peer,
                 client = ?client.id(),
-                code = code.0,
-                id = identifier,
+                code = _code.0,
+                id = _identifier,
             );
             count!(
-                "radius_tokio.packets_dropped",
+                metrics::PACKETS_DROPPED,
                 "reason" => "missing_message_authenticator"
             );
             return Err(io::Error::new(
@@ -605,16 +613,19 @@ async fn process_frame<H: Handler>(
                 "missing message authenticator",
             ));
         }
-        Validated::BadMessageAuthenticator { code, identifier } => {
-            warn_!(
+        Validated::BadMessageAuthenticator {
+            code: _code,
+            identifier: _identifier,
+        } => {
+            warn!(
                 event = "radsec_drop",
                 reason = "bad_message_authenticator",
                 %peer,
                 client = ?client.id(),
-                code = code.0,
-                id = identifier,
+                code = _code.0,
+                id = _identifier,
             );
-            count!("radius_tokio.packets_dropped", "reason" => "bad_message_authenticator");
+            count!(metrics::PACKETS_DROPPED, "reason" => "bad_message_authenticator");
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "bad message authenticator",
@@ -630,7 +641,7 @@ async fn process_frame<H: Handler>(
         id = header.identifier,
         len = datagram.len(),
     );
-    count!("radius_tokio.requests_dispatched", "code" => header.code.0.to_string());
+    count!(metrics::REQUESTS_DISPATCHED, "code" => header.code.0.to_string());
 
     // Steps 4–5: dedup-aware dispatch. Cache hit replays the
     // previously-sent reply; cache miss either short-circuits a
@@ -664,7 +675,7 @@ async fn process_frame<H: Handler>(
                 id = _identifier,
                 reply_len = bytes.len(),
             );
-            count!("radius_tokio.dedup_hits");
+            count!(metrics::DEDUP_HITS);
             conn.write_all(&bytes).await?;
             Ok(())
         }
@@ -684,17 +695,17 @@ async fn process_frame<H: Handler>(
                         id = _identifier,
                         len = bytes.len(),
                     );
-                    count!("radius_tokio.replies_sent", "code" => _reply_code.to_string());
+                    count!(metrics::REPLIES_SENT, "code" => _reply_code.to_string());
                     Ok(())
                 }
                 Err(e) => {
-                    warn_!(
+                    warn!(
                         event = "radsec_reply_send_error",
                         code = _code.0,
                         id = _identifier,
                         error = %e,
                     );
-                    count!("radius_tokio.send_errors");
+                    count!(metrics::SEND_ERRORS);
                     Err(e)
                 }
             }
@@ -704,7 +715,7 @@ async fn process_frame<H: Handler>(
             identifier: _identifier,
         } => {
             debug!(event = "handler_drop", code = _code.0, id = _identifier,);
-            count!("radius_tokio.packets_dropped", "reason" => "handler_drop");
+            count!(metrics::PACKETS_DROPPED, "reason" => "handler_drop");
             Ok(())
         }
         Dispatched::StatusServerReply {
@@ -723,7 +734,7 @@ async fn process_frame<H: Handler>(
                         len = bytes.len(),
                     );
                     count!(
-                        "radius_tokio.status_server_replies",
+                        metrics::STATUS_SERVER_REPLIES,
                         "transport" => "radsec",
                         "role" => match _role {
                             super::status::ListenerRole::Auth => "auth",
@@ -733,13 +744,13 @@ async fn process_frame<H: Handler>(
                     Ok(())
                 }
                 Err(e) => {
-                    warn_!(
+                    warn!(
                         event = "radsec_status_server_reply_send_error",
                         %peer,
                         id = _identifier,
                         error = %e,
                     );
-                    count!("radius_tokio.send_errors");
+                    count!(metrics::SEND_ERRORS);
                     Err(e)
                 }
             }
@@ -755,7 +766,7 @@ async fn process_frame<H: Handler>(
                 id = _identifier,
             );
             count!(
-                "radius_tokio.packets_dropped",
+                metrics::PACKETS_DROPPED,
                 "reason" => "status_server_disabled_per_client",
             );
             Ok(())
@@ -771,7 +782,7 @@ async fn process_frame<H: Handler>(
                 id = _identifier,
             );
             count!(
-                "radius_tokio.packets_dropped",
+                metrics::PACKETS_DROPPED,
                 "reason" => "status_server_disabled",
             );
             Ok(())

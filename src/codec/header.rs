@@ -75,6 +75,43 @@ impl Code {
     pub const COA_NAK: Code = Code(45);
 }
 
+impl Code {
+    /// Human-readable name for known codes, e.g. `"Access-Request"`.
+    /// Returns `"Unknown"` for codes the parser does not enumerate.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Code::ACCESS_REQUEST => "Access-Request",
+            Code::ACCESS_ACCEPT => "Access-Accept",
+            Code::ACCESS_REJECT => "Access-Reject",
+            Code::ACCOUNTING_REQUEST => "Accounting-Request",
+            Code::ACCOUNTING_RESPONSE => "Accounting-Response",
+            Code::ACCESS_CHALLENGE => "Access-Challenge",
+            Code::STATUS_SERVER => "Status-Server",
+            Code::STATUS_CLIENT => "Status-Client",
+            Code::DISCONNECT_REQUEST => "Disconnect-Request",
+            Code::DISCONNECT_ACK => "Disconnect-ACK",
+            Code::DISCONNECT_NAK => "Disconnect-NAK",
+            Code::COA_REQUEST => "CoA-Request",
+            Code::COA_ACK => "CoA-ACK",
+            Code::COA_NAK => "CoA-NAK",
+            _ => "Unknown",
+        }
+    }
+}
+
+impl fmt::Display for Code {
+    /// Renders the RFC name when known, otherwise the decimal byte.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = self.name();
+        if name == "Unknown" {
+            write!(f, "Code({})", self.0)
+        } else {
+            f.write_str(name)
+        }
+    }
+}
+
 /// Parsed view of the fixed 20-byte RADIUS header.
 ///
 /// Owned (the authenticator is just 16 bytes; copying it is cheaper

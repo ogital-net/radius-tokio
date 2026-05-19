@@ -54,6 +54,7 @@
 
 pub mod attributes;
 pub mod authenticator;
+pub(crate) mod constants;
 pub mod dissect;
 pub mod eap;
 pub mod encode;
@@ -62,15 +63,13 @@ pub mod message_authenticator;
 pub mod typed;
 
 use attributes::AttributesIter;
+use constants::VENDOR_SPECIFIC as VENDOR_SPECIFIC_TYPE;
 use header::{Code, Header, HeaderError, MAX_PACKET_LEN, MIN_PACKET_LEN};
 
 /// Maximum encoded length of a single attribute's value field
 /// (RFC 2865 §5: the Length byte is 1 octet and counts the 2-byte TLV
 /// header).
 const MAX_ATTRIBUTE_VALUE_LEN: usize = u8::MAX as usize - 2;
-
-/// Type code for the Vendor-Specific Attribute (RFC 2865 §5.26).
-const VENDOR_SPECIFIC_TYPE: u8 = 26;
 
 /// Errors produced while building or sealing a packet.
 ///

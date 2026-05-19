@@ -29,7 +29,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use radius_tokio::auth::mschap::{self, MsChapSecret};
 use radius_tokio::server::{
@@ -37,24 +37,14 @@ use radius_tokio::server::{
 };
 use radius_tokio::Code;
 
-const SHARED_SECRET: &str = "testing123";
-const IDENTITY: &str = "alice";
-const PASSWORD: &str = "hello123";
+mod common;
+use common::{
+    add_eap_message, build_eap_failure, build_eap_success, nanos_now, ATTR_EAP_MESSAGE,
+    ATTR_STATE, ATTR_USER_NAME, EAP_CODE_REQUEST, EAP_CODE_RESPONSE, EAP_TYPE_IDENTITY, IDENTITY,
+    PASSWORD, SHARED_SECRET,
+};
 
-// RADIUS attribute types we touch directly. Spelled out here so the
-// test does not depend on the `dict-rfc` codegen surface for these
-// well-known constants — it's a transport-level test, not a
-// dictionary test.
-const ATTR_USER_NAME: u8 = 1;
-const ATTR_STATE: u8 = 24;
-const ATTR_EAP_MESSAGE: u8 = 79;
-
-// EAP codes (RFC 3748 §4).
-const EAP_CODE_REQUEST: u8 = 1;
-const EAP_CODE_RESPONSE: u8 = 2;
-const EAP_CODE_SUCCESS: u8 = 3;
-// EAP types.
-const EAP_TYPE_IDENTITY: u8 = 1;
+// EAP type specific to MSCHAPv2 (draft-kamath-pppext-eap-mschapv2).
 const EAP_TYPE_MSCHAPV2: u8 = 26;
 
 // MSCHAPv2 opcodes (RFC 2759 §6 + draft-kamath-pppext-eap-mschapv2).
@@ -284,15 +274,6 @@ impl Handler for EapMschapV2Handler {
 
 // ── EAP / MSCHAPv2 codec helpers ─────────────────────────────────────────
 
-/// Nanoseconds since the Unix epoch, truncated to 64 bits. Used as a
-/// cheap nonce ingredient — we never depend on the high-order bits.
-fn nanos_now() -> u64 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0u128, |d| d.as_nanos());
-    u64::try_from(nanos & u128::from(u64::MAX)).unwrap_or(0)
-}
-
 struct EapPacket<'a> {
     code: u8,
     id: u8,
@@ -417,25 +398,6 @@ fn build_mschap_success_request(eap_id: u8, mschap_id: u8, auth_resp: &[u8; 42])
     out.extend_from_slice(&u16::try_from(ms_len).unwrap().to_be_bytes());
     out.extend_from_slice(auth_resp);
     out
-}
-
-fn build_eap_success(id: u8) -> Vec<u8> {
-    vec![EAP_CODE_SUCCESS, id, 0, 4]
-}
-
-fn build_eap_failure(id: u8) -> Vec<u8> {
-    // EAP code 4 = Failure (RFC 3748).
-    vec![4, id, 0, 4]
-}
-
-/// Append an EAP packet to a reply, fragmenting into ≤253-byte
-/// `EAP-Message` attributes per RFC 3579 §3.1.
-fn add_eap_message(reply: &mut radius_tokio::Reply, eap: &[u8]) {
-    for chunk in eap.chunks(253) {
-        reply
-            .add_attribute(ATTR_EAP_MESSAGE, chunk)
-            .expect("EAP-Message fragment fits");
-    }
 }
 
 // ── Test harness ─────────────────────────────────────────────────────────

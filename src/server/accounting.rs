@@ -116,7 +116,7 @@ impl AcctStatusType {
 }
 
 /// Acct-Status-Type attribute code (RFC 2866 §5.1).
-pub(crate) const ACCT_STATUS_TYPE_CODE: u8 = 40;
+pub(crate) use crate::codec::constants::ACCT_STATUS_TYPE as ACCT_STATUS_TYPE_CODE;
 
 #[cfg(test)]
 mod tests {

@@ -415,7 +415,7 @@ impl CoaOriginator {
                 count!("radius_tokio.coa_outcomes", "outcome" => "nak");
             }
             Err(_e) => {
-                warn_!(event = "coa_error", %target, code = code.0, id = identifier, error = %_e);
+                warn!(event = "coa_error", %target, code = code.0, id = identifier, error = %_e);
                 count!("radius_tokio.coa_outcomes", "outcome" => "error");
             }
         }
@@ -495,7 +495,7 @@ async fn send_and_await(
             }
         }
     }
-    warn_!(event = "coa_timeout", %target, attempts);
+    warn!(event = "coa_timeout", %target, attempts);
     Err(CoaError::Timeout)
 }
 

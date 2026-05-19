@@ -89,12 +89,12 @@ macro_rules! debug {
 /// operator probably wants to see (bad authenticator, malformed
 /// header from a known client, retransmit storm).
 #[cfg(feature = "tracing")]
-macro_rules! warn_ {
+macro_rules! warn {
     ($($tt:tt)*) => { ::tracing::event!(target: $crate::obs::TARGET, ::tracing::Level::WARN, $($tt)*) };
 }
 
 #[cfg(not(feature = "tracing"))]
-macro_rules! warn_ {
+macro_rules! warn {
     ($($tt:tt)*) => {
         ()
     };
@@ -213,4 +213,74 @@ macro_rules! observe {
     ($($tt:tt)*) => {
         ()
     };
+}
+
+/// Stable metric names emitted by the crate.
+///
+/// Every `count!` / `observe!` call site in the runtime uses one of
+/// these constants instead of a string literal, so a typo is caught
+/// at compile time and operators have a single place to consult when
+/// wiring up a dashboard. The string values are part of the
+/// observability contract — renaming any of them is a breaking change
+/// for downstream metric scrapes.
+///
+/// All names share the `radius_tokio.` prefix; tags / labels are
+/// applied per-call-site at the emit point.
+#[allow(dead_code)] // Some constants only used when specific features are enabled.
+pub(crate) mod metrics {
+    /// Counter: packets the receive pipeline discarded before
+    /// dispatch. Tag `reason` distinguishes `unknown_client`,
+    /// `malformed_header`, `bad_request_authenticator`,
+    /// `missing_message_authenticator`, `bad_message_authenticator`,
+    /// `handler_drop`, `dispatch_error`, `unsupported_code`.
+    pub(crate) const PACKETS_DROPPED: &str = "radius_tokio.packets_dropped";
+
+    /// Counter: requests handed to the consumer handler. Tag `code`
+    /// carries the decimal RADIUS code byte.
+    pub(crate) const REQUESTS_DISPATCHED: &str = "radius_tokio.requests_dispatched";
+
+    /// Counter: dedup-cache hits where a cached reply was
+    /// retransmitted in place of running the handler again.
+    pub(crate) const DEDUP_HITS: &str = "radius_tokio.dedup_hits";
+
+    /// Counter: replies successfully written to the wire. Tag `code`
+    /// carries the decimal RADIUS reply code byte.
+    pub(crate) const REPLIES_SENT: &str = "radius_tokio.replies_sent";
+
+    /// Counter: send-side I/O errors from the transport socket.
+    pub(crate) const SEND_ERRORS: &str = "radius_tokio.send_errors";
+
+    /// Counter: built-in Status-Server replies emitted (RFC 5997).
+    /// Tag `transport` is `udp` or `radsec`.
+    pub(crate) const STATUS_SERVER_REPLIES: &str = "radius_tokio.status_server_replies";
+
+    /// Counter: `RadSec` connections rejected by the pre-handshake
+    /// admission gate ([`ClientStore::admit_radsec`]).
+    ///
+    /// [`ClientStore::admit_radsec`]: crate::server::ClientStore::admit_radsec
+    pub(crate) const RADSEC_ADMIT_REJECTS: &str = "radius_tokio.radsec_admit_rejects";
+
+    /// Counter: `RadSec` mTLS handshakes that failed.
+    pub(crate) const RADSEC_HANDSHAKE_FAILURES: &str = "radius_tokio.radsec_handshake_failures";
+
+    /// Counter: post-handshake cert-to-client lookups that failed.
+    /// Tag `reason` is `missing` or `denied`.
+    pub(crate) const RADSEC_CERT_LOOKUP_FAILURES: &str =
+        "radius_tokio.radsec_cert_lookup_failures";
+
+    /// Counter: `RadSec` connections that completed the handshake
+    /// and entered the per-connection serve loop.
+    pub(crate) const RADSEC_CONNECTIONS: &str = "radius_tokio.radsec_connections";
+
+    /// Counter: peer-initiated TLS key updates handled mid-connection.
+    pub(crate) const RADSEC_KEY_UPDATES: &str = "radius_tokio.radsec_key_updates";
+
+    /// Counter: live `RadSec` connections torn down by
+    /// [`Server::close_connections_for`](crate::server::Server::close_connections_for).
+    pub(crate) const RADSEC_REVOCATIONS_APPLIED: &str =
+        "radius_tokio.radsec_revocations_applied";
+
+    /// Histogram: wall-clock seconds spent inside the consumer
+    /// handler, sampled per dispatched request.
+    pub(crate) const HANDLER_DURATION_SECONDS: &str = "radius_tokio.handler_duration_seconds";
 }

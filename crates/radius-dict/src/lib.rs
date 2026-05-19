@@ -27,6 +27,7 @@ pub mod typed;
 /// `radius-dict-codegen`. The generator emits Rust source referencing these
 /// by name; a mismatch is caught at compile time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Type {
     /// UTF-8 text without a trailing NUL (RFC 8044 §3.4).
     String,

@@ -27,7 +27,8 @@ use super::client::Client;
 #[derive(Debug)]
 pub enum HandlerResult {
     /// Send the supplied reply (after the server seals it with the
-    /// matching request's Authenticator and the client's secret).
+    /// matching request's Authenticator and the client's shared
+    /// secret).
     Reply(Reply),
     /// Intentional silent discard — no reply is generated. RFC 2865 §3
     /// permits this for any malformed or unauthorised request; the
@@ -43,18 +44,31 @@ pub enum HandlerResult {
 /// Handlers that intend to send a NAK should return
 /// `HandlerResult::Reply` with the appropriate code, not an error.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum HandlerError {
     /// The handler produced an attribute that exceeded the codec's
     /// limits. Forwarded from [`crate::codec::CodecError`].
     Codec(crate::codec::CodecError),
     /// The handler abandoned the request for an application-specific
     /// reason. The supplied message is for diagnostics only.
-    Application(&'static str),
+    Application(String),
 }
 
 impl From<crate::codec::CodecError> for HandlerError {
     fn from(err: crate::codec::CodecError) -> Self {
         HandlerError::Codec(err)
+    }
+}
+
+impl From<String> for HandlerError {
+    fn from(msg: String) -> Self {
+        HandlerError::Application(msg)
+    }
+}
+
+impl From<&str> for HandlerError {
+    fn from(msg: &str) -> Self {
+        HandlerError::Application(msg.to_owned())
     }
 }
 

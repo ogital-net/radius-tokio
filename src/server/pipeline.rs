@@ -54,7 +54,7 @@ use super::status::{self, ListenerRole, StatusServerPolicy, StatusTransport};
 pub(crate) enum Validated<'a> {
     /// Header parsed and every authenticator check passed.
     Ok { header: Header, attrs: &'a [u8] },
-    /// `Header::parse` rejected the datagram.
+    /// `Header::parse` rejected the packet.
     MalformedHeader(HeaderError),
     /// Code-appropriate Request Authenticator did not verify.
     BadRequestAuthenticator { code: Code, identifier: u8 },
@@ -65,15 +65,15 @@ pub(crate) enum Validated<'a> {
     BadMessageAuthenticator { code: Code, identifier: u8 },
 }
 
-/// Parse `datagram` and run every authenticator check that does not
+/// Parse `packet` and run every authenticator check that does not
 /// depend on the transport. Pure; safe to call on any thread.
-pub(crate) fn validate<'a>(datagram: &'a [u8], client: &Client) -> Validated<'a> {
-    let (header, attrs) = match Header::parse(datagram) {
+pub(crate) fn validate<'a>(packet: &'a [u8], client: &Client) -> Validated<'a> {
+    let (header, attrs) = match Header::parse(packet) {
         Ok(parsed) => parsed,
         Err(e) => return Validated::MalformedHeader(e),
     };
 
-    if !verify_request_authenticator(header.code, datagram, client.secret()) {
+    if !verify_request_authenticator(header.code, packet, client.secret()) {
         return Validated::BadRequestAuthenticator {
             code: header.code,
             identifier: header.identifier,
@@ -81,7 +81,7 @@ pub(crate) fn validate<'a>(datagram: &'a [u8], client: &Client) -> Validated<'a>
     }
 
     let substitute = ma_substitute(header.code, &header.authenticator);
-    match message_authenticator::verify(datagram, &substitute, client.secret()) {
+    match message_authenticator::verify(packet, &substitute, client.secret()) {
         Verification::Valid => {}
         Verification::Absent => {
             // RFC 5080 §2.2.2 / RFC 3579 §3.2: Access-Request packets
@@ -122,13 +122,13 @@ pub(crate) fn validate<'a>(datagram: &'a [u8], client: &Client) -> Validated<'a>
 /// for its code. Access-Request authenticators are random and cannot
 /// be checked on their own; for everything else we recompute
 /// `MD5(packet-with-zeros || secret)` and compare.
-pub(crate) fn verify_request_authenticator(code: Code, datagram: &[u8], secret: &[u8]) -> bool {
+pub(crate) fn verify_request_authenticator(code: Code, packet: &[u8], secret: &[u8]) -> bool {
     match code {
         // Accounting-Request (RFC 2866 §3), CoA-Request /
         // Disconnect-Request (RFC 5176): authenticator is
         // MD5(packet-with-zeros || secret) — verify in place.
         Code::ACCOUNTING_REQUEST | Code::COA_REQUEST | Code::DISCONNECT_REQUEST => {
-            authenticator::verify_zeroed_request(datagram, secret)
+            authenticator::verify_zeroed_request(packet, secret)
         }
         // Access-Request (RFC 2865 §3) carries a random authenticator;
         // its integrity is bound by the Message-Authenticator (when
@@ -231,7 +231,7 @@ impl Dispatched {
 ///
 /// Assumes the caller has already validated the packet via
 /// [`validate`]; in particular `header` and `attrs` must refer to
-/// the same datagram bytes.
+/// the same packet bytes.
 pub(crate) async fn dispatch_validated<H: Handler>(
     header: Header,
     attrs: &[u8],
@@ -305,7 +305,7 @@ pub(crate) async fn dispatch_validated<H: Handler>(
     let result = handler.handle(request).await;
     #[cfg(feature = "metrics")]
     observe!(
-        "radius_tokio.handler_duration_seconds",
+        crate::obs::metrics::HANDLER_DURATION_SECONDS,
         handler_t0.elapsed().as_secs_f64()
     );
 

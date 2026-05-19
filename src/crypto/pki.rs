@@ -126,6 +126,7 @@ use super::tls::{pop_err, EvpPkeyOwned, TlsError, X509Owned};
 
 /// Asymmetric key algorithm choice for [`PrivateKey::generate`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KeyAlgorithm {
     /// ECDSA over the P-256 curve. Default; small, fast, RFC 8422.
     #[default]

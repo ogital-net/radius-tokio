@@ -36,13 +36,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::codec::constants::REPLY_MESSAGE as REPLY_MESSAGE_TYPE;
 use crate::codec::encode::Reply;
 use crate::codec::header::Code;
 
 use super::client::Client;
-
-/// Attribute type code for `Reply-Message` (RFC 2865 §5.18).
-const REPLY_MESSAGE_TYPE: u8 = 18;
 
 /// Role the operator assigned to a listener.
 ///

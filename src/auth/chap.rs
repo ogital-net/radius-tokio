@@ -10,16 +10,11 @@
 //! unused by this helper.
 
 use crate::codec::attributes::AttributeError;
+use crate::codec::constants::{CHAP_CHALLENGE as CHAP_CHALLENGE_TYPE, CHAP_PASSWORD as CHAP_PASSWORD_TYPE};
 use crate::crypto::{ct_eq, md5};
 use crate::server::Request;
 
 use super::VerifyOutcome;
-
-/// RFC 2865 §5.3: CHAP-Password attribute type.
-const CHAP_PASSWORD_TYPE: u8 = 3;
-
-/// RFC 2865 §5.40: CHAP-Challenge attribute type.
-const CHAP_CHALLENGE_TYPE: u8 = 60;
 
 /// Wire length of `CHAP-Password`: 1 byte CHAP-ID + 16 byte response.
 const CHAP_PASSWORD_LEN: usize = 1 + 16;

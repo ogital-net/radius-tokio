@@ -45,10 +45,25 @@ impl Default for ClientId {
     }
 }
 
+impl fmt::Display for ClientId {
+    /// Renders the underlying counter as a plain decimal number.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.get())
+    }
+}
+
 /// Owned shared-secret bytes. The buffer is overwritten with
 /// `OPENSSL_cleanse` on drop.
 ///
 /// Display / Debug deliberately do not reveal contents.
+///
+/// # Clone
+///
+/// Deliberately not `Clone`: duplicating the secret would defeat the
+/// `OPENSSL_cleanse`-on-drop guarantee — the original allocation
+/// could be freed while a copy keeps the bytes resident. Callers that
+/// need to share a secret across tasks hold the owning
+/// [`Client`] inside an [`Arc`](std::sync::Arc).
 pub struct SecretBytes(Box<[u8]>);
 
 impl SecretBytes {

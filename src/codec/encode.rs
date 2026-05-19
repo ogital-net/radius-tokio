@@ -24,12 +24,10 @@
 //! the attribute can call [`Reply::without_message_authenticator`] —
 //! that opt-out is intentionally verbose.
 
+use super::constants::TUNNEL_PASSWORD as TUNNEL_PASSWORD_TYPE;
 use super::header::Code;
 use super::typed::{Attr, IntoWire, VsaAttr, WireType};
 use super::{authenticator, message_authenticator, CodecError, PacketBuffer, TlvWriter};
-
-/// Attribute type code for `Tunnel-Password` (RFC 2868 §3.5).
-const TUNNEL_PASSWORD_TYPE: u8 = 69;
 
 /// Maximum plaintext length for a `Tunnel-Password` attribute (RFC 2868 §3.5).
 ///
