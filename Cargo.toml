@@ -113,7 +113,7 @@ socket2 = { version = "0.6.3", features = ["all"] }
 libc = "0.2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "signal", "time", "macros", "test-util"] }
 # Benchmarks. Pulled in only for `cargo bench`; dependency-light and
 # offline (no html_reports → drops the `plotters`/`tinytemplate` tree).
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
@@ -145,6 +145,9 @@ name = "threadlocal_responder"
 
 [[example]]
 name = "coa_originator"
+
+[[example]]
+name = "graceful_shutdown"
 
 [[example]]
 name = "mixed_udp_radsec"
