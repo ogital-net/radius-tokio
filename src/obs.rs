@@ -265,8 +265,7 @@ pub(crate) mod metrics {
 
     /// Counter: post-handshake cert-to-client lookups that failed.
     /// Tag `reason` is `missing` or `denied`.
-    pub(crate) const RADSEC_CERT_LOOKUP_FAILURES: &str =
-        "radius_tokio.radsec_cert_lookup_failures";
+    pub(crate) const RADSEC_CERT_LOOKUP_FAILURES: &str = "radius_tokio.radsec_cert_lookup_failures";
 
     /// Counter: `RadSec` connections that completed the handshake
     /// and entered the per-connection serve loop.
@@ -277,8 +276,7 @@ pub(crate) mod metrics {
 
     /// Counter: live `RadSec` connections torn down by
     /// [`Server::close_connections_for`](crate::server::Server::close_connections_for).
-    pub(crate) const RADSEC_REVOCATIONS_APPLIED: &str =
-        "radius_tokio.radsec_revocations_applied";
+    pub(crate) const RADSEC_REVOCATIONS_APPLIED: &str = "radius_tokio.radsec_revocations_applied";
 
     /// Histogram: wall-clock seconds spent inside the consumer
     /// handler, sampled per dispatched request.

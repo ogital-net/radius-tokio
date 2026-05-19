@@ -293,7 +293,7 @@ when the features are disabled.
 
 ## MSRV
 
-**Rust 1.79** (required for return-position `impl Trait` in traits;
+**Rust 1.83** (required for return-position `impl Trait` in traits;
 used pervasively for `async fn` in traits without `async-trait`).
 Pinned via `rust-version` in each `Cargo.toml`.
 
@@ -301,7 +301,7 @@ Pinned via `rust-version` in each `Cargo.toml`.
 
 CI builds and tests every push on:
 
-| Host                        | Stable | MSRV (1.79) |
+| Host                        | Stable | MSRV (1.83) |
 | --------------------------- | :----: | :---------: |
 | Linux x86_64 (glibc)        |   ✓    |      ✓      |
 | macOS aarch64 (Apple Si.)   |   ✓    |      ✓      |

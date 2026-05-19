@@ -10,7 +10,9 @@
 //! unused by this helper.
 
 use crate::codec::attributes::AttributeError;
-use crate::codec::constants::{CHAP_CHALLENGE as CHAP_CHALLENGE_TYPE, CHAP_PASSWORD as CHAP_PASSWORD_TYPE};
+use crate::codec::constants::{
+    CHAP_CHALLENGE as CHAP_CHALLENGE_TYPE, CHAP_PASSWORD as CHAP_PASSWORD_TYPE,
+};
 use crate::crypto::{ct_eq, md5};
 use crate::server::Request;
 

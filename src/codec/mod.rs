@@ -854,7 +854,7 @@ mod tests {
         let before = pkt.as_bytes().len();
         let err = pkt
             .add_attribute_with(7, |out| {
-                out.extend(std::iter::repeat(0xAA).take(MAX_ATTRIBUTE_VALUE_LEN + 1));
+                out.extend(std::iter::repeat_n(0xAA, MAX_ATTRIBUTE_VALUE_LEN + 1));
             })
             .unwrap_err();
         assert!(matches!(

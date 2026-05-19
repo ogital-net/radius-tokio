@@ -39,9 +39,9 @@ use radius_tokio::Code;
 
 mod common;
 use common::{
-    add_eap_message, build_eap_failure, build_eap_success, nanos_now, ATTR_EAP_MESSAGE,
-    ATTR_STATE, ATTR_USER_NAME, EAP_CODE_REQUEST, EAP_CODE_RESPONSE, EAP_TYPE_IDENTITY, IDENTITY,
-    PASSWORD, SHARED_SECRET,
+    add_eap_message, build_eap_failure, build_eap_success, nanos_now, ATTR_EAP_MESSAGE, ATTR_STATE,
+    ATTR_USER_NAME, EAP_CODE_REQUEST, EAP_CODE_RESPONSE, EAP_TYPE_IDENTITY, IDENTITY, PASSWORD,
+    SHARED_SECRET,
 };
 
 // EAP type specific to MSCHAPv2 (draft-kamath-pppext-eap-mschapv2).

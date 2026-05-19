@@ -29,9 +29,6 @@ use super::generated::{AttributeEntry, ValueEntry, VendorEntry};
 /// RFC entries come first so they shadow vendor tables for any code
 /// reuse (none today, but the order matters for symmetry with the
 /// `VENDORS` and `VALUES` aggregates below).
-// `static` rather than `const` so we can reference the codegen'd `static`
-// tables in `super::generated::*`. `const_refs_to_static` only stabilised
-// in Rust 1.83; our MSRV is 1.79.
 static ATTRIBUTE_TABLES: &[&[AttributeEntry]] = &[
     #[cfg(feature = "dict-rfc")]
     super::generated::rfc::ATTRIBUTES,

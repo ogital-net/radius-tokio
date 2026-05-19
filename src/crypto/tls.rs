@@ -294,7 +294,7 @@ impl X509Owned {
         let mut p = buf.as_mut_ptr();
         // SAFETY: buf is at least `len` bytes; i2d_X509 writes
         // exactly `len` bytes and advances the pointer.
-        let written = unsafe { aws_lc_sys::i2d_X509(self.0.as_ptr(), &mut p) };
+        let written = unsafe { aws_lc_sys::i2d_X509(self.0.as_ptr(), &raw mut p) };
         if written != len {
             return Err(TlsError::Ssl(pop_err("i2d_X509 write")));
         }
@@ -363,7 +363,7 @@ impl X509Owned {
         let mut p = der.as_mut_ptr();
         // SAFETY: der has `len` bytes of capacity; i2d_X509_PUBKEY
         // writes exactly `len` bytes and advances the pointer.
-        let written = unsafe { aws_lc_sys::i2d_X509_PUBKEY(pubkey, &mut p) };
+        let written = unsafe { aws_lc_sys::i2d_X509_PUBKEY(pubkey, &raw mut p) };
         if written != len {
             return Err(TlsError::Ssl(pop_err("i2d_X509_PUBKEY write")));
         }
@@ -571,10 +571,10 @@ fn i2d_asn1_type(value: *const ASN1_TYPE) -> Option<Vec<u8>> {
     let len_usize = usize::try_from(len).ok()?;
     let mut out = vec![0u8; len_usize];
     let mut p = out.as_mut_ptr();
-    // SAFETY: `&mut p` points to a writable `*mut u8`; aws-lc
+    // SAFETY: `&raw mut p` points to a writable `*mut u8`; aws-lc
     // advances the pointer by `len` bytes which we sized exactly
     // from the previous call.
-    let written = unsafe { i2d_ASN1_TYPE(value, &mut p) };
+    let written = unsafe { i2d_ASN1_TYPE(value, &raw mut p) };
     if written != len {
         return None;
     }
@@ -1620,7 +1620,7 @@ impl TlsConnection {
         // out-pointers are stack slots we own. BIO_mem_contents
         // returns 1 on success and populates them with the BIO's
         // internal buffer pointer + length without consuming.
-        let r = unsafe { BIO_mem_contents(self.wbio.as_ptr(), &mut ptr, &mut len) };
+        let r = unsafe { BIO_mem_contents(self.wbio.as_ptr(), &raw mut ptr, &raw mut len) };
         if r != 1 || ptr.is_null() || len == 0 {
             return &[];
         }

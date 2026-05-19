@@ -47,7 +47,7 @@ impl Sha1 {
         // valid slice for the duration of this call.
         let ret = unsafe {
             SHA1_Update(
-                &mut self.ctx,
+                &raw mut self.ctx,
                 data.as_ptr().cast::<std::os::raw::c_void>(),
                 data.len(),
             )
@@ -60,7 +60,7 @@ impl Sha1 {
         let mut out = [0u8; DIGEST_LENGTH];
         // SAFETY: out is exactly DIGEST_LENGTH bytes. ctx is
         // initialized and not previously finalized.
-        let ret = unsafe { SHA1_Final(out.as_mut_ptr(), &mut self.ctx) };
+        let ret = unsafe { SHA1_Final(out.as_mut_ptr(), &raw mut self.ctx) };
         assert_eq!(ret, 1, "SHA1_Final failed");
         out
     }

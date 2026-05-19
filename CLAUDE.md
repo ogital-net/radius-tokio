@@ -424,7 +424,7 @@ These are aspirational and will be revisited once we have benchmarks.
   in the public API.
 - Async: native `async fn` / `-> impl Future` in traits. **No
   `async-trait`.**
-- **MSRV: 1.79+** (required for return-position `impl Trait` in traits).
+- **MSRV: 1.83+** (required for return-position `impl Trait` in traits).
   Pinned via `rust-version` in each `Cargo.toml`.
 
 ## API stability
@@ -443,7 +443,7 @@ Order within a phase is a suggestion, not a contract; expect iteration.
 
 ### Phase 0 — Project scaffolding
 
-- [x] `rust-version = "1.79"` pinned in every `Cargo.toml` (workspace root + member crates).
+- [x] `rust-version = "1.83"` pinned in every `Cargo.toml` (workspace root + member crates).
 - [x] `Cargo.toml` lints table: `unsafe_op_in_unsafe_fn = "deny"`,
       `missing_docs = "warn"` on `lib.rs`, `clippy::pedantic = "warn"`.
 - [x] `deny.toml` (cargo-deny) for license / advisory gating.

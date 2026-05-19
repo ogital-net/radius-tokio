@@ -5,7 +5,7 @@ The single source of truth for project vision, scope, and architecture is
 
 ## Development prerequisites
 
-- Rust **1.79** or later (pinned via `rust-version` in each `Cargo.toml`).
+- Rust **1.83** or later (pinned via `rust-version` in each `Cargo.toml`).
 - Native build deps for `aws-lc-sys` when the `radsec` feature is on:
   - **Linux:** `cmake`, `clang`, `libclang-dev`
   - **macOS:** `cmake` (via Homebrew)
@@ -162,7 +162,7 @@ GitHub Actions runs on every push and pull request
 | `fmt`            | stable             | `cargo fmt --check`                         |
 | `clippy`         | stable             | `--workspace --all-features --all-targets`  |
 | `docs`           | stable             | rustdoc with `-D warnings`                  |
-| `test`           | stable + 1.79 MSRV | Linux x86_64, macOS aarch64, Windows MSVC   |
+| `test`           | stable + 1.83 MSRV | Linux x86_64, macOS aarch64, Windows MSVC   |
 | `asan`           | nightly            | AddressSanitizer over `src/crypto/`         |
 | `cargo-deny`     | stable             | licenses, advisories, bans, sources         |
 | `publish_dryrun` | stable             | `cargo publish --dry-run` for codegen crate |

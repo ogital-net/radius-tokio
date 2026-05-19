@@ -304,7 +304,7 @@ impl PrivateKey {
 
         let mut pkey_raw: *mut aws_lc_sys::EVP_PKEY = std::ptr::null_mut();
         // SAFETY: ctx valid; out-param is a stack slot we own.
-        if unsafe { EVP_PKEY_keygen(ctx.0.as_ptr(), &mut pkey_raw) } != 1 {
+        if unsafe { EVP_PKEY_keygen(ctx.0.as_ptr(), &raw mut pkey_raw) } != 1 {
             return Err(TlsError::Ssl(pop_err("EVP_PKEY_keygen")));
         }
         let pkey = EvpPkeyOwned(

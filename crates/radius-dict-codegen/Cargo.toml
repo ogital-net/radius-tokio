@@ -2,7 +2,7 @@
 name = "radius-dict-codegen"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.79"
+rust-version = "1.83"
 description = "FreeRADIUS dictionary parser and Rust code generator (build-time only)"
 license = "BSD-2-Clause"
 repository = "https://github.com/example/radius-tokio"

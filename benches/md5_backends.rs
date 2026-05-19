@@ -67,7 +67,7 @@ fn bench_awslc(c: &mut Criterion) {
                 for i in 0..n {
                     // SAFETY: `p.add(i*64)` points to a 64-byte
                     // block inside `buf`; `ctx` is initialized.
-                    unsafe { aws_lc_sys::MD5_Transform(&mut ctx, p.add(i * 64)) };
+                    unsafe { aws_lc_sys::MD5_Transform(&raw mut ctx, p.add(i * 64)) };
                 }
                 black_box(&ctx);
             });

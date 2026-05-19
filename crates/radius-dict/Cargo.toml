@@ -2,7 +2,7 @@
 name = "radius-dict"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.79"
+rust-version = "1.83"
 description = "Typed FreeRADIUS dictionary tables for RADIUS attribute encoding/decoding"
 license = "BSD-2-Clause"
 repository = "https://github.com/example/radius-tokio"

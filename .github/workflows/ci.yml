@@ -68,7 +68,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        toolchain: [stable, "1.79"]
+        toolchain: [stable, "1.83"]
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
@@ -106,7 +106,7 @@ jobs:
       # semver-compatible deps and trips edition2024 manifests (e.g.
       # `clap_builder 4.6.0`) before any of our `--locked` steps run. Keeping
       # stable as the default sidesteps that; the MSRV build commands below
-      # invoke `cargo +1.79.0` explicitly.
+      # invoke `cargo +1.83.0` explicitly.
       - name: Install stable toolchain (default)
         uses: dtolnay/rust-toolchain@stable
 
