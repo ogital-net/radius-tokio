@@ -127,6 +127,20 @@ impl<'a> RawAttribute<'a> {
         }
     }
 
+    /// Presence-only check against a typed handle.
+    ///
+    /// Returns `true` iff the attribute type byte equals `attr.code`.
+    /// Does *not* attempt to decode the value, so a malformed payload
+    /// still counts as present — the right semantics for top-level
+    /// dispatch (`if req contains EAP-Message do EAP else …`) where
+    /// the handler's job is *to* parse the value.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn matches<T: WireType>(&self, attr: Attr<T>) -> bool {
+        self.attribute_type() == attr.code
+    }
+
     /// Match this attribute against a Vendor-Specific handle and decode
     /// the per-vendor value.
     ///
@@ -157,6 +171,38 @@ impl<'a> RawAttribute<'a> {
         let data_len = (v_len as usize).checked_sub(2)?;
         let data = data.get(..data_len)?;
         T::decode(data)
+    }
+
+    /// Presence-only check against a Vendor-Specific handle.
+    ///
+    /// Returns `true` iff this attribute is type 26, carries the
+    /// requested PEN + vendor-type, and has a structurally valid VSA
+    /// envelope (vendor-length fits within the outer value). The
+    /// payload bytes are *not* run through `T::decode`.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn matches_vsa<T: WireType>(&self, attr: VsaAttr<T>) -> bool {
+        if self.attribute_type() != 26 {
+            return false;
+        }
+        let val = self.value();
+        let Some((pen_bytes, rest)) = val.split_first_chunk::<4>() else {
+            return false;
+        };
+        if u32::from_be_bytes(*pen_bytes) != attr.vendor {
+            return false;
+        }
+        let Some((&[v_type, v_len], data)) = rest.split_first_chunk::<2>() else {
+            return false;
+        };
+        if v_type != attr.vendor_type {
+            return false;
+        }
+        let Some(data_len) = (v_len as usize).checked_sub(2) else {
+            return false;
+        };
+        data.len() >= data_len
     }
 
     /// Walk this attribute's value bytes as a sequence of TLV
@@ -225,6 +271,28 @@ impl<'a> RawAttribute<'a> {
         None
     }
 
+    /// Presence-only check against a TLV child handle.
+    ///
+    /// Returns `true` iff the outer attribute matches `attr.parent`
+    /// and its TLV children contain a well-formed slot whose
+    /// sub-type equals `attr.child`. The child's value bytes are
+    /// *not* decoded under `T`.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn matches_tlv<T: WireType>(&self, attr: TlvAttr<T>) -> bool {
+        if self.attribute_type() != attr.parent {
+            return false;
+        }
+        for slot in self.tlv_children() {
+            let Ok(child) = slot else { return false };
+            if child.attribute_type() == attr.child {
+                return true;
+            }
+        }
+        false
+    }
+
     /// VSA equivalent of [`get_tlv`](Self::get_tlv): match a
     /// vendor-specific TLV child handle.
     ///
@@ -244,6 +312,29 @@ impl<'a> RawAttribute<'a> {
             }
         }
         None
+    }
+
+    /// Presence-only check against a vendor-specific TLV child handle.
+    ///
+    /// Returns `true` iff this attribute carries a structurally valid
+    /// VSA envelope for `attr.vendor` / `attr.parent` and the inner
+    /// TLV region contains a well-formed slot whose sub-type equals
+    /// `attr.child`. The child's value bytes are *not* decoded
+    /// under `T`.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn matches_vsa_tlv<T: WireType>(&self, attr: VsaTlvAttr<T>) -> bool {
+        let Some(inner) = self.vsa_tlv_children(attr.vendor, attr.parent) else {
+            return false;
+        };
+        for slot in inner {
+            let Ok(child) = slot else { return false };
+            if child.attribute_type() == attr.child {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -371,6 +462,92 @@ pub fn first_vsa_tlv<T: WireType>(attrs: &[u8], attr: VsaTlvAttr<T>) -> Option<T
     }
     None
 }
+
+/// Presence-only walk: `true` iff some well-formed slot in `attrs`
+/// matches `attr` under [`RawAttribute::matches`].
+///
+/// The value bytes are *not* decoded — the right primitive for
+/// dispatch (e.g. "does this packet carry an `EAP-Message`?"). Walks
+/// stop at the first match *or* the first malformed slot, whichever
+/// comes first; a parse error before a hit yields `false`.
+#[inline]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+pub fn contains<T: WireType>(attrs: &[u8], attr: Attr<T>) -> bool {
+    for slot in iter(attrs) {
+        let Ok(raw) = slot else { return false };
+        if raw.matches(attr) {
+            return true;
+        }
+    }
+    false
+}
+
+/// VSA equivalent of [`contains`].
+#[inline]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+pub fn contains_vsa<T: WireType>(attrs: &[u8], attr: VsaAttr<T>) -> bool {
+    for slot in iter(attrs) {
+        let Ok(raw) = slot else { return false };
+        if raw.matches_vsa(attr) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Presence-only walk for a TLV child handle. Mirrors [`first_tlv`]
+/// but skips the inner `T::decode`.
+#[inline]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+pub fn contains_tlv<T: WireType>(attrs: &[u8], attr: TlvAttr<T>) -> bool {
+    for slot in iter(attrs) {
+        let Ok(raw) = slot else { return false };
+        if raw.matches_tlv(attr) {
+            return true;
+        }
+    }
+    false
+}
+
+/// VSA equivalent of [`contains_tlv`].
+#[inline]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+pub fn contains_vsa_tlv<T: WireType>(attrs: &[u8], attr: VsaTlvAttr<T>) -> bool {
+    for slot in iter(attrs) {
+        let Ok(raw) = slot else { return false };
+        if raw.matches_vsa_tlv(attr) {
+            return true;
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------
+// Multi-attribute routing
+// ---------------------------------------------------------------------
+//
+// The library deliberately does *not* ship a bitmap / set type for
+// "which attributes are present in this packet". A 256-bit map only
+// covers RFC top-level codes — VSAs all collapse onto bit 26, TLV
+// children aren't visible — so any consumer wanting to route on a
+// vendor attribute would have to mix in a second walk anyway. Two
+// ways to ask the same question, two performance profiles, two code
+// paths under test.
+//
+// The opinionated idiom is therefore: when you need to inspect
+// several attributes in one pass (a root dispatcher, for example),
+// walk the attribute region once with [`iter`] / `Request::attributes_iter`
+// and fold the predicates inline. See `Request::attributes_iter` for
+// the worked example.
+//
+// For a one-off presence check, [`contains`] / [`contains_vsa`] /
+// [`contains_tlv`] (and the matching `Request::contains*` methods)
+// are the right shortcut — they short-circuit and only walk as far
+// as the first match.
 
 #[cfg(test)]
 mod tests {
@@ -671,5 +848,103 @@ mod tests {
         let bytes = region(&[(26, &value)]);
         let parent = iter(&bytes).next().unwrap().unwrap();
         assert!(parent.vsa_tlv_children(25053, 146).is_none());
+    }
+
+    #[test]
+    fn contains_top_level() {
+        use super::super::typed::{Attr, WInteger, WText};
+        let bytes = region(&[(1, b"bob"), (5, &[0, 0, 0, 42])]);
+        assert!(contains(&bytes, Attr::<WText>::new(1)));
+        assert!(contains(&bytes, Attr::<WInteger>::new(5)));
+        // Absent code.
+        assert!(!contains(&bytes, Attr::<WText>::new(2)));
+    }
+
+    #[test]
+    fn contains_ignores_decode_failure() {
+        use super::super::typed::{Attr, WInteger};
+        // Attribute type 5 with a 1-byte value — would fail `WInteger`
+        // decode (expects 4 bytes), but presence is still reported.
+        let bytes = region(&[(5, &[0xff])]);
+        assert!(contains(&bytes, Attr::<WInteger>::new(5)));
+        // And first() — which *does* decode — returns None on the
+        // same input, confirming the two helpers split cleanly.
+        assert_eq!(first(&bytes, Attr::<WInteger>::new(5)), None);
+    }
+
+    #[test]
+    fn contains_returns_false_on_parse_error_before_match() {
+        use super::super::typed::{Attr, WText};
+        // Underflow on the very first slot; the User-Name we'd
+        // otherwise find never becomes visible.
+        let mut bytes = vec![1u8, 1u8]; // length byte < 2
+        bytes.extend(region(&[(1, b"alice")]));
+        assert!(!contains(&bytes, Attr::<WText>::new(1)));
+    }
+
+    #[test]
+    fn contains_vsa_matches_envelope_without_decoding() {
+        use super::super::typed::{VsaAttr, WInteger};
+        // Cisco (PEN 9), vendor-type 1, value = b"abc" (3 bytes).
+        // `WInteger` would reject this, but `contains_vsa` only
+        // validates the envelope.
+        let mut value = Vec::new();
+        value.extend_from_slice(&9u32.to_be_bytes());
+        value.push(1);
+        value.push(5); // vendor-len = 2 + 3
+        value.extend_from_slice(b"abc");
+        let bytes = region(&[(26, &value)]);
+        assert!(contains_vsa(&bytes, VsaAttr::<WInteger>::new(9, 1)));
+        // Wrong vendor / vendor-type.
+        assert!(!contains_vsa(&bytes, VsaAttr::<WInteger>::new(9, 2)));
+        assert!(!contains_vsa(&bytes, VsaAttr::<WInteger>::new(14823, 1)));
+    }
+
+    #[test]
+    fn contains_tlv_and_vsa_tlv() {
+        use super::super::typed::{TlvAttr, VsaTlvAttr, WByte, WText};
+        // RFC TLV: 173.1 = [7]
+        let kids = tlv_region(&[(1, &[7])]);
+        let rfc = region(&[(173, &kids)]);
+        assert!(contains_tlv(&rfc, TlvAttr::<WByte>::new(173, 1)));
+        assert!(!contains_tlv(&rfc, TlvAttr::<WByte>::new(173, 9)));
+        assert!(!contains_tlv(&rfc, TlvAttr::<WByte>::new(174, 1)));
+
+        // VSA TLV: Ruckus / 146.1 = "hi"
+        let inner = tlv_region(&[(1, b"hi")]);
+        let mut value = Vec::new();
+        value.extend_from_slice(&25053u32.to_be_bytes());
+        value.push(146);
+        value.push(u8::try_from(2 + inner.len()).unwrap());
+        value.extend_from_slice(&inner);
+        let vsa = region(&[(26, &value)]);
+        assert!(contains_vsa_tlv(
+            &vsa,
+            VsaTlvAttr::<WText>::new(25053, 146, 1),
+        ));
+        assert!(!contains_vsa_tlv(
+            &vsa,
+            VsaTlvAttr::<WText>::new(25053, 146, 9),
+        ));
+        assert!(!contains_vsa_tlv(&vsa, VsaTlvAttr::<WText>::new(9, 146, 1),));
+    }
+
+    #[test]
+    fn matches_helpers_on_raw_attribute() {
+        use super::super::typed::{Attr, VsaAttr, WInteger, WText};
+        let mut vsa_value = Vec::new();
+        vsa_value.extend_from_slice(&9u32.to_be_bytes());
+        vsa_value.push(1);
+        vsa_value.push(7);
+        vsa_value.extend_from_slice(b"hello");
+        let bytes = region(&[(1, b"bob"), (26, &vsa_value)]);
+        let mut it = iter(&bytes);
+        let user = it.next().unwrap().unwrap();
+        assert!(user.matches(Attr::<WText>::new(1)));
+        assert!(!user.matches(Attr::<WInteger>::new(2)));
+        let vsa = it.next().unwrap().unwrap();
+        assert!(vsa.matches_vsa(VsaAttr::<WText>::new(9, 1)));
+        assert!(!vsa.matches_vsa(VsaAttr::<WText>::new(9, 2)));
+        assert!(!vsa.matches_vsa(VsaAttr::<WText>::new(14823, 1)));
     }
 }

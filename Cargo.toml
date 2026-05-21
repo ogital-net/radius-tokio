@@ -150,6 +150,9 @@ name = "coa_originator"
 name = "graceful_shutdown"
 
 [[example]]
+name = "routing_dispatcher"
+
+[[example]]
 name = "mixed_udp_radsec"
 required-features = ["radsec"]
 

@@ -20,6 +20,7 @@ use std::sync::Arc;
 use crate::codec::attributes::{self, AttributeError, AttributesIter, RawAttribute};
 use crate::codec::encode::Reply;
 use crate::codec::header::Code;
+use crate::codec::typed::{Attr, TlvAttr, VsaAttr, VsaTlvAttr, WireType};
 
 use super::client::Client;
 
@@ -161,6 +162,42 @@ impl<'a> Request<'a> {
     }
 
     /// Iterate the raw attribute region.
+    ///
+    /// This is the recommended primitive for **multi-attribute
+    /// routing**. When a root handler needs to dispatch on the
+    /// combined presence of several attributes (RFC and/or
+    /// vendor-specific), walk the region once and fold the
+    /// predicates inline — one pass, zero allocation, no extra API
+    /// surface:
+    ///
+    /// ```ignore
+    /// use radius_tokio::dict::generated::rfc::attrs;
+    /// use radius_tokio::dict::generated::cisco::vsas;
+    ///
+    /// let (mut has_eap, mut has_pap, mut has_chap, mut has_cisco_av) =
+    ///     (false, false, false, false);
+    ///
+    /// for slot in req.attributes_iter() {
+    ///     let Ok(raw) = slot else { break }; // stop at first parse error
+    ///     has_eap      |= raw.matches(attrs::EAP_MESSAGE);
+    ///     has_pap      |= raw.matches(attrs::USER_PASSWORD);
+    ///     has_chap     |= raw.matches(attrs::CHAP_PASSWORD);
+    ///     has_cisco_av |= raw.matches_vsa(vsas::CISCO_AV_PAIR);
+    /// }
+    ///
+    /// match (has_eap, has_pap, has_chap, has_cisco_av) {
+    ///     (true, _, _, _) => handle_eap(req).await,
+    ///     (_, true, _, _) => handle_pap(req).await,
+    ///     (_, _, true, _) => handle_chap(req).await,
+    ///     (_, _, _, true) => handle_cisco(req).await,
+    ///     _               => handle_default(req).await,
+    /// }
+    /// ```
+    ///
+    /// For a *single*-attribute presence check, prefer
+    /// [`Self::contains`] / [`Self::contains_vsa`] /
+    /// [`Self::contains_tlv`] — they short-circuit on the first
+    /// match.
     #[must_use]
     pub fn attributes_iter(&self) -> AttributesIter<'a> {
         attributes::iter(self.attributes)
@@ -182,6 +219,79 @@ impl<'a> Request<'a> {
             }
         }
         Ok(None)
+    }
+
+    /// Presence-only check for a typed attribute handle.
+    ///
+    /// Returns `true` iff the request carries a well-formed
+    /// attribute slot matching `attr`. The payload is *not* decoded
+    /// under `T`, which is exactly what a top-level dispatch needs:
+    /// ```ignore
+    /// use radius_tokio::dict::generated::rfc::attrs;
+    ///
+    /// if req.contains(attrs::EAP_MESSAGE) {
+    ///     handle_eap(req).await
+    /// } else if req.contains(attrs::USER_PASSWORD) {
+    ///     handle_pap(req).await
+    /// } else if req.contains(attrs::CHAP_PASSWORD) {
+    ///     handle_chap(req).await
+    /// } else {
+    ///     // …
+    /// }
+    /// ```
+    ///
+    /// A malformed attribute encountered before a match yields
+    /// `false` — consistent with [`Self::first_raw`]'s find-or-fail
+    /// behaviour but collapsed to a single boolean for dispatch use.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn contains<T: WireType>(&self, attr: Attr<T>) -> bool {
+        attributes::contains(self.attributes, attr)
+    }
+
+    /// Presence-only check for a Vendor-Specific attribute handle.
+    /// See [`Self::contains`] for the dispatch idiom.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn contains_vsa<T: WireType>(&self, attr: VsaAttr<T>) -> bool {
+        attributes::contains_vsa(self.attributes, attr)
+    }
+
+    /// Presence-only check for a TLV child handle.
+    /// See [`Self::contains`] for the dispatch idiom.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn contains_tlv<T: WireType>(&self, attr: TlvAttr<T>) -> bool {
+        attributes::contains_tlv(self.attributes, attr)
+    }
+
+    /// Presence-only check for a vendor-specific TLV child handle.
+    /// See [`Self::contains`] for the dispatch idiom.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn contains_vsa_tlv<T: WireType>(&self, attr: VsaTlvAttr<T>) -> bool {
+        attributes::contains_vsa_tlv(self.attributes, attr)
+    }
+
+    /// Presence-only check for a raw attribute type byte.
+    ///
+    /// Cheaper than [`Self::first_raw`] for callers that only need
+    /// "is it there?": no `Result` to unwrap, no `RawAttribute`
+    /// returned. Equivalent to `self.first_raw(typ).ok().flatten().is_some()`.
+    #[inline]
+    #[must_use]
+    pub fn contains_raw(&self, typ: u8) -> bool {
+        for slot in self.attributes_iter() {
+            let Ok(raw) = slot else { return false };
+            if raw.attribute_type() == typ {
+                return true;
+            }
+        }
+        false
     }
 
     /// Decode the `Acct-Status-Type` attribute (RFC 2866 §5.1) if
