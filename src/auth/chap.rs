@@ -91,6 +91,7 @@ mod tests {
             attrs,
             client,
             "127.0.0.1:1812".parse().unwrap(),
+            "127.0.0.1:1812".parse().unwrap(),
         )
     }
 

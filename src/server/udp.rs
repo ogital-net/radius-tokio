@@ -93,6 +93,11 @@ where
     H: Handler,
 {
     let socket = Arc::new(socket);
+    // Captured once: the bound address never changes after
+    // `bind()`, so exposing it through `Request::dst()` is just a
+    // copy. For wildcard binds this is `0.0.0.0:port` /
+    // `[::]:port` — see `Request::dst` for the caveat.
+    let local_addr = socket.local_addr()?;
     let mut buf = vec![0u8; MAX_PACKET_LEN];
     loop {
         tokio::select! {
@@ -133,6 +138,7 @@ where
                         &socket,
                         datagram,
                         src,
+                        local_addr,
                         client,
                         &handler,
                         &cache,
@@ -160,6 +166,7 @@ async fn process_packet<H>(
     socket: &Arc<UdpSocket>,
     datagram: Vec<u8>,
     src: SocketAddr,
+    dst: SocketAddr,
     client: Arc<super::client::Client>,
     handler: &Arc<H>,
     cache: &Arc<DedupCache>,
@@ -253,6 +260,7 @@ async fn process_packet<H>(
         header,
         attrs,
         src,
+        dst,
         &client,
         handler.as_ref(),
         cache,

@@ -232,10 +232,12 @@ impl Dispatched {
 /// Assumes the caller has already validated the packet via
 /// [`validate`]; in particular `header` and `attrs` must refer to
 /// the same packet bytes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_validated<H: Handler>(
     header: Header,
     attrs: &[u8],
     peer: SocketAddr,
+    local: SocketAddr,
     client: &Arc<Client>,
     handler: &H,
     cache: &DedupCache,
@@ -298,6 +300,7 @@ pub(crate) async fn dispatch_validated<H: Handler>(
         attrs,
         client,
         peer,
+        local,
     );
 
     #[cfg(feature = "metrics")]

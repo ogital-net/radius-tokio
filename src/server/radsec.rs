@@ -360,6 +360,15 @@ where
 {
     // Step 2: server-side mTLS handshake against the listener-wide
     // trust store from `TlsContext::server`.
+    // Capture the local address before the TLS wrapper takes
+    // ownership of the `TcpStream`. Falls back to the unspecified
+    // address if the kernel can't tell us (shouldn't happen on a
+    // freshly-accepted connection, but a fallback keeps the
+    // pipeline infallible).
+    let local = stream.local_addr().unwrap_or_else(|_| match peer {
+        SocketAddr::V4(_) => SocketAddr::from(([0u8; 4], 0)),
+        SocketAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
+    });
     let tls = TlsConnection::accept(&tls_ctx).map_err(tls_to_io)?;
     let mut conn = AsyncTls::new(stream, tls);
     if let Err(_e) = conn.handshake().await {
@@ -409,6 +418,7 @@ where
     let loop_result = run_frame_loop(
         &mut conn,
         peer,
+        local,
         &client,
         handler.as_ref(),
         cache.as_ref(),
@@ -436,6 +446,7 @@ where
 async fn run_frame_loop<H: Handler>(
     conn: &mut AsyncTls,
     peer: SocketAddr,
+    local: SocketAddr,
     client: &Arc<Client>,
     handler: &H,
     cache: &DedupCache,
@@ -495,6 +506,7 @@ async fn run_frame_loop<H: Handler>(
                     conn,
                     &frame[..len],
                     peer,
+                    local,
                     client,
                     handler,
                     cache,
@@ -546,6 +558,7 @@ async fn process_frame<H: Handler>(
     conn: &mut AsyncTls,
     datagram: &[u8],
     peer: SocketAddr,
+    local: SocketAddr,
     client: &Arc<Client>,
     handler: &H,
     cache: &DedupCache,
@@ -651,6 +664,7 @@ async fn process_frame<H: Handler>(
         header,
         attrs,
         peer,
+        local,
         client,
         handler,
         cache,

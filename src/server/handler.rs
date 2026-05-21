@@ -105,12 +105,14 @@ pub struct Request<'a> {
     attributes: &'a [u8],
     client: &'a Arc<Client>,
     src: SocketAddr,
+    dst: SocketAddr,
 }
 
 impl<'a> Request<'a> {
     /// Construct a request view. Used by the server pipeline; not
     /// part of the public consumer surface (callers receive a
     /// `Request` from the handler trait).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         code: Code,
         identifier: u8,
@@ -118,6 +120,7 @@ impl<'a> Request<'a> {
         attributes: &'a [u8],
         client: &'a Arc<Client>,
         src: SocketAddr,
+        dst: SocketAddr,
     ) -> Self {
         Self {
             code,
@@ -126,6 +129,7 @@ impl<'a> Request<'a> {
             attributes,
             client,
             src,
+            dst,
         }
     }
 
@@ -156,9 +160,35 @@ impl<'a> Request<'a> {
     }
 
     /// UDP source address (or peer address for `RadSec`).
+    ///
+    /// Mirrors FreeRADIUS's `%{Packet-SRC-IP-Address}` /
+    /// `%{Packet-SRC-Port}` pair — the address the NAS sent the
+    /// request from. Handlers can branch on this to apply
+    /// per-NAS policy (rate limits, VLAN steering, …) without
+    /// re-deriving it from the `Client` record.
     #[must_use]
     pub fn src(&self) -> SocketAddr {
         self.src
+    }
+
+    /// Local socket address the request was received on — the
+    /// `bind()` address of the UDP listener or the `accept()`
+    /// local address of the RadSec TCP connection.
+    ///
+    /// Mirrors FreeRADIUS's `%{Packet-DST-IP-Address}` /
+    /// `%{Packet-DST-Port}` pair. Useful for handlers that run
+    /// behind several listeners (e.g. one bind per VRF, one per
+    /// tenant VIP) and need to know which one fired without
+    /// threading separate `Handler` instances per listener.
+    ///
+    /// Note: for a UDP socket bound to a wildcard address
+    /// (`0.0.0.0` / `[::]`), this returns the wildcard, not the
+    /// concrete interface address the datagram actually arrived
+    /// on. Recovering the latter requires `IP_PKTINFO` /
+    /// `IPV6_RECVPKTINFO`, which the library does not yet enable.
+    #[must_use]
+    pub fn dst(&self) -> SocketAddr {
+        self.dst
     }
 
     /// Iterate the raw attribute region.
@@ -402,6 +432,7 @@ mod tests {
             &[],
             &client,
             "127.0.0.1:1812".parse().unwrap(),
+            "127.0.0.1:1812".parse().unwrap(),
         );
         let reply = req.reply(Code::ACCESS_ACCEPT);
         // Drop and inspect via seal: identifier should round-trip.
@@ -422,6 +453,7 @@ mod tests {
             attrs,
             &client,
             "127.0.0.1:1812".parse().unwrap(),
+            "127.0.0.1:1812".parse().unwrap(),
         );
         let raw = req.first_raw(1).unwrap().expect("present");
         assert_eq!(raw.value(), b"alice");
@@ -441,6 +473,7 @@ mod tests {
             req_auth,
             &[],
             &client,
+            "127.0.0.1:1812".parse().unwrap(),
             "127.0.0.1:1812".parse().unwrap(),
         );
 
@@ -472,6 +505,7 @@ mod tests {
             [0; 16],
             &[],
             &client,
+            "127.0.0.1:1812".parse().unwrap(),
             "127.0.0.1:1812".parse().unwrap(),
         );
         let mut reply = req.reply(Code::ACCESS_REJECT);
