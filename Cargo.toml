@@ -16,10 +16,7 @@ license = "BSD-2-Clause"
 repository = "https://github.com/example/radius-tokio"
 keywords = ["radius", "aaa", "networking", "tokio"]
 categories = ["network-programming", "asynchronous"]
-# CLAUDE.md is the in-repo source-of-truth for project vision and roadmap.
-# It is internal documentation; keep it out of the published package so
-# nothing in the crate's docs can reference a file that isn't shipped.
-exclude = ["CLAUDE.md", "dhat-heap.json"]
+exclude = ["dhat-heap.json"]
 
 [features]
 default = ["dict-rfc", "fast-md5"]

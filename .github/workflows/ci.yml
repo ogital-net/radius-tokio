@@ -184,7 +184,7 @@ jobs:
   # Verifies the crate that's first in the publish chain still packages
   # cleanly. The other two members can't be dry-run verified until their
   # path-deps are actually on crates.io (chicken-and-egg with workspace
-  # publish chains; see CLAUDE.md Phase 11).
+  # publish chains).
   publish_dryrun:
     name: publish dry-run (radius-dict-codegen)
     runs-on: ubuntu-latest

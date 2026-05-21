@@ -1,7 +1,36 @@
 # Contributing to radius-tokio
 
-The single source of truth for project vision, scope, and architecture is
-[`CLAUDE.md`](CLAUDE.md). Read it before proposing non-trivial changes.
+## Architecture at a glance
+
+`radius-tokio` is a **library**, not a daemon — there is no `main`, no
+config file, and no global state. Consumers construct a `Server`,
+plug in two traits (`ClientStore` and `Handler`), and drive it from
+their own Tokio runtime. The source tree mirrors that split:
+
+- `src/codec/` — zero-copy wire decode, typed attribute encode, reply
+  sealing. No I/O, no allocation on the hot read path.
+- `src/crypto/` — safe wrappers over `aws-lc-sys` for MD5, HMAC-MD5,
+  HMAC-SHA*, AES, DES, RNG, and the RadSec `SSL` layer. Every
+  `unsafe` block is FFI-only and carries a `// SAFETY:` comment.
+- `src/server/` — transport (UDP, RadSec/TCP+TLS), admission gating,
+  dedup + retransmit cache, dispatch pipeline, CoA originator,
+  Status-Server responder, graceful shutdown.
+- `src/auth/` — PAP / CHAP / MS-CHAPv2 / EAP-MD5 helpers that
+  handlers can call; the library never makes the auth decision
+  itself.
+- `crates/radius-dict/` + `crates/radius-dict-codegen/` — RFC and
+  vendor dictionaries, parsed at build time into typed attribute
+  handles.
+
+The `Server` owns every wire- and protocol-level detail (decode,
+dedup, authenticator verification, reply seal, mTLS). Consumer code
+owns the policy (“who is this peer?”, “what should I send back?”).
+Keep that boundary intact when proposing changes — anything that
+leaks sockets, secrets, or authenticators into the `Handler` surface
+should get scrutinised hard.
+
+For performance budgets and the methodology used to validate them,
+see [`BENCHMARKS.md`](BENCHMARKS.md).
 
 ## Development prerequisites
 
@@ -173,5 +202,4 @@ All jobs must pass before merging.
 ## Commit style
 
 Use short, imperative subject lines (`Add codec round-trip fuzz
-target`). Reference the relevant roadmap phase (see `CLAUDE.md`) in
-the commit body when applicable.
+target`).

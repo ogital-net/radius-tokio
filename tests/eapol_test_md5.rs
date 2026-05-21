@@ -3,8 +3,8 @@
 //! handler.
 //!
 //! Sister test to [`eapol_test_mschapv2`]. Full EAP-method
-//! termination is an explicit non-goal of the library (see
-//! `CLAUDE.md`): the codec relays `EAP-Message` and exposes
+//! termination is an explicit non-goal of the library: the codec
+//! relays `EAP-Message` and exposes
 //! `auth::eap_md5::challenge_response` /
 //! `auth::eap_md5::verify_response`, but the state machine that
 //! wires them together is the consumer's responsibility. This test

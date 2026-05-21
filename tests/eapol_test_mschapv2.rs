@@ -2,7 +2,7 @@
 //! `eapol_test` utility against an in-process EAP-MSCHAPv2 handler.
 //!
 //! Full EAP-method termination is an explicit non-goal of the
-//! library (see CLAUDE.md): the codec exposes the `EAP-Message`
+//! library: the codec exposes the `EAP-Message`
 //! reassembly view and `auth::mschap::v2_nt_response` /
 //! `auth::mschap::v2_authenticator_response`, but the state machine
 //! that wires them together is the consumer's responsibility. This

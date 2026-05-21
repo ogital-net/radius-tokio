@@ -1,7 +1,7 @@
 //! End-to-end UDP throughput + latency measurement against a running
 //! [`Server`] with a no-op handler.
 //!
-//! This is the bench that backs the CLAUDE.md "Performance budget"
+//! This is the bench that backs the crate's "Performance budget"
 //! verification: everything in
 //! `benches/{codec_decode,codec_encode,roundtrip}.rs` measures the
 //! synchronous codec/crypto floor; this binary folds in the actual
@@ -199,7 +199,7 @@ fn report_latency(mut samples: Vec<Duration>) {
     println!("  p999  = {:?}", percentile(&samples, 0.999));
     println!("  max   = {:?}", samples[n - 1]);
 
-    // CLAUDE.md performance budget: <50 µs added latency (excluding
+    // Performance budget: <50 µs added latency (excluding
     // handler). The budget is written against the reference platform
     // (Linux on a modern x86 core); on other OSes / arches the
     // loopback UDP path itself can dominate, so we just print the
@@ -208,10 +208,10 @@ fn report_latency(mut samples: Vec<Duration>) {
     let budget = Duration::from_micros(50);
     if is_reference_platform() {
         let verdict = if p99 <= budget { "PASS" } else { "FAIL" };
-        println!("  CLAUDE.md p99 budget = {budget:?}: {verdict}");
+        println!("  p99 budget = {budget:?}: {verdict}");
     } else {
         println!(
-            "  CLAUDE.md p99 budget = {budget:?}: SKIP (not reference platform: {})",
+            "  p99 budget = {budget:?}: SKIP (not reference platform: {})",
             platform_label(),
         );
     }
@@ -267,22 +267,22 @@ fn report_throughput(packets: usize, elapsed: Duration) {
     println!("  wall clock      = {elapsed:?}");
     println!("  throughput      = {rate:.0} req/s");
 
-    // CLAUDE.md performance budget: >200k req/s on a modern x86 core.
+    // Performance budget: >200k req/s on a modern x86 core.
     // See `report_latency` for why the verdict is gated to the
     // reference platform.
     let budget = 200_000.0;
     if is_reference_platform() {
         let verdict = if rate >= budget { "PASS" } else { "FAIL" };
-        println!("  CLAUDE.md req/s budget = {budget:.0}: {verdict}");
+        println!("  req/s budget = {budget:.0}: {verdict}");
     } else {
         println!(
-            "  CLAUDE.md req/s budget = {budget:.0}: SKIP (not reference platform: {})",
+            "  req/s budget = {budget:.0}: SKIP (not reference platform: {})",
             platform_label(),
         );
     }
 }
 
-/// The performance budget in CLAUDE.md is written against "a modern
+/// The performance budget is written against "a modern
 /// x86 core" running Linux. Loopback UDP scheduling on macOS / BSD
 /// and on non-x86 hosts has a materially different floor, so we only
 /// emit a PASS/FAIL verdict on the reference platform.

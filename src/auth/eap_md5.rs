@@ -6,7 +6,7 @@
 //! the EAP-Request that carried the challenge.
 //!
 //! Full EAP method termination is an explicit non-goal of this
-//! library (see `CLAUDE.md`); the codec relays `EAP-Message`
+//! library; the codec relays `EAP-Message`
 //! attributes and this module exposes the raw computation needed by
 //! consumers that wish to terminate EAP-MD5 in their handler. The
 //! state machine — issuing the request, tracking the `State`

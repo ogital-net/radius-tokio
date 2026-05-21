@@ -1,5 +1,5 @@
 //! [`StaticClients`] lookup-throughput benchmarks at varying table
-//! sizes. The CLAUDE.md performance budget calls out 10k-client
+//! sizes. The performance budget calls out 10k-client
 //! tables; we sweep 10 / 100 / 1 000 / 10 000 to make any super-linear
 //! growth visible.
 
