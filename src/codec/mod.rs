@@ -12,7 +12,7 @@
 //! * [`message_authenticator`] — Message-Authenticator (attribute 80)
 //!   helpers, including the *secure-default* policy described below.
 //! * [`eap`] — `EAP-Message` (attribute 79) reassembly view (RFC 3579
-//!   §3.1).
+//!   §3.1) plus a typed EAP packet-header view (RFC 3748 §4).
 //! * [`encode`] — high-level reply builder that wires the pieces above
 //!   together.
 //!

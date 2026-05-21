@@ -32,20 +32,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use radius_tokio::auth::mschap::{self, MsChapSecret};
+use radius_tokio::eap;
 use radius_tokio::server::{
     Client, Handler, HandlerResult, IpCidr, Request, Server, StaticClients,
 };
 use radius_tokio::Code;
 
 mod common;
-use common::{
-    add_eap_message, build_eap_failure, build_eap_success, nanos_now, ATTR_EAP_MESSAGE, ATTR_STATE,
-    ATTR_USER_NAME, EAP_CODE_REQUEST, EAP_CODE_RESPONSE, EAP_TYPE_IDENTITY, IDENTITY, PASSWORD,
-    SHARED_SECRET,
-};
-
-// EAP type specific to MSCHAPv2 (draft-kamath-pppext-eap-mschapv2).
-const EAP_TYPE_MSCHAPV2: u8 = 26;
+use common::{nanos_now, IDENTITY, PASSWORD, SHARED_SECRET};
 
 // MSCHAPv2 opcodes (RFC 2759 §6 + draft-kamath-pppext-eap-mschapv2).
 const MS_OP_CHALLENGE: u8 = 1;
@@ -118,44 +112,32 @@ impl Handler for EapMschapV2Handler {
             return HandlerResult::Drop;
         }
 
-        // Reassemble the EAP-Message attribute(s) into a contiguous
-        // buffer. The library exposes the iterator/concat helpers in
-        // `codec::eap`; we use the raw attribute iterator here so
-        // the test stays self-contained and visible.
-        let mut eap = Vec::new();
-        for raw in request.attributes_iter() {
-            let Ok(raw) = raw else {
-                return HandlerResult::Drop;
-            };
-            if raw.attribute_type() == ATTR_EAP_MESSAGE {
-                eap.extend_from_slice(raw.value());
-            }
-        }
-        if eap.is_empty() {
+        // Reassemble the EAP-Message attribute(s) and parse the EAP
+        // header. `request.eap_message()` walks the attribute region
+        // for us and returns an empty `Vec` when no EAP-Message is
+        // present.
+        let eap_buf = request.eap_message();
+        if eap_buf.is_empty() {
             return HandlerResult::Drop;
         }
 
-        let Some(eap_pkt) = parse_eap(&eap) else {
+        let Ok(eap_pkt) = eap::Packet::parse(&eap_buf) else {
             return HandlerResult::Drop;
         };
 
-        // Locate any State attribute the peer is echoing.
-        let state_attr = match request.first_raw(ATTR_STATE) {
-            Ok(Some(raw)) => Some(raw.value()),
-            Ok(None) => None,
-            Err(_) => return HandlerResult::Drop,
-        };
+        // Any State attribute the peer is echoing.
+        let state_attr = request.state();
 
-        match (eap_pkt.code, eap_pkt.kind) {
+        match (eap_pkt.code(), eap_pkt.typ()) {
             // ── Round 1: EAP-Response/Identity ───────────────────────────
-            (EAP_CODE_RESPONSE, EapKind::Identity) => {
+            (eap::Code::RESPONSE, Some(eap::Type::IDENTITY)) => {
                 if state_attr.is_some() {
                     // Identity should be the first message; bail.
                     return HandlerResult::Drop;
                 }
                 let auth_challenge = self.fresh_auth_challenge();
                 let state_value = self.fresh_state();
-                let next_eap_id = eap_pkt.id.wrapping_add(1);
+                let next_eap_id = eap_pkt.identifier().wrapping_add(1);
                 let mschap_id = next_eap_id;
 
                 self.sessions.lock().unwrap().insert(
@@ -171,15 +153,27 @@ impl Handler for EapMschapV2Handler {
                 let eap_req =
                     build_mschap_challenge(next_eap_id, mschap_id, &auth_challenge, SERVER_NAME);
                 let mut reply = request.reply(Code::ACCESS_CHALLENGE);
-                reply
-                    .add_attribute(ATTR_STATE, &state_value)
-                    .expect("state fits");
-                add_eap_message(&mut reply, &eap_req);
+                reply.add_state(&state_value).expect("state fits");
+                reply.add_eap_message(&eap_req).expect("fragments fit");
                 HandlerResult::Reply(reply)
             }
 
             // ── Round 2 or 3: EAP-Response/MSCHAPv2 ─────────────────────
-            (EAP_CODE_RESPONSE, EapKind::MsChapV2(op)) => {
+            (eap::Code::RESPONSE, Some(eap::Type::MSCHAPV2)) => {
+                // Type-Data layout (RFC 2759 §6 + draft):
+                //   opcode(1) || mschap-id(1) || ms-length(2) || body(*)
+                // Peer acks (Success/Failure) carry only the bare
+                // opcode byte and omit the rest.
+                let type_data = eap_pkt.type_data();
+                let Some(&op) = type_data.first() else {
+                    return HandlerResult::Drop;
+                };
+                let body: &[u8] = if type_data.len() >= 4 {
+                    &type_data[4..]
+                } else {
+                    &[]
+                };
+
                 let Some(state_bytes) = state_attr else {
                     return HandlerResult::Drop;
                 };
@@ -197,7 +191,7 @@ impl Handler for EapMschapV2Handler {
 
                 match (session.stage, op) {
                     (Stage::AwaitingChallengeResponse, MS_OP_RESPONSE) => {
-                        let Some(resp) = parse_mschap_response(eap_pkt.body) else {
+                        let Some(resp) = parse_mschap_response(body) else {
                             return HandlerResult::Drop;
                         };
                         let expected = mschap::v2_nt_response(
@@ -211,8 +205,9 @@ impl Handler for EapMschapV2Handler {
                             // doesn't exercise this branch but the
                             // library API is the same.
                             let mut reply = request.reply(Code::ACCESS_REJECT);
-                            let fail = build_eap_failure(eap_pkt.id);
-                            add_eap_message(&mut reply, &fail);
+                            reply
+                                .add_eap_failure(eap_pkt.identifier())
+                                .expect("failure fits");
                             return HandlerResult::Reply(reply);
                         }
 
@@ -233,20 +228,18 @@ impl Handler for EapMschapV2Handler {
                             let mut sessions = self.sessions.lock().unwrap();
                             if let Some(s) = sessions.get_mut(&state_key) {
                                 s.stage = Stage::AwaitingSuccessAck;
-                                s.last_eap_id = eap_pkt.id.wrapping_add(1);
+                                s.last_eap_id = eap_pkt.identifier().wrapping_add(1);
                             }
                         }
 
                         let success_req = build_mschap_success_request(
-                            eap_pkt.id.wrapping_add(1),
+                            eap_pkt.identifier().wrapping_add(1),
                             session.mschap_id,
                             &auth_resp,
                         );
                         let mut reply = request.reply(Code::ACCESS_CHALLENGE);
-                        reply
-                            .add_attribute(ATTR_STATE, &state_key)
-                            .expect("state fits");
-                        add_eap_message(&mut reply, &success_req);
+                        reply.add_state(&state_key).expect("state fits");
+                        reply.add_eap_message(&success_req).expect("fragments fit");
                         HandlerResult::Reply(reply)
                     }
                     (Stage::AwaitingSuccessAck, MS_OP_SUCCESS) => {
@@ -257,11 +250,12 @@ impl Handler for EapMschapV2Handler {
                         let mut reply = request.reply(Code::ACCESS_ACCEPT);
                         // Echo the User-Name back; some NAS gear
                         // expects it on Access-Accept (RFC 2865 §5.1).
-                        if let Ok(Some(un)) = request.first_raw(ATTR_USER_NAME) {
-                            let _ = reply.add_attribute(ATTR_USER_NAME, un.value());
+                        if let Some(name) = request.user_name() {
+                            let _ = reply.add_attribute(1, name);
                         }
-                        let success = build_eap_success(eap_pkt.id);
-                        add_eap_message(&mut reply, &success);
+                        reply
+                            .add_eap_success(eap_pkt.identifier())
+                            .expect("success fits");
                         HandlerResult::Reply(reply)
                     }
                     _ => HandlerResult::Drop,
@@ -272,74 +266,7 @@ impl Handler for EapMschapV2Handler {
     }
 }
 
-// ── EAP / MSCHAPv2 codec helpers ─────────────────────────────────────────
-
-struct EapPacket<'a> {
-    code: u8,
-    id: u8,
-    kind: EapKind,
-    /// `MSCHAPv2` body: bytes following the `MSCHAPv2` 4-byte header
-    /// (i.e. starting at value-size for Challenge / Response, or at
-    /// the message string for Success).
-    body: &'a [u8],
-}
-
-enum EapKind {
-    Identity,
-    /// Carries the `MSCHAPv2` opcode.
-    MsChapV2(u8),
-}
-
-fn parse_eap(buf: &[u8]) -> Option<EapPacket<'_>> {
-    if buf.len() < 4 {
-        return None;
-    }
-    let code = buf[0];
-    let id = buf[1];
-    let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
-    if length < 4 || length > buf.len() {
-        return None;
-    }
-    if length == 4 {
-        // Bare EAP-Success / -Failure; not expected on the request side.
-        return Some(EapPacket {
-            code,
-            id,
-            kind: EapKind::Identity,
-            body: &[],
-        });
-    }
-    let typ = buf[4];
-    match typ {
-        EAP_TYPE_IDENTITY => Some(EapPacket {
-            code,
-            id,
-            kind: EapKind::Identity,
-            body: &buf[5..length],
-        }),
-        EAP_TYPE_MSCHAPV2 => {
-            // MSCHAPv2 type-data is at least one byte (the opcode).
-            // Challenge / Response carry the full RFC 2759 header
-            // (opcode + mschap-id + ms-length); Success / Failure
-            // *responses from the peer* are bare opcodes — wpa_supplicant
-            // sends a 1-byte body containing only the Success opcode
-            // when ack'ing the server's Success request.
-            if length < 6 {
-                return None;
-            }
-            let op = buf[5];
-            // Body offset depends on whether the full header is present.
-            let body_start = if length >= 9 { 9 } else { 6 };
-            Some(EapPacket {
-                code,
-                id,
-                kind: EapKind::MsChapV2(op),
-                body: &buf[body_start..length],
-            })
-        }
-        _ => None,
-    }
-}
+// ── MSCHAPv2 codec helpers ───────────────────────────────────────────────
 
 struct MsChapResponseFields {
     peer_challenge: [u8; 16],
@@ -366,37 +293,38 @@ fn parse_mschap_response(body: &[u8]) -> Option<MsChapResponseFields> {
 }
 
 fn build_mschap_challenge(eap_id: u8, mschap_id: u8, challenge: &[u8; 16], name: &[u8]) -> Vec<u8> {
-    // EAP header(5) + MSCHAPv2 header(4) + value-size(1) + challenge(16) + name
+    // MSCHAPv2 Challenge inner layout (RFC 2759 §6 + draft):
+    //   opcode(1) || mschap-id(1) || ms-length(2) || value-size(1)=16
+    //     || challenge(16) || name(*)
     let ms_len = 4 + 1 + 16 + name.len();
-    let eap_len = 5 + ms_len;
-    let mut out = Vec::with_capacity(eap_len);
-    out.push(EAP_CODE_REQUEST);
-    out.push(eap_id);
-    out.extend_from_slice(&u16::try_from(eap_len).unwrap().to_be_bytes());
-    out.push(EAP_TYPE_MSCHAPV2);
-    out.push(MS_OP_CHALLENGE);
-    out.push(mschap_id);
-    out.extend_from_slice(&u16::try_from(ms_len).unwrap().to_be_bytes());
-    out.push(16);
-    out.extend_from_slice(challenge);
-    out.extend_from_slice(name);
+    let mut type_data = Vec::with_capacity(ms_len);
+    type_data.push(MS_OP_CHALLENGE);
+    type_data.push(mschap_id);
+    type_data.extend_from_slice(&u16::try_from(ms_len).unwrap().to_be_bytes());
+    type_data.push(16);
+    type_data.extend_from_slice(challenge);
+    type_data.extend_from_slice(name);
+
+    let mut out = Vec::with_capacity(5 + ms_len);
+    eap::write_request(&mut out, eap_id, eap::Type::MSCHAPV2, &type_data)
+        .expect("EAP packet length fits");
     out
 }
 
 fn build_mschap_success_request(eap_id: u8, mschap_id: u8, auth_resp: &[u8; 42]) -> Vec<u8> {
-    // Body is the ASCII "S=<40 hex>" string; no M= message.
+    // MSCHAPv2 Success inner layout: opcode || mschap-id || ms-length
+    //   || body. Body is the ASCII "S=<40 hex>" string; no M= message.
     let body_len = auth_resp.len();
     let ms_len = 4 + body_len;
-    let eap_len = 5 + ms_len;
-    let mut out = Vec::with_capacity(eap_len);
-    out.push(EAP_CODE_REQUEST);
-    out.push(eap_id);
-    out.extend_from_slice(&u16::try_from(eap_len).unwrap().to_be_bytes());
-    out.push(EAP_TYPE_MSCHAPV2);
-    out.push(MS_OP_SUCCESS);
-    out.push(mschap_id);
-    out.extend_from_slice(&u16::try_from(ms_len).unwrap().to_be_bytes());
-    out.extend_from_slice(auth_resp);
+    let mut type_data = Vec::with_capacity(ms_len);
+    type_data.push(MS_OP_SUCCESS);
+    type_data.push(mschap_id);
+    type_data.extend_from_slice(&u16::try_from(ms_len).unwrap().to_be_bytes());
+    type_data.extend_from_slice(auth_resp);
+
+    let mut out = Vec::with_capacity(5 + ms_len);
+    eap::write_request(&mut out, eap_id, eap::Type::MSCHAPV2, &type_data)
+        .expect("EAP packet length fits");
     out
 }
 

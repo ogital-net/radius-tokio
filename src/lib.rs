@@ -37,6 +37,6 @@ pub use codec::encode::Reply;
 pub use codec::header::Code;
 pub use codec::typed;
 pub use codec::{
-    attributes, authenticator, dissect, header, message_authenticator, CodecError, PacketBuffer,
-    TlvWriter,
+    attributes, authenticator, dissect, eap, header, message_authenticator, CodecError,
+    PacketBuffer, TlvWriter,
 };

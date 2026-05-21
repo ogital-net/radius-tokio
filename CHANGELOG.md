@@ -37,6 +37,42 @@ and deprecation precedes removal by at least one minor release.
 
 ### Added
 
+- **EAP-over-RADIUS ergonomics.** The codec now exposes the full
+  parse / encode pair for EAP-Message payloads so consumers writing
+  an EAP method engine never reach for raw bytes:
+  - `codec::eap::Packet::parse` — borrowed, validated view over a
+    reassembled `EAP-Message` payload (`Code` / `Identifier` /
+    `Length` / `Type` / `Type-Data`), with `eap::Code` and `eap::Type`
+    newtypes carrying the well-known RFC 3748 §4 / §5 constants
+    (`IDENTITY`, `MD5_CHALLENGE`, `MSCHAPV2`, `TLS`, `PEAP`, …).
+  - `codec::eap::write_request` / `write_response` /
+    `write_success` / `write_failure` — symmetric encoders that
+    round-trip through `Packet::parse`; method-specific code only
+    has to build the `Type-Data` blob.
+  - `Reply::add_eap_message(&[u8])` — fragments an EAP packet into
+    consecutive ≤253-byte `EAP-Message` attributes per RFC 3579 §3.1
+    (inverse of `eap::reassemble_into`). `Reply::add_eap_success(id)`
+    / `Reply::add_eap_failure(id)` sugar over it for the common
+    terminal-EAP reply shapes.
+  - `Request::eap_message()` / `Request::eap_message_into(&mut Vec<u8>)`
+    — reassemble every `EAP-Message` attribute into a fresh or
+    caller-supplied buffer in one call.
+  - `Request::state()` / `Reply::add_state(&[u8])` — opaque
+    `State` (RFC 2865 §5.24) round-trip helpers for multi-round
+    exchanges. `Request::user_name()` mirrors the same shape for
+    the canonical RFC 2865 §5.1 attribute.
+  - New `examples/eap_identity_challenge.rs` — worked EAP-MD5
+    `Access-Request` → `Access-Challenge` → `Access-Request` →
+    `Access-Accept` flow in ≤ 30 lines of handler code, driven by
+    hostap's `eapol_test`. The sister `tests/eapol_test_md5.rs`
+    and `tests/eapol_test_mschapv2.rs` integration tests run the
+    same idiom end-to-end against the real `eapol_test` binary.
+
+  Terminating EAP methods inside the library (PEAP, EAP-TLS,
+  EAP-TTLS, EAP-MSCHAPv2 state machinery) remains a permanent
+  non-goal; the codec view plus `auth::eap_md5` / `auth::mschap`
+  primitives are everything the library exposes — consumers plug in
+  whatever method engine they already use.
 - **Status-Server (RFC 5997 / RFC 6614 §2.6).** Built-in keepalive
   responder runs inline on every UDP and RadSec listener — no
   consumer `Handler` invocation, no new task — so probe traffic

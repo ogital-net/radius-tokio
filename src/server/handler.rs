@@ -251,6 +251,79 @@ impl<'a> Request<'a> {
         Ok(None)
     }
 
+    /// Return the value of the `State` attribute (RFC 2865 §5.24,
+    /// attribute type 24) the NAS is echoing on this request, if any.
+    ///
+    /// `State` is opaque to the protocol — typically a server-minted
+    /// token from a previous Access-Challenge. Use it to key into
+    /// whatever session store the handler maintains; pair with
+    /// [`Reply::add_state`](crate::codec::encode::Reply::add_state)
+    /// to mint the next round's value.
+    ///
+    /// Returns `None` when no `State` attribute is present or when a
+    /// malformed attribute slot is encountered before one could be
+    /// located. Handlers that need to distinguish "absent" from
+    /// "malformed payload upstream" can use
+    /// [`Self::first_raw`]`(24)` directly.
+    #[must_use]
+    pub fn state(&self) -> Option<&'a [u8]> {
+        // 24 = State (RFC 2865 §5.24). See `Reply::add_state` for the
+        // rationale for hard-coding the type byte here.
+        self.first_raw(24).ok().flatten().map(|raw| raw.value())
+    }
+
+    /// Borrowed value of the `User-Name` attribute (RFC 2865 §5.1,
+    /// attribute type 1) the NAS is asserting on this request, if
+    /// any.
+    ///
+    /// `User-Name` is the canonical subscriber identity in RADIUS;
+    /// Access-Accept replies commonly echo it back so the NAS can
+    /// log the authenticated identity even when it differs from the
+    /// claimed one (e.g. EAP outer vs inner identity). Pair with
+    /// [`crate::Reply::add_attribute`] to echo:
+    ///
+    /// ```ignore
+    /// if let Some(name) = request.user_name() {
+    ///     reply.add_attribute(1, name)?;
+    /// }
+    /// ```
+    ///
+    /// Returns `None` when no `User-Name` attribute is present or
+    /// when a malformed attribute slot is encountered before one
+    /// could be located. Handlers that need to distinguish "absent"
+    /// from "malformed payload upstream" can use
+    /// [`Self::first_raw`]`(1)` directly.
+    #[must_use]
+    pub fn user_name(&self) -> Option<&'a [u8]> {
+        // 1 = User-Name (RFC 2865 §5.1). Hard-coded for parity with
+        // `state()` — the typed handle for callers who want it is
+        // `dict::generated::rfc::attrs::USER_NAME`.
+        self.first_raw(1).ok().flatten().map(|raw| raw.value())
+    }
+
+    /// Reassemble every `EAP-Message` (RFC 3579 §3.1) attribute on
+    /// this request into a fresh `Vec<u8>`.
+    ///
+    /// Returns an empty vector when no `EAP-Message` attribute is
+    /// present. Pair the result with
+    /// [`codec::eap::Packet::parse`](crate::codec::eap::Packet::parse)
+    /// to drive method dispatch. Use [`Self::eap_message_into`] when
+    /// you want to reuse a scratch buffer across requests.
+    #[must_use]
+    pub fn eap_message(&self) -> Vec<u8> {
+        crate::codec::eap::reassemble(self.attributes)
+    }
+
+    /// Reassemble every `EAP-Message` (RFC 3579 §3.1) attribute on
+    /// this request into `out`, returning the number of bytes
+    /// appended.
+    ///
+    /// `out` is *appended to*, not cleared — the caller owns the
+    /// buffer's lifecycle and can reuse it across requests.
+    pub fn eap_message_into(&self, out: &mut Vec<u8>) -> usize {
+        crate::codec::eap::reassemble_into(self.attributes, out)
+    }
+
     /// Presence-only check for a typed attribute handle.
     ///
     /// Returns `true` iff the request carries a well-formed
@@ -458,6 +531,40 @@ mod tests {
         let raw = req.first_raw(1).unwrap().expect("present");
         assert_eq!(raw.value(), b"alice");
         assert!(req.first_raw(99).unwrap().is_none());
+    }
+
+    #[test]
+    fn user_name_returns_borrowed_value() {
+        let client = Arc::new(Client::new(b"x".as_slice()));
+        // User-Name (1) = "alice", NAS-Port (5) = 2
+        let attrs = &[1u8, 7, b'a', b'l', b'i', b'c', b'e', 5, 6, 0, 0, 0, 2];
+        let req = Request::new(
+            Code::ACCESS_REQUEST,
+            1,
+            [0; 16],
+            attrs,
+            &client,
+            "127.0.0.1:1812".parse().unwrap(),
+            "127.0.0.1:1812".parse().unwrap(),
+        );
+        assert_eq!(req.user_name(), Some(b"alice".as_slice()));
+    }
+
+    #[test]
+    fn user_name_absent_returns_none() {
+        let client = Arc::new(Client::new(b"x".as_slice()));
+        // No User-Name attribute; only NAS-Port.
+        let attrs = &[5u8, 6, 0, 0, 0, 2];
+        let req = Request::new(
+            Code::ACCESS_REQUEST,
+            1,
+            [0; 16],
+            attrs,
+            &client,
+            "127.0.0.1:1812".parse().unwrap(),
+            "127.0.0.1:1812".parse().unwrap(),
+        );
+        assert_eq!(req.user_name(), None);
     }
 
     #[test]

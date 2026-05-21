@@ -150,6 +150,9 @@ name = "graceful_shutdown"
 name = "routing_dispatcher"
 
 [[example]]
+name = "eap_identity_challenge"
+
+[[example]]
 name = "mixed_udp_radsec"
 required-features = ["radsec"]
 

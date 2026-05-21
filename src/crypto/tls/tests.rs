@@ -401,3 +401,67 @@ fn matches_hostname_cn_fallback_only_without_san_dns() {
     // IP SAN still works regardless of CN-fallback flag.
     assert!(peer.matches_hostname("10.0.0.5", false));
 }
+
+#[test]
+fn server_without_client_auth_accepts_cert_less_client() {
+    // EAP-PEAP / TTLS / FAST shape: the server presents a cert but
+    // does NOT request one back. A client that omits its cert must
+    // still complete the handshake.
+    let pki = build_pki();
+    let server_ctx =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem)
+            .expect("build cert-optional server ctx");
+    let mut server = TlsConnection::accept(&server_ctx).expect("accept");
+    // Client trusts the server CA but does NOT install a client cert.
+    let mut client = client_side::builder(&pki.ca_pem).unwrap().build().unwrap();
+    drive(&mut server, &mut client).expect("handshake");
+    assert!(!server.is_handshaking());
+    // No client cert was presented.
+    assert!(server.peer_certificate().is_none());
+}
+
+#[test]
+fn export_keying_material_matches_between_peers_and_differs_per_label() {
+    // RFC 5705 / RFC 8446 §7.5: both ends of a TLS session derive
+    // identical exporter output for the same (label, context, len).
+    // Different labels must yield independent material.
+    let pki = build_pki();
+    let server_ctx =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem)
+            .unwrap();
+    let mut server = TlsConnection::accept(&server_ctx).unwrap();
+    let mut client = client_side::builder(&pki.ca_pem).unwrap().build().unwrap();
+    drive(&mut server, &mut client).expect("handshake");
+
+    let mut srv_msk = [0u8; 64];
+    let mut cli_msk = [0u8; 64];
+    server
+        .export_keying_material("client EAP encryption", None, &mut srv_msk)
+        .expect("server export");
+    client
+        .export_keying_material("client EAP encryption", None, &mut cli_msk)
+        .expect("client export");
+    assert_eq!(srv_msk, cli_msk, "exporters must agree across peers");
+
+    // A different label must produce different output (with
+    // overwhelming probability under any sane TLS exporter).
+    let mut srv_other = [0u8; 64];
+    server
+        .export_keying_material("client PEAP encryption", None, &mut srv_other)
+        .expect("server export (other label)");
+    assert_ne!(srv_msk, srv_other, "labels must namespace exporter output");
+}
+
+#[test]
+fn export_keying_material_before_handshake_is_error() {
+    let pki = build_pki();
+    let server_ctx =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem)
+            .unwrap();
+    let server = TlsConnection::accept(&server_ctx).unwrap();
+    let mut out = [0u8; 16];
+    let err = server
+        .export_keying_material("client EAP encryption", None, &mut out)
+        .expect_err("must reject pre-handshake export");
+    assert!(matches!(err, TlsError::Handshake(_)), "got {err:?}");
+}

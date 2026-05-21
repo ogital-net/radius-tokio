@@ -83,9 +83,9 @@ use aws_lc_sys::{
     SSL_CTX_check_private_key, SSL_CTX_free, SSL_CTX_new, SSL_CTX_set1_cert_store,
     SSL_CTX_set_client_CA_list, SSL_CTX_set_min_proto_version, SSL_CTX_set_num_tickets,
     SSL_CTX_set_options, SSL_CTX_set_verify, SSL_CTX_set_verify_depth, SSL_CTX_use_PrivateKey,
-    SSL_CTX_use_certificate, SSL_accept, SSL_free, SSL_get_error, SSL_get_key_update_type,
-    SSL_get_peer_certificate, SSL_key_update, SSL_new, SSL_pending, SSL_read, SSL_set_bio,
-    SSL_shutdown, SSL_version, SSL_write, TLS_server_method, X509_NAME_ENTRY_get_data,
+    SSL_CTX_use_certificate, SSL_accept, SSL_export_keying_material, SSL_free, SSL_get_error,
+    SSL_get_key_update_type, SSL_get_peer_certificate, SSL_key_update, SSL_new, SSL_pending,
+    SSL_read, SSL_set_bio, SSL_shutdown, SSL_version, SSL_write, TLS_server_method, X509_NAME_ENTRY_get_data,
     X509_NAME_dup, X509_NAME_free, X509_NAME_get_entry, X509_NAME_get_index_by_NID,
     X509_NAME_oneline, X509_STORE_add_cert, X509_STORE_new, X509_free, X509_get_ext_d2i,
     X509_get_subject_name, ASN1_OBJECT, ASN1_TYPE, BIO, EVP_PKEY, GENERAL_NAME, GEN_DNS, GEN_IPADD,
@@ -1232,6 +1232,57 @@ impl TlsContext {
         key_pem: &[u8],
         client_ca_pem: &[u8],
     ) -> Result<Self, TlsError> {
+        Self::build_server(cert_chain_pem, key_pem, Some(client_ca_pem))
+    }
+
+    /// Build a server-side context that does **not** require the
+    /// peer to present a certificate.
+    ///
+    /// Used by EAP methods that tunnel a separate authentication
+    /// exchange inside a server-authenticated TLS session
+    /// (EAP-PEAP, EAP-TTLS, EAP-FAST): the supplicant proves who
+    /// it is via the inner method (MS-CHAPv2, PAP, …) and the TLS
+    /// channel only protects that exchange. Mandating a client
+    /// certificate here would defeat the whole point.
+    ///
+    /// Compared to [`Self::server`]:
+    /// * `install_client_cas` is skipped (no `CertificateRequest`
+    ///   is sent during the handshake).
+    /// * Verify mode is left at libssl's default (`SSL_VERIFY_NONE`
+    ///   from the application's standpoint), so peers that do *not*
+    ///   present a certificate are accepted.
+    ///
+    /// All other hardening matches [`Self::server`] verbatim: TLS
+    /// 1.2 floor, key/cert pairing check, chain-depth cap, session
+    /// tickets disabled.
+    ///
+    /// # Security caveat
+    ///
+    /// **Do not use this constructor for RadSec listeners.** RadSec
+    /// requires mutual TLS (RFC 6614 §2.3); use [`Self::server`].
+    /// This constructor is exclusively for EAP-PEAP / EAP-TTLS /
+    /// EAP-FAST TLS sessions where authorization happens in an
+    /// inner method.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsError`] for any libssl init / parse / mismatch
+    /// failure.
+    pub fn server_without_client_auth(
+        cert_chain_pem: &[u8],
+        key_pem: &[u8],
+    ) -> Result<Self, TlsError> {
+        Self::build_server(cert_chain_pem, key_pem, None)
+    }
+
+    /// Shared body for [`Self::server`] and
+    /// [`Self::server_without_client_auth`]. `client_ca_pem ==
+    /// None` switches off mandatory mTLS.
+    fn build_server(
+        cert_chain_pem: &[u8],
+        key_pem: &[u8],
+        client_ca_pem: Option<&[u8]>,
+    ) -> Result<Self, TlsError> {
         // SAFETY: TLS_server_method returns a pointer to a static
         // SSL_METHOD, never NULL.
         let method = unsafe { TLS_server_method() };
@@ -1279,31 +1330,38 @@ impl TlsContext {
         drop(cert);
         drop(key);
 
-        // Trust anchors for the *client* certs. Required — see
-        // the doc comment on `server()` for why we don't fall back
-        // to the platform store.
-        install_client_cas(&ctx, client_ca_pem)?;
+        if let Some(pem) = client_ca_pem {
+            // Trust anchors for the *client* certs. Required for
+            // RadSec — see the doc comment on `server()` for why we
+            // don't fall back to the platform store.
+            install_client_cas(&ctx, pem)?;
 
-        // Mandatory mTLS for RadSec: peer MUST present a cert and
-        // its chain MUST validate against the configured trust
-        // store. No application callback — passing libssl's check
-        // *is* the gate.
-        // SAFETY: ctx valid; passing `None` for the verify callback
-        // tells libssl to use its built-in chain-validation result
-        // verbatim.
-        unsafe {
-            SSL_CTX_set_verify(
-                ctx.0.as_ptr(),
-                SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
-                None,
-            );
+            // Mandatory mTLS for RadSec: peer MUST present a cert
+            // and its chain MUST validate against the configured
+            // trust store. No application callback — passing
+            // libssl's check *is* the gate.
+            // SAFETY: ctx valid; passing `None` for the verify
+            // callback tells libssl to use its built-in chain-
+            // validation result verbatim.
+            unsafe {
+                SSL_CTX_set_verify(
+                    ctx.0.as_ptr(),
+                    SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+                    None,
+                );
+            }
+            // Cap the accepted chain depth. RFC 5280 doesn't fix a
+            // ceiling; `radsecproxy` uses 5 + 1 (leaf + 5
+            // intermediates), which covers every realistic RadSec
+            // PKI and rejects pathologically long cross-signed
+            // chains predictably.
+            // SAFETY: ctx valid; depth fits trivially in c_int.
+            unsafe { SSL_CTX_set_verify_depth(ctx.0.as_ptr(), MAX_CERT_DEPTH) };
         }
-        // Cap the accepted chain depth. RFC 5280 doesn't fix a
-        // ceiling; `radsecproxy` uses 5 + 1 (leaf + 5 intermediates),
-        // which covers every realistic RadSec PKI and rejects
-        // pathologically long cross-signed chains predictably.
-        // SAFETY: ctx valid; depth fits trivially in c_int.
-        unsafe { SSL_CTX_set_verify_depth(ctx.0.as_ptr(), MAX_CERT_DEPTH) };
+        // No `else` branch: libssl defaults to `SSL_VERIFY_NONE`
+        // (no `CertificateRequest`, peer cert is optional and not
+        // chain-validated when absent). That is exactly what
+        // EAP-PEAP / TTLS / FAST want.
 
         // Disable session resumption. RadSec connections are
         // long-lived (one per NAS, kept open for the device's
@@ -1772,6 +1830,80 @@ impl TlsConnection {
         // PeerCertificate, whose Drop calls X509_free.
         let raw = unsafe { SSL_get_peer_certificate(self.ssl.0.as_ptr()) };
         NonNull::new(raw).map(PeerCertificate::from_owned)
+    }
+
+    /// Export keying material from the completed TLS session
+    /// (RFC 5705 / RFC 8446 §7.5), the primitive every EAP method
+    /// layered over TLS uses to derive its MSK + EMSK.
+    ///
+    /// Typical labels:
+    /// - `"client EAP encryption"` — EAP-TLS (RFC 5216 §2.3),
+    ///   EAP-TTLS (RFC 5281 §11), PEAPv0.
+    /// - `"client PEAP encryption"` — PEAPv1.
+    /// - `"EXPORTER_EAP_TLS_Key_Material"` — EAP-TLS over TLS 1.3
+    ///   (RFC 9190 §2.3).
+    ///
+    /// EAP methods customarily request 128 bytes (`out_len = 128`),
+    /// split as `MSK = out[0..64]`, `EMSK = out[64..128]`. The
+    /// authentication server then takes `MSK[0..32]` as the
+    /// MS-MPPE-Recv-Key and `MSK[32..64]` as the MS-MPPE-Send-Key
+    /// (note the RECV/SEND order — that's RFC 5216 §2.3).
+    ///
+    /// `context` is the optional TLS-Exporter context value. Most
+    /// EAP labels pass `None`; PEAPv1 / EAP-FAST pass method-specific
+    /// bytes. A `Some(&[])` (empty slice) is **semantically different**
+    /// from `None` per RFC 5705 §4 and we propagate that distinction
+    /// to libssl via the `use_context` flag.
+    ///
+    /// # Errors
+    ///
+    /// - [`TlsError::Handshake`] — the handshake has not yet
+    ///   finished; no keying material is available.
+    /// - [`TlsError::Ssl`] — `SSL_export_keying_material` failed
+    ///   (e.g. label exceeded libssl's length cap, or the
+    ///   negotiated cipher suite forbids exporters).
+    pub fn export_keying_material(
+        &self,
+        label: &str,
+        context: Option<&[u8]>,
+        out: &mut [u8],
+    ) -> Result<(), TlsError> {
+        if !self.handshake_done {
+            return Err(TlsError::Handshake(
+                "export_keying_material called before handshake completion".to_owned(),
+            ));
+        }
+        let (ctx_ptr, ctx_len, use_context) = match context {
+            // RFC 5705 §4: `use_context = 1` with `context_len = 0`
+            // is the documented way to request the "empty context"
+            // derivation, which differs from the no-context case.
+            Some(c) => (c.as_ptr(), c.len(), 1 as c_int),
+            None => (std::ptr::null::<u8>(), 0usize, 0 as c_int),
+        };
+        // SAFETY: ssl valid (Drop has not run); out slice is
+        // exclusively borrowed for the call duration; label is
+        // borrowed for the call and passed with its byte length
+        // (not nul-terminated — libssl uses `label_len`, not
+        // `strlen`); context pointer is either null with len 0 or a
+        // valid borrow with matching length; numeric casts are
+        // checked below.
+        let r = unsafe {
+            SSL_export_keying_material(
+                self.ssl.0.as_ptr(),
+                out.as_mut_ptr(),
+                out.len(),
+                label.as_ptr().cast::<c_char>(),
+                label.len(),
+                ctx_ptr,
+                ctx_len,
+                use_context,
+            )
+        };
+        if r == 1 {
+            Ok(())
+        } else {
+            Err(TlsError::Ssl(pop_err("SSL_export_keying_material")))
+        }
     }
 
     /// Send a TLS `close_notify` alert.

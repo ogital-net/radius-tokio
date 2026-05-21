@@ -311,5 +311,39 @@ pub(crate) mod client_side {
                 _ => Err(TlsError::Io(pop_err("SSL_read client"))),
             }
         }
+
+        /// Wrap `SSL_export_keying_material` for cross-peer
+        /// agreement tests against [`super::super::TlsConnection::export_keying_material`].
+        pub fn export_keying_material(
+            &self,
+            label: &str,
+            context: Option<&[u8]>,
+            out: &mut [u8],
+        ) -> Result<(), TlsError> {
+            let (ctx_ptr, ctx_len, use_context) = match context {
+                Some(c) => (c.as_ptr(), c.len(), 1_i32),
+                None => (std::ptr::null::<u8>(), 0_usize, 0_i32),
+            };
+            // SAFETY: ssl valid; out borrowed exclusively for the
+            // call; label is passed with explicit length (no NUL
+            // requirement); context pointer matches its length.
+            let r = unsafe {
+                aws_lc_sys::SSL_export_keying_material(
+                    self.ssl.0.as_ptr(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                    label.as_ptr().cast::<std::os::raw::c_char>(),
+                    label.len(),
+                    ctx_ptr,
+                    ctx_len,
+                    use_context,
+                )
+            };
+            if r == 1 {
+                Ok(())
+            } else {
+                Err(TlsError::Ssl(pop_err("SSL_export_keying_material client")))
+            }
+        }
     }
 }

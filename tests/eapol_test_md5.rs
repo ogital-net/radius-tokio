@@ -32,20 +32,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use radius_tokio::auth::eap_md5;
+use radius_tokio::eap;
 use radius_tokio::server::{
     Client, Handler, HandlerResult, IpCidr, Request, Server, StaticClients,
 };
 use radius_tokio::Code;
 
 mod common;
-use common::{
-    add_eap_message, build_eap_failure, build_eap_success, nanos_now, ATTR_EAP_MESSAGE, ATTR_STATE,
-    ATTR_USER_NAME, EAP_CODE_REQUEST, EAP_CODE_RESPONSE, EAP_TYPE_IDENTITY, IDENTITY, PASSWORD,
-    SHARED_SECRET,
-};
-
-// EAP types specific to MD5 (RFC 3748 §5).
-const EAP_TYPE_MD5: u8 = 4;
+use common::{nanos_now, IDENTITY, PASSWORD, SHARED_SECRET};
 
 /// Per-EAP-conversation state, keyed by the 16-byte `State` attribute
 /// the server hands out on its first Access-Challenge.
@@ -96,40 +90,30 @@ impl Handler for EapMd5Handler {
             return HandlerResult::Drop;
         }
 
-        // Reassemble the EAP-Message attribute(s) into a contiguous
-        // buffer.
-        let mut eap = Vec::new();
-        for raw in request.attributes_iter() {
-            let Ok(raw) = raw else {
-                return HandlerResult::Drop;
-            };
-            if raw.attribute_type() == ATTR_EAP_MESSAGE {
-                eap.extend_from_slice(raw.value());
-            }
-        }
-        if eap.is_empty() {
+        // Reassemble the EAP-Message attribute(s) and parse the EAP
+        // header. `request.eap_message()` walks the attribute region
+        // for us and returns an empty `Vec` when no EAP-Message is
+        // present.
+        let eap_buf = request.eap_message();
+        if eap_buf.is_empty() {
             return HandlerResult::Drop;
         }
 
-        let Some(eap_pkt) = parse_eap(&eap) else {
+        let Ok(eap_pkt) = eap::Packet::parse(&eap_buf) else {
             return HandlerResult::Drop;
         };
 
-        let state_attr = match request.first_raw(ATTR_STATE) {
-            Ok(Some(raw)) => Some(raw.value().to_vec()),
-            Ok(None) => None,
-            Err(_) => return HandlerResult::Drop,
-        };
+        let state_attr = request.state().map(<[u8]>::to_vec);
 
-        match (eap_pkt.code, eap_pkt.kind) {
+        match (eap_pkt.code(), eap_pkt.typ()) {
             // ── Round 1: EAP-Response/Identity ──────────────────────
-            (EAP_CODE_RESPONSE, EapKind::Identity) => {
+            (eap::Code::RESPONSE, Some(eap::Type::IDENTITY)) => {
                 if state_attr.is_some() {
                     return HandlerResult::Drop;
                 }
                 let challenge = self.fresh_challenge();
                 let state_value = self.fresh_state();
-                let next_eap_id = eap_pkt.id.wrapping_add(1);
+                let next_eap_id = eap_pkt.identifier().wrapping_add(1);
 
                 self.sessions.lock().unwrap().insert(
                     state_value,
@@ -139,17 +123,23 @@ impl Handler for EapMd5Handler {
                     },
                 );
 
-                let eap_req = build_md5_challenge(next_eap_id, &challenge);
                 let mut reply = request.reply(Code::ACCESS_CHALLENGE);
-                reply
-                    .add_attribute(ATTR_STATE, &state_value)
-                    .expect("state fits");
-                add_eap_message(&mut reply, &eap_req);
+                reply.add_state(&state_value).expect("state fits");
+                let mut eap_req = Vec::new();
+                let md5_type_data = md5_challenge_type_data(&challenge);
+                eap::write_request(
+                    &mut eap_req,
+                    next_eap_id,
+                    eap::Type::MD5_CHALLENGE,
+                    &md5_type_data,
+                )
+                .expect("EAP packet length fits");
+                reply.add_eap_message(&eap_req).expect("fragments fit");
                 HandlerResult::Reply(reply)
             }
 
             // ── Round 2: EAP-Response/MD5-Challenge ─────────────────
-            (EAP_CODE_RESPONSE, EapKind::Md5Challenge) => {
+            (eap::Code::RESPONSE, Some(eap::Type::MD5_CHALLENGE)) => {
                 let Some(state_bytes) = state_attr else {
                     return HandlerResult::Drop;
                 };
@@ -165,7 +155,7 @@ impl Handler for EapMd5Handler {
                     return HandlerResult::Drop;
                 };
 
-                let Some(response) = parse_md5_response(eap_pkt.body) else {
+                let Some(response) = parse_md5_response(eap_pkt.type_data()) else {
                     return HandlerResult::Drop;
                 };
 
@@ -176,16 +166,18 @@ impl Handler for EapMd5Handler {
                     &response,
                 ) {
                     let mut reply = request.reply(Code::ACCESS_ACCEPT);
-                    if let Ok(Some(un)) = request.first_raw(ATTR_USER_NAME) {
-                        let _ = reply.add_attribute(ATTR_USER_NAME, un.value());
+                    if let Some(name) = request.user_name() {
+                        let _ = reply.add_attribute(1, name);
                     }
-                    let success = build_eap_success(eap_pkt.id);
-                    add_eap_message(&mut reply, &success);
+                    reply
+                        .add_eap_success(eap_pkt.identifier())
+                        .expect("success fits");
                     HandlerResult::Reply(reply)
                 } else {
                     let mut reply = request.reply(Code::ACCESS_REJECT);
-                    let fail = build_eap_failure(eap_pkt.id);
-                    add_eap_message(&mut reply, &fail);
+                    reply
+                        .add_eap_failure(eap_pkt.identifier())
+                        .expect("failure fits");
                     HandlerResult::Reply(reply)
                 }
             }
@@ -194,45 +186,7 @@ impl Handler for EapMd5Handler {
     }
 }
 
-// ── EAP codec helpers ────────────────────────────────────────────────
-
-struct EapPacket<'a> {
-    code: u8,
-    id: u8,
-    kind: EapKind,
-    /// Type-Data following the 1-byte Type field.
-    body: &'a [u8],
-}
-
-enum EapKind {
-    Identity,
-    Md5Challenge,
-}
-
-fn parse_eap(buf: &[u8]) -> Option<EapPacket<'_>> {
-    if buf.len() < 4 {
-        return None;
-    }
-    let code = buf[0];
-    let id = buf[1];
-    let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
-    if length < 5 || length > buf.len() {
-        return None;
-    }
-    let typ = buf[4];
-    let body = &buf[5..length];
-    let kind = match typ {
-        EAP_TYPE_IDENTITY => EapKind::Identity,
-        EAP_TYPE_MD5 => EapKind::Md5Challenge,
-        _ => return None,
-    };
-    Some(EapPacket {
-        code,
-        id,
-        kind,
-        body,
-    })
-}
+// ── EAP method-specific helpers ──────────────────────────────────────
 
 /// Parse the EAP-Response/MD5-Challenge Type-Data:
 /// `Value-Size(1) || Value(16) || Name(*)` (RFC 3748 §5.4).
@@ -248,14 +202,10 @@ fn parse_md5_response(body: &[u8]) -> Option<[u8; 16]> {
     Some(out)
 }
 
-fn build_md5_challenge(eap_id: u8, challenge: &[u8; 16]) -> Vec<u8> {
-    // EAP header(4) + Type(1) + Value-Size(1) + Value(16). No Name.
-    let eap_len = 4 + 1 + 1 + 16;
-    let mut out = Vec::with_capacity(eap_len);
-    out.push(EAP_CODE_REQUEST);
-    out.push(eap_id);
-    out.extend_from_slice(&u16::try_from(eap_len).unwrap().to_be_bytes());
-    out.push(EAP_TYPE_MD5);
+/// Build the EAP-Request/MD5-Challenge Type-Data:
+/// `Value-Size(1)=16 || Value(16)` (RFC 3748 §5.4). No Name.
+fn md5_challenge_type_data(challenge: &[u8; 16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 16);
     out.push(16);
     out.extend_from_slice(challenge);
     out
