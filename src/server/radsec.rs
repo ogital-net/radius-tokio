@@ -201,11 +201,18 @@ struct ConnGuard {
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        self.registry
+        let mut map = self
+            .registry
             .inner
             .lock()
-            .expect("ConnectionRegistry mutex poisoned")
-            .remove(&self.conn_id);
+            .expect("ConnectionRegistry mutex poisoned");
+        map.remove(&self.conn_id);
+        #[cfg(feature = "metrics")]
+        {
+            #[allow(clippy::cast_precision_loss)]
+            let len = map.len() as f64;
+            gauge!(metrics::RADSEC_ACTIVE_CONNECTIONS, len);
+        }
     }
 }
 
@@ -216,16 +223,25 @@ impl ConnectionRegistry {
     fn register(self: &Arc<Self>, client_id: ClientId) -> (ConnGuard, oneshot::Receiver<()>) {
         let conn_id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.inner
-            .lock()
-            .expect("ConnectionRegistry mutex poisoned")
-            .insert(
+        {
+            let mut map = self
+                .inner
+                .lock()
+                .expect("ConnectionRegistry mutex poisoned");
+            map.insert(
                 conn_id,
                 ConnEntry {
                     client_id,
                     closer: tx,
                 },
             );
+            #[cfg(feature = "metrics")]
+            {
+                #[allow(clippy::cast_precision_loss)]
+                let len = map.len() as f64;
+                gauge!(metrics::RADSEC_ACTIVE_CONNECTIONS, len);
+            }
+        }
         (
             ConnGuard {
                 registry: Arc::clone(self),
@@ -253,6 +269,12 @@ impl ConnectionRegistry {
                 }
             }
             *guard = keep;
+            #[cfg(feature = "metrics")]
+            {
+                #[allow(clippy::cast_precision_loss)]
+                let len = guard.len() as f64;
+                gauge!(metrics::RADSEC_ACTIVE_CONNECTIONS, len);
+            }
             taken
         };
         let n = taken.len();

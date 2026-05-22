@@ -23,7 +23,7 @@
 //!
 //! Fragmentation, handshake driving, ciphertext buffering, and
 //! keying-material export are all delegated to the shared
-//! [`crate::tls_tunnel::TlsTunnel`].
+//! `TlsTunnel` (crate-internal).
 //!
 //! # Keying material
 //!

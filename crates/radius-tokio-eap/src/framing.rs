@@ -331,6 +331,13 @@ impl Reassembler {
                 .total_length
                 .expect("Frame::parse guarantees Some(total_length) when L bit is set");
             if total > self.max_total_length {
+                warn!(
+                    event = "reassembly_overflow",
+                    site = "declared_total_exceeds_cap",
+                    declared = total,
+                    cap = self.max_total_length,
+                );
+                count!(crate::obs::metrics::REASSEMBLY_OVERFLOWS);
                 return Err(Error::ReassemblyOverflow {
                     expected: total,
                     buffered: 0,
@@ -349,6 +356,14 @@ impl Reassembler {
         if let Some(expected) = self.expected {
             let would_be = self.buf.len().saturating_add(frame.payload.len());
             if would_be as u64 > u64::from(expected) {
+                warn!(
+                    event = "reassembly_overflow",
+                    site = "fragments_exceed_declared",
+                    expected,
+                    buffered = self.buf.len(),
+                    attempted = frame.payload.len(),
+                );
+                count!(crate::obs::metrics::REASSEMBLY_OVERFLOWS);
                 return Err(Error::ReassemblyOverflow {
                     expected,
                     buffered: self.buf.len(),
@@ -362,6 +377,13 @@ impl Reassembler {
             // in sequence (we reset between messages, so this is
             // really just per-call protection).
             if frame.payload.len() as u64 > u64::from(self.max_total_length) {
+                warn!(
+                    event = "reassembly_overflow",
+                    site = "unbounded_single_fragment_exceeds_cap",
+                    cap = self.max_total_length,
+                    attempted = frame.payload.len(),
+                );
+                count!(crate::obs::metrics::REASSEMBLY_OVERFLOWS);
                 return Err(Error::ReassemblyOverflow {
                     expected: self.max_total_length,
                     buffered: 0,

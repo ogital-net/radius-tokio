@@ -37,6 +37,8 @@ use tokio::sync::broadcast;
 
 use super::client::Client;
 use super::store::ClientStore;
+#[allow(unused_imports)] // unused when both `tracing` and `metrics` are off
+use crate::obs::metrics;
 
 /// Tunables for a [`CachedStore`].
 ///
@@ -120,13 +122,30 @@ impl<S> CachedStore<S> {
         let mut map = self.lock_state();
         if let Some(Slot::Resolved { .. }) = map.get(&addr) {
             map.remove(&addr);
+            debug!(event = "client_cache_invalidate", %addr);
+            #[cfg(feature = "metrics")]
+            {
+                #[allow(clippy::cast_precision_loss)]
+                let len = map.len() as f64;
+                gauge!(metrics::CLIENT_CACHE_SIZE, len);
+            }
         }
     }
 
     /// Drop every cached entry. In-flight lookups are not interrupted.
     pub fn clear(&self) {
         let mut map = self.lock_state();
+        let before = map.len();
         map.retain(|_, slot| matches!(slot, Slot::Pending(_)));
+        let evicted = before.saturating_sub(map.len());
+        info!(event = "client_cache_clear", evicted = evicted);
+        let _ = evicted;
+        #[cfg(feature = "metrics")]
+        {
+            #[allow(clippy::cast_precision_loss)]
+            let len = map.len() as f64;
+            gauge!(metrics::CLIENT_CACHE_SIZE, len);
+        }
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, Slot>> {
@@ -170,6 +189,11 @@ impl<S: ClientStore> ClientStore for CachedStore<S> {
             }
         };
 
+        if matches!(action, Action::Hit(_)) {
+            trace!(event = "client_cache_hit", %src);
+            count!(metrics::CLIENT_CACHE_HITS);
+        }
+
         async move {
             match action {
                 Action::Hit(value) => value,
@@ -192,6 +216,14 @@ impl<S: ClientStore> ClientStore for CachedStore<S> {
                     } else {
                         self.config.negative_ttl
                     };
+                    let result = if value.is_some() {
+                        "positive"
+                    } else {
+                        "negative"
+                    };
+                    trace!(event = "client_cache_miss", %src, result = result);
+                    count!(metrics::CLIENT_CACHE_MISSES, "result" => result);
+                    let _ = result;
                     let expires_at = Instant::now() + ttl;
                     {
                         let mut map = self.lock_state();
@@ -202,6 +234,12 @@ impl<S: ClientStore> ClientStore for CachedStore<S> {
                                 expires_at,
                             },
                         );
+                        #[cfg(feature = "metrics")]
+                        {
+                            #[allow(clippy::cast_precision_loss)]
+                            let len = map.len() as f64;
+                            gauge!(metrics::CLIENT_CACHE_SIZE, len);
+                        }
                     }
                     // Broadcast to any waiters. `send` returns Err if
                     // there are no live receivers, which is fine.

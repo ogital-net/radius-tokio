@@ -10,9 +10,10 @@
 //!
 //! # Differences from EAP-TLS
 //!
-//! * EAP type is [`Type::PEAP`] (25) instead of [`Type::TLS`] (13).
-//! * The [`TlsContext`] is built via
-//!   [`TlsContext::server_without_client_auth`] — no
+//! * EAP type is [`radius_tokio::eap::Type::PEAP`] (25) instead of
+//!   [`radius_tokio::eap::Type::TLS`] (13).
+//! * The [`radius_tokio::tls::TlsContext`] is built via
+//!   [`radius_tokio::tls::TlsContext::server_without_client_auth`] — no
 //!   `CertificateRequest` is sent during the handshake.
 //! * After the TLS handshake completes, the server drives an
 //!   inner EAP conversation by encrypting inner EAP packets into
@@ -26,7 +27,7 @@
 //!
 //! # End-of-conversation sequence
 //!
-//! After the inner method returns [`InnerOutcome::Success`]:
+//! After the inner method returns [`crate::inner::InnerOutcome::Success`]:
 //!
 //! 1. The driver wraps an inner `EAP-Success` packet
 //!    (`Code=3, Id=last_peer_inner_id+1, Length=4`) in TLS

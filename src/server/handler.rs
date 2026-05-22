@@ -750,6 +750,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dict-cisco")]
     fn contains_vsa_finds_vendor_attribute() {
         use crate::dict::cisco::attrs as cisco;
         let client = Arc::new(Client::new(b"s".as_slice()));

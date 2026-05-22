@@ -685,8 +685,10 @@ version = "0.1.0"
 name = "radius-tokio-eap"
 version = "0.1.0"
 dependencies = [
+ "metrics",
  "radius-tokio",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

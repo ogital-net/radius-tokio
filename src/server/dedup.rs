@@ -31,6 +31,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[allow(unused_imports)] // unused when the `metrics` feature is off
+use crate::obs::metrics;
+
 /// The four-tuple a RADIUS dedup cache keys on (RFC 5080 §2.2.2).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Key {
@@ -117,6 +120,16 @@ impl DedupCache {
                 expires_at: now + self.ttl,
             },
         );
+        // Gauge the just-locked shard's size as a cheap proxy for
+        // load. Summing all shards on every insert would defeat the
+        // point of sharding; this gives a per-shard signal that scales
+        // ~linearly with overall occupancy.
+        #[cfg(feature = "metrics")]
+        {
+            #[allow(clippy::cast_precision_loss)]
+            let len = shard.len() as f64;
+            gauge!(metrics::DEDUP_CACHE_SIZE, len, "shard" => idx.to_string());
+        }
     }
 
     /// Test-only: total live entries across every shard.

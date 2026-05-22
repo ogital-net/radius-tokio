@@ -63,6 +63,9 @@
 #![warn(missing_docs, rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 
+#[macro_use]
+mod obs;
+
 pub mod error;
 pub mod framing;
 pub mod handler;

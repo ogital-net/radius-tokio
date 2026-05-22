@@ -215,6 +215,34 @@ macro_rules! observe {
     };
 }
 
+/// Set a named gauge to an absolute value. Usage:
+///
+/// ```ignore
+/// gauge!("radius_tokio.radsec_active_connections", count as f64);
+/// gauge!("radius_tokio.client_cache_size", size as f64, "role" => "udp");
+/// ```
+///
+/// Expands to [`metrics::gauge!`] when the `metrics` feature is
+/// enabled and to nothing when it is not.
+#[cfg(feature = "metrics")]
+#[allow(unused_macros)]
+macro_rules! gauge {
+    ($name:expr, $value:expr $(,)?) => {
+        ::metrics::gauge!($name).set($value)
+    };
+    ($name:expr, $value:expr, $($key:literal => $val:expr),+ $(,)?) => {
+        ::metrics::gauge!($name, $($key => $val),+).set($value)
+    };
+}
+
+#[cfg(not(feature = "metrics"))]
+#[allow(unused_macros)]
+macro_rules! gauge {
+    ($($tt:tt)*) => {
+        ()
+    };
+}
+
 /// Stable metric names emitted by the crate.
 ///
 /// Every `count!` / `observe!` call site in the runtime uses one of
@@ -281,4 +309,51 @@ pub(crate) mod metrics {
     /// Histogram: wall-clock seconds spent inside the consumer
     /// handler, sampled per dispatched request.
     pub(crate) const HANDLER_DURATION_SECONDS: &str = "radius_tokio.handler_duration_seconds";
+
+    // ---- CoA originator (RFC 5176) ----------------------------------
+
+    /// Counter: requests the [`CoaOriginator`](crate::server::coa::CoaOriginator)
+    /// emitted on the wire. Tag `code` carries the decimal RADIUS
+    /// code byte (40 = Disconnect-Request, 43 = CoA-Request).
+    pub(crate) const COA_REQUESTS_SENT: &str = "radius_tokio.coa_requests_sent";
+
+    /// Counter: CoA / Disconnect retransmissions (excluding the
+    /// initial send). Untagged — the retry path does not know the
+    /// originating code at the point it ticks.
+    pub(crate) const COA_RETRANSMITS: &str = "radius_tokio.coa_retransmits";
+
+    /// Counter: terminal outcome for each originated CoA /
+    /// Disconnect. Tag `outcome` is `ack`, `nak`, `timeout`, or
+    /// `error`.
+    pub(crate) const COA_OUTCOMES: &str = "radius_tokio.coa_outcomes";
+
+    // ---- Gauges (lifecycle / cache occupancy) -----------------------
+
+    /// Gauge: number of `RadSec` connections currently held in the
+    /// per-server [`ConnectionRegistry`](crate::server::radsec).
+    /// Updated on every connection accept and drop. A monotonically
+    /// rising value is a leak; a sustained ceiling indicates a NAS
+    /// holding connections open without traffic.
+    pub(crate) const RADSEC_ACTIVE_CONNECTIONS: &str = "radius_tokio.radsec_active_connections";
+
+    /// Gauge: total entries across every shard of the
+    /// dedup / retransmit cache. Updated after each `insert` (which
+    /// is also when the cache is swept for expired entries), so the
+    /// value lags by at most one packet per source.
+    pub(crate) const DEDUP_CACHE_SIZE: &str = "radius_tokio.dedup_cache_size";
+
+    /// Gauge: entries currently held in the
+    /// [`CachedStore`](crate::server::CachedStore) client cache.
+    /// Sum of resolved positive, resolved negative, and in-flight
+    /// (`Pending`) slots.
+    pub(crate) const CLIENT_CACHE_SIZE: &str = "radius_tokio.client_cache_size";
+
+    /// Counter: client-cache lookups that returned a fresh hit
+    /// without consulting the backend.
+    pub(crate) const CLIENT_CACHE_HITS: &str = "radius_tokio.client_cache_hits";
+
+    /// Counter: client-cache lookups that missed and triggered a
+    /// backend call. Tag `result` is `positive` or `negative`
+    /// depending on what the backend returned.
+    pub(crate) const CLIENT_CACHE_MISSES: &str = "radius_tokio.client_cache_misses";
 }

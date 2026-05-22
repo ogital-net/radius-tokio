@@ -46,9 +46,25 @@ eap-ttls = ["radius-tokio/radsec"]
 # Umbrella enabling every EAP method this crate ships.
 all-methods = ["eap-md5", "eap-mschapv2", "eap-tls", "peap", "eap-ttls"]
 
+# Emit structured `tracing` events for session lifecycle, method
+# dispatch decisions, reassembly state, and TLS-tunnel handshake
+# completion. Off by default — enabling it pulls in `tracing` and
+# wires a `target = "radius_tokio_eap"` per call site so consumers
+# can filter the EAP crate independently of the core RADIUS one.
+tracing = ["dep:tracing"]
+
+# Export per-event counters (sessions created/completed, Nak
+# pivots, fragment overflows, TLS handshakes) via the `metrics`
+# facade. Off by default; enabling it pulls in `metrics` and pays
+# a counter increment per emit. Stable metric names live in
+# [`obs::metrics`](src/obs.rs).
+metrics = ["dep:metrics"]
+
 [dependencies]
 radius-tokio = { path = "../..", version = "0.1.0" }
 tokio = { version = "1", default-features = false, features = ["sync"] }
+tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
+metrics = { version = "0.24", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }

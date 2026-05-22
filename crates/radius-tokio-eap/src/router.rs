@@ -22,7 +22,7 @@
 //!
 //! # Pieces
 //!
-//! * [`DynMethodFactory`](crate::DynMethodFactory) — object-safe
+//! * [`DynMethodFactory`] — object-safe
 //!   sibling of [`MethodFactory`](crate::MethodFactory). Implemented
 //!   automatically for any `MethodFactory` via the
 //!   [`DynFactory`](crate::DynFactory) adapter.
@@ -34,7 +34,7 @@
 //!   tracks already-tried methods so the peer can't loop forever,
 //!   and otherwise behaves exactly like
 //!   [`EapHandler`](crate::EapHandler) (same session store,
-//!   same [`AcceptDecorator`](crate::AcceptDecorator) hook, same
+//!   same [`AcceptDecorator`] hook, same
 //!   MS-MPPE key emission).
 //!
 //! # Example
@@ -325,6 +325,10 @@ impl<S> MultiEapHandler<S>
 where
     S: SessionStore<Method = BoxedEapMethod> + 'static,
 {
+    // Observability instrumentation inflates the line count past the
+    // pedantic default; the control flow itself is still a single
+    // linear dispatcher and splitting it would obscure the spec mapping.
+    #[allow(clippy::too_many_lines)]
     async fn dispatch(
         &self,
         existing: Option<SessionId>,
@@ -352,6 +356,15 @@ where
                 method.notify_peer_identity(id);
             }
             let outcome = method.start()?;
+            debug!(
+                event = "session_started",
+                method = preferred_typ.0,
+                via = "identity_router_preferred",
+            );
+            count!(
+                crate::obs::metrics::SESSIONS_CREATED,
+                "method" => preferred_typ.0.to_string(),
+            );
             let mut session = Session::new(method);
             session.peer_identity = peer_identity;
             session.tried_types.push(preferred_typ);
@@ -386,11 +399,26 @@ where
                 .collect();
 
             let Some(next_typ) = desired.into_iter().next() else {
+                warn!(event = "nak_reject", current = session.method.typ().0,);
+                count!(crate::obs::metrics::NAK_REJECTS);
+                count!(
+                    crate::obs::metrics::SESSIONS_COMPLETED,
+                    "method" => session.method.typ().0.to_string(),
+                    "outcome" => "dropped",
+                );
                 return Ok(Dispatch::Reject {
                     eap_identifier: peer_id,
                 });
             };
 
+            let from_typ = session.method.typ();
+            info!(event = "nak_pivot", from = from_typ.0, to = next_typ.0,);
+            count!(
+                crate::obs::metrics::NAK_PIVOTS,
+                "from" => from_typ.0.to_string(),
+                "to" => next_typ.0.to_string(),
+            );
+            let _ = from_typ;
             let factory = self
                 .router
                 .lookup(next_typ)
@@ -410,6 +438,16 @@ where
         let current_typ = session.method.typ();
         if pkt.typ() != Some(current_typ) {
             // Wrong type and not a Nak — terminate.
+            warn!(
+                event = "session_wrong_type",
+                expected = current_typ.0,
+                got = pkt.typ().map_or(0u8, |t| t.0),
+            );
+            count!(
+                crate::obs::metrics::SESSIONS_COMPLETED,
+                "method" => current_typ.0.to_string(),
+                "outcome" => "dropped",
+            );
             return Ok(Dispatch::Reject {
                 eap_identifier: peer_id,
             });

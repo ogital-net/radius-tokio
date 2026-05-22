@@ -129,6 +129,8 @@ impl TlsTunnel {
         match self.tls.process().map_err(|e| Error::Tls(e.to_string()))? {
             HandshakeState::Established => {
                 self.handshake_done = true;
+                debug!(event = "tls_tunnel_handshake_complete");
+                count!(crate::obs::metrics::TLS_HANDSHAKES_COMPLETED);
                 Ok(true)
             }
             HandshakeState::NeedsRead | HandshakeState::NeedsWrite => Ok(false),
@@ -271,6 +273,8 @@ impl TlsTunnel {
         let mut keymat = vec![0u8; MSK_LEN + EMSK_LEN];
         self.export_keying_material(label, None, &mut keymat)?;
         let emsk = keymat.split_off(MSK_LEN);
+        debug!(event = "tls_tunnel_msk_derived", label = label);
+        count!(crate::obs::metrics::MSK_DERIVATIONS);
         Ok((keymat, emsk))
     }
 }

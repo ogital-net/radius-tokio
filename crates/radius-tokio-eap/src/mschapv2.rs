@@ -3,10 +3,10 @@
 //!
 //! Two consumers share this module:
 //!
-//! * [`MsChapV2Server`] / [`MsChapV2Factory`] — [`InnerEap`] driver
+//! * [`crate::mschapv2::MsChapV2Server`] / [`crate::mschapv2::MsChapV2Factory`] — [`crate::inner::InnerEap`] driver
 //!   used as the inner method inside a TLS tunnel (PEAP or
 //!   EAP-TTLS). Feature: `peap`.
-//! * [`EapMsChapV2`] / [`EapMsChapV2Factory`] — [`EapMethod`]
+//! * [`crate::mschapv2::EapMsChapV2`] / [`crate::mschapv2::EapMsChapV2Factory`] — [`EapMethod`]
 //!   driver for bare/native EAP-MSCHAPv2 over the wire (EAP type
 //!   26, no outer TLS), targeting legacy wired 802.1X.
 //!   Feature: `eap-mschapv2`.
@@ -30,7 +30,7 @@
 //!
 //! # Wire format
 //!
-//! Inside a single [`Type::MSCHAPV2`] EAP type-data payload:
+//! Inside a single [`radius_tokio::eap::Type::MSCHAPV2`] EAP type-data payload:
 //!
 //! ```text
 //!   0       1       2 .. 3       4 ..
@@ -62,7 +62,7 @@
 //!   Done(Success)        // → InnerOutcome::Success
 //! ```
 //!
-//! # State machine — native ([`EapMsChapV2`])
+//! # State machine — native ([`crate::mschapv2::EapMsChapV2`])
 //!
 //! Identity is owned by [`crate::handler::EapHandler`], so the
 //! native driver skips the Identity round and begins at the

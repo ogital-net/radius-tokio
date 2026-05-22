@@ -13,7 +13,7 @@
 //!
 //! Outer EAP frames are identical to EAP-TLS / PEAP — same
 //! [`crate::framing`] envelope, only the EAP `Type` byte differs
-//! ([`Type::TTLS`] = 21).
+//! ([`radius_tokio::eap::Type::TTLS`] = 21).
 //!
 //! Inner AVPs follow RFC 5281 §10.1:
 //!
@@ -53,7 +53,7 @@
 //!    `User-Password` for PAP) into a TLS application-data
 //!    record.
 //! 3. The driver decrypts, parses the AVPs, dispatches them to
-//!    the [`TtlsInner`], and returns [`MethodOutcome::Success`]
+//!    the [`crate::eap_ttls::TtlsInner`], and returns [`MethodOutcome::Success`]
 //!    or [`MethodOutcome::Failure`] based on the inner outcome.
 //!    The outer [`crate::EapHandler`] then ships the
 //!    `Access-Accept` (with MS-MPPE keys derived from the TLS

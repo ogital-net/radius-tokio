@@ -22,7 +22,7 @@
 //! full EAP packets (Code | Identifier | Length | Type | Data) and
 //! produce full EAP packets in reply. The outer driver decrypts
 //! TLS records into inner EAP packets before calling
-//! [`InnerEap::step`] and re-encrypts each emitted packet before
+//! [`crate::inner::InnerEap::step`] and re-encrypts each emitted packet before
 //! shipping it.
 //!
 //! Inner methods do **not** observe TLS framing, identifier
