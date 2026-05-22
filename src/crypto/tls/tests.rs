@@ -427,8 +427,7 @@ fn export_keying_material_matches_between_peers_and_differs_per_label() {
     // Different labels must yield independent material.
     let pki = build_pki();
     let server_ctx =
-        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem)
-            .unwrap();
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
     let mut server = TlsConnection::accept(&server_ctx).unwrap();
     let mut client = client_side::builder(&pki.ca_pem).unwrap().build().unwrap();
     drive(&mut server, &mut client).expect("handshake");
@@ -456,8 +455,7 @@ fn export_keying_material_matches_between_peers_and_differs_per_label() {
 fn export_keying_material_before_handshake_is_error() {
     let pki = build_pki();
     let server_ctx =
-        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem)
-            .unwrap();
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
     let server = TlsConnection::accept(&server_ctx).unwrap();
     let mut out = [0u8; 16];
     let err = server

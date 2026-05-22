@@ -103,7 +103,10 @@ impl Handler for EapMd5 {
                 let state = self.token(1);
                 let challenge = self.token(2);
                 let next_id = eap_pkt.identifier().wrapping_add(1);
-                self.sessions.lock().unwrap().insert(state, (next_id, challenge));
+                self.sessions
+                    .lock()
+                    .unwrap()
+                    .insert(state, (next_id, challenge));
                 let mut type_data = vec![16u8];
                 type_data.extend_from_slice(&challenge);
                 let mut eap_req = Vec::new();
@@ -133,11 +136,15 @@ impl Handler for EapMd5 {
                     if let Some(name) = request.user_name() {
                         reply.add_attribute(1, name).expect("user-name fits");
                     }
-                    reply.add_eap_success(eap_pkt.identifier()).expect("success fits");
+                    reply
+                        .add_eap_success(eap_pkt.identifier())
+                        .expect("success fits");
                     HandlerResult::Reply(reply)
                 } else {
                     let mut reply = request.reply(Code::ACCESS_REJECT);
-                    reply.add_eap_failure(eap_pkt.identifier()).expect("failure fits");
+                    reply
+                        .add_eap_failure(eap_pkt.identifier())
+                        .expect("failure fits");
                     HandlerResult::Reply(reply)
                 }
             }

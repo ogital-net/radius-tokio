@@ -85,14 +85,14 @@ use aws_lc_sys::{
     SSL_CTX_set_options, SSL_CTX_set_verify, SSL_CTX_set_verify_depth, SSL_CTX_use_PrivateKey,
     SSL_CTX_use_certificate, SSL_accept, SSL_export_keying_material, SSL_free, SSL_get_error,
     SSL_get_key_update_type, SSL_get_peer_certificate, SSL_key_update, SSL_new, SSL_pending,
-    SSL_read, SSL_set_bio, SSL_shutdown, SSL_version, SSL_write, TLS_server_method, X509_NAME_ENTRY_get_data,
-    X509_NAME_dup, X509_NAME_free, X509_NAME_get_entry, X509_NAME_get_index_by_NID,
-    X509_NAME_oneline, X509_STORE_add_cert, X509_STORE_new, X509_free, X509_get_ext_d2i,
-    X509_get_subject_name, ASN1_OBJECT, ASN1_TYPE, BIO, EVP_PKEY, GENERAL_NAME, GEN_DNS, GEN_IPADD,
-    GEN_OTHERNAME, GEN_RID, GEN_URI, OTHERNAME, SSL, SSL_CTX, SSL_ERROR_NONE, SSL_ERROR_WANT_READ,
-    SSL_ERROR_WANT_WRITE, SSL_ERROR_ZERO_RETURN, SSL_KEY_UPDATE_NONE, SSL_KEY_UPDATE_REQUESTED,
-    SSL_OP_NO_TICKET, SSL_VERIFY_FAIL_IF_NO_PEER_CERT, SSL_VERIFY_PEER, TLS1_2_VERSION,
-    TLS1_3_VERSION, X509, X509_STORE,
+    SSL_read, SSL_set_bio, SSL_shutdown, SSL_version, SSL_write, TLS_server_method,
+    X509_NAME_ENTRY_get_data, X509_NAME_dup, X509_NAME_free, X509_NAME_get_entry,
+    X509_NAME_get_index_by_NID, X509_NAME_oneline, X509_STORE_add_cert, X509_STORE_new, X509_free,
+    X509_get_ext_d2i, X509_get_subject_name, ASN1_OBJECT, ASN1_TYPE, BIO, EVP_PKEY, GENERAL_NAME,
+    GEN_DNS, GEN_IPADD, GEN_OTHERNAME, GEN_RID, GEN_URI, OTHERNAME, SSL, SSL_CTX, SSL_ERROR_NONE,
+    SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE, SSL_ERROR_ZERO_RETURN, SSL_KEY_UPDATE_NONE,
+    SSL_KEY_UPDATE_REQUESTED, SSL_OP_NO_TICKET, SSL_VERIFY_FAIL_IF_NO_PEER_CERT, SSL_VERIFY_PEER,
+    TLS1_2_VERSION, TLS1_3_VERSION, X509, X509_STORE,
 };
 
 // ============================================================================

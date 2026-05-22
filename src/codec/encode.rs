@@ -756,7 +756,10 @@ mod tests {
                 val.len() - 4,
                 "vendor-length covers vendor-type..ciphertext",
             );
-            assert!(val[6] & 0x80 != 0, "salt MSB must be set per RFC 2548 §2.4.3");
+            assert!(
+                val[6] & 0x80 != 0,
+                "salt MSB must be set per RFC 2548 §2.4.3"
+            );
             let salt = [val[6], val[7]];
             let ciphertext = &val[8..];
             let plaintext = crate::crypto::password::tunnel_password_decrypt(

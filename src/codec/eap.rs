@@ -242,9 +242,7 @@ fn write_with_type(
     let total = 4usize
         .checked_add(1)
         .and_then(|n| n.checked_add(type_data.len()))
-        .ok_or(PacketError::PayloadTooLong {
-            len: usize::MAX,
-        })?;
+        .ok_or(PacketError::PayloadTooLong { len: usize::MAX })?;
     let length = u16::try_from(total).map_err(|_| PacketError::PayloadTooLong { len: total })?;
     out.reserve(total);
     out.push(code.0);

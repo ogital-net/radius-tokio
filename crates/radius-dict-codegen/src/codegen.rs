@@ -38,6 +38,8 @@ pub fn render(module_label: &str, dict: &Dictionary) -> String {
     write_values(&mut out, dict);
     writeln!(out).unwrap();
     write_attrs_module(&mut out, dict);
+    writeln!(out).unwrap();
+    write_values_module(&mut out, dict);
 
     out
 }
@@ -215,6 +217,387 @@ fn write_attrs_module(out: &mut String, dict: &Dictionary) {
         }
     }
     writeln!(out, "}}").unwrap();
+}
+
+/// Emit `pub mod values { ... }` with one Rust newtype per
+/// integer-typed attribute that carries `VALUE` enumerators, plus an
+/// associated `pub const` per enumerator and an [`IntoWire`] impl
+/// matching the attribute's wire shape.
+///
+/// Each newtype is `#[repr(transparent)]` and exposes its scalar via
+/// `as_*()` / the public `.0` field. The universe is open: peers can
+/// still send values that aren't in the dictionary, so the type wraps
+/// the underlying scalar rather than being a closed Rust `enum`.
+///
+/// Attributes whose wire type is not integer-shaped (string, octets,
+/// IP address, …) are skipped here — `VALUE` directives are rare on
+/// those and a newtype would buy us little. Cross-dictionary `VALUE`
+/// references (an enumerator pointing to an attribute defined in a
+/// different group) are also skipped because the target type is
+/// unknown at this codegen site.
+fn write_values_module(out: &mut String, dict: &Dictionary) {
+    use std::collections::BTreeMap;
+
+    // Index attributes by name for value → attribute lookup. A
+    // `BTreeMap` gives a deterministic iteration order matching the
+    // dictionary, but we drive emission off the attribute list below
+    // so we just need point lookups here.
+    let mut attrs_by_name: std::collections::HashMap<&str, &super::Attribute> =
+        std::collections::HashMap::with_capacity(dict.attributes.len());
+    for a in &dict.attributes {
+        attrs_by_name.insert(a.name.as_str(), a);
+    }
+
+    // Group values by attribute, preserving source order within each
+    // group. Within a group, dedupe by enumerator name: dictionary
+    // files frequently re-state the same `VALUE` line across
+    // successor RFCs (e.g. `Error-Cause Invalid-Attribute-Value 407`
+    // is defined identically in both rfc3576 and rfc5176). The first
+    // occurrence wins; later restatements are silently dropped.
+    let mut order: Vec<&str> = Vec::new();
+    let mut groups: BTreeMap<&str, Vec<&super::Value>> = BTreeMap::new();
+    let mut seen_names: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
+    for v in &dict.values {
+        let key = v.attribute.as_str();
+        if !seen_names.insert((key, v.name.as_str())) {
+            continue;
+        }
+        if !groups.contains_key(key) {
+            order.push(key);
+        }
+        groups.entry(key).or_default().push(v);
+    }
+
+    writeln!(
+        out,
+        "/// Typed enumerators for every attribute in this dictionary group"
+    )
+    .unwrap();
+    writeln!(out, "/// that carries one or more `VALUE` directives.").unwrap();
+    writeln!(out, "///").unwrap();
+    writeln!(
+        out,
+        "/// Each attribute becomes a `#[repr(transparent)]` newtype with one"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "/// associated `pub const` per dictionary enumerator. The universe is"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "/// open — peers may send unknown values, so the type wraps its scalar"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "/// rather than being a closed Rust `enum`. Pattern matching against"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "/// the associated consts works the same way as with `bitflags`-style"
+    )
+    .unwrap();
+    writeln!(out, "/// types.").unwrap();
+    writeln!(
+        out,
+        "#[allow(missing_docs, non_upper_case_globals, unused_imports, clippy::unreadable_literal, clippy::wildcard_imports)]"
+    )
+    .unwrap();
+    writeln!(out, "pub mod values {{").unwrap();
+    writeln!(out, "    use crate::typed::*;").unwrap();
+
+    for attr_name in order {
+        let Some(attr) = attrs_by_name.get(attr_name).copied() else {
+            // Cross-dictionary VALUE — emitted attribute lives in
+            // a different group. The reverse-lookup table still
+            // covers it via `registry::value_name`.
+            continue;
+        };
+        let Some(shape) = value_shape(attr.typ, attr.flags) else {
+            continue;
+        };
+        write_value_newtype(out, &attr.name, &shape, &groups[attr_name]);
+    }
+
+    writeln!(out, "}}").unwrap();
+}
+
+/// Emit one `pub struct Foo(pub T);` newtype + its associated consts +
+/// reverse-lookup + matching [`IntoWire`] impls. Called once per
+/// integer-typed attribute that carries `VALUE` enumerators.
+#[allow(clippy::too_many_lines)]
+fn write_value_newtype(
+    out: &mut String,
+    attr_name: &str,
+    shape: &ValueShape,
+    values: &[&super::Value],
+) {
+    let type_ident = pascal_ident(attr_name);
+    let inner = shape.inner;
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "    /// Typed enumerator for the `{attr_name}` attribute."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]"
+    )
+    .unwrap();
+    writeln!(out, "    #[repr(transparent)]").unwrap();
+    writeln!(out, "    pub struct {type_ident}(pub {inner});").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    impl {type_ident} {{").unwrap();
+    for v in values {
+        let cident = value_const_ident(&v.name);
+        let lit = scalar_literal(inner, v.number);
+        writeln!(
+            out,
+            "        /// `{name}` (= `{n}`).",
+            name = v.name,
+            n = v.number
+        )
+        .unwrap();
+        writeln!(out, "        pub const {cident}: Self = Self({lit});").unwrap();
+    }
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "        /// Underlying scalar (`{inner}`) as written on the wire."
+    )
+    .unwrap();
+    writeln!(out, "        #[must_use]").unwrap();
+    writeln!(
+        out,
+        "        pub const fn {as_fn}(self) -> {inner} {{ self.0 }}",
+        as_fn = shape.as_fn
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "        /// Dictionary name for this value, if it matches a known enumerator."
+    )
+    .unwrap();
+    writeln!(out, "        #[must_use]").unwrap();
+    writeln!(out, "        pub fn name(self) -> Option<&'static str> {{").unwrap();
+    writeln!(out, "            const TABLE: &[({inner}, &str)] = &[").unwrap();
+    for v in values {
+        let lit = scalar_literal(inner, v.number);
+        writeln!(out, "                ({lit}, {name:?}),", name = v.name).unwrap();
+    }
+    writeln!(out, "            ];").unwrap();
+    writeln!(
+        out,
+        "            TABLE.iter().find_map(|(n, s)| (*n == self.0).then_some(*s))"
+    )
+    .unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
+    // IntoWire impls — one for the direct shape, plus a tagged
+    // pair impl when the attribute has `has_tag`.
+    let marker = shape.marker;
+    if shape.tagged {
+        writeln!(out, "    impl IntoWire<{marker}> for (u8, {type_ident}) {{").unwrap();
+        writeln!(out, "        #[inline]").unwrap();
+        writeln!(
+            out,
+            "        fn write_value(self, out: &mut ::std::vec::Vec<u8>) {{"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "            <(u8, {inner}) as IntoWire<{marker}>>::write_value((self.0, self.1.0), out);"
+        )
+        .unwrap();
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(
+            out,
+            "    impl IntoWire<{marker}> for Tagged<{type_ident}> {{"
+        )
+        .unwrap();
+        writeln!(out, "        #[inline]").unwrap();
+        writeln!(
+            out,
+            "        fn write_value(self, out: &mut ::std::vec::Vec<u8>) {{"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "            Tagged {{ tag: self.tag, value: self.value.0 }}.write_value(out);"
+        )
+        .unwrap();
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "    }}").unwrap();
+    } else {
+        writeln!(out, "    impl IntoWire<{marker}> for {type_ident} {{").unwrap();
+        writeln!(out, "        #[inline]").unwrap();
+        writeln!(
+            out,
+            "        fn write_value(self, out: &mut ::std::vec::Vec<u8>) {{"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "            <{inner} as IntoWire<{marker}>>::write_value(self.0, out);"
+        )
+        .unwrap();
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "    }}").unwrap();
+    }
+}
+
+/// Wire-shape descriptor for an attribute that carries `VALUE`
+/// enumerators. Returned by [`value_shape`].
+struct ValueShape {
+    /// Rust scalar literal used as the newtype's inner type.
+    inner: &'static str,
+    /// Codec wire-type marker matching the attribute (`WInteger`, …).
+    marker: &'static str,
+    /// Whether the attribute is [`Flags::has_tag`] (changes the `IntoWire` shape).
+    tagged: bool,
+    /// Conventional `as_*` accessor name for the inner scalar.
+    as_fn: &'static str,
+}
+
+/// Map an attribute's type+flags to a [`ValueShape`] when its wire
+/// form is integer-like. Returns `None` for strings, octets, IP
+/// addresses, etc. — those don't get a typed enumerator newtype.
+fn value_shape(t: Type, flags: Flags) -> Option<ValueShape> {
+    // Encrypted attributes ship cipher-shaped values; a typed
+    // enumerator over their post-decrypt form is the user's job.
+    if flags.encrypt.is_some() {
+        return None;
+    }
+    if flags.has_tag {
+        return match t {
+            Type::Integer | Type::Uint32 | Type::Date => Some(ValueShape {
+                inner: "u32",
+                marker: "WTaggedInteger",
+                tagged: true,
+                as_fn: "as_u32",
+            }),
+            _ => None,
+        };
+    }
+    Some(match t {
+        Type::Byte => ValueShape {
+            inner: "u8",
+            marker: "WByte",
+            tagged: false,
+            as_fn: "as_u8",
+        },
+        Type::Short => ValueShape {
+            inner: "u16",
+            marker: "WShort",
+            tagged: false,
+            as_fn: "as_u16",
+        },
+        Type::Integer | Type::Uint32 | Type::Date => ValueShape {
+            inner: "u32",
+            marker: "WInteger",
+            tagged: false,
+            as_fn: "as_u32",
+        },
+        Type::Integer64 => ValueShape {
+            inner: "u64",
+            marker: "WInteger64",
+            tagged: false,
+            as_fn: "as_u64",
+        },
+        Type::Signed => ValueShape {
+            inner: "i32",
+            marker: "WSigned",
+            tagged: false,
+            as_fn: "as_i32",
+        },
+        _ => return None,
+    })
+}
+
+/// Cast a dictionary `VALUE` number (always parsed as `i64`) to the
+/// concrete Rust scalar literal matching the attribute's wire type.
+/// Truncation / two's-complement reinterpretation follows the same
+/// rules the codec uses on the wire.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn scalar_literal(inner: &str, n: i64) -> String {
+    match inner {
+        "u8" => format!("{}u8", n as u8),
+        "u16" => format!("{}u16", n as u16),
+        "u32" => format!("{}u32", n as u32),
+        "u64" => format!("{}u64", n as u64),
+        "i32" => format!("{}i32", n as i32),
+        _ => format!("{n}"),
+    }
+}
+
+/// Convert a dictionary attribute name (`Tunnel-Type`,
+/// `NAS-Port-Type`, `MS-CHAP2-Response`) into a `PascalCase` Rust
+/// type identifier (`TunnelType`, `NasPortType`, `MsChap2Response`).
+///
+/// Each `-`-delimited segment is title-cased: first ASCII letter
+/// uppercase, remaining ASCII letters lowercased. Digits and
+/// non-ASCII characters pass through. Leading digits are prefixed
+/// with `_` to keep the result a valid identifier.
+fn pascal_ident(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut first = true;
+    for segment in name.split(['-', '.']) {
+        if segment.is_empty() {
+            continue;
+        }
+        let mut chars = segment.chars();
+        if let Some(c) = chars.next() {
+            if first && c.is_ascii_digit() {
+                out.push('_');
+            }
+            first = false;
+            if c.is_ascii_lowercase() {
+                out.push(c.to_ascii_uppercase());
+            } else {
+                out.push(c);
+            }
+        }
+        for c in chars {
+            if c.is_ascii_uppercase() {
+                out.push(c.to_ascii_lowercase());
+            } else {
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// Convert a dictionary `VALUE` name into a `SCREAMING_SNAKE_CASE`
+/// associated-const identifier. Same shape as [`const_ident`] but
+/// also maps `.` to `_` and prefixes a leading digit with `_` so the
+/// result is always a valid Rust identifier.
+fn value_const_ident(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 1);
+    let mut first = true;
+    for ch in name.chars() {
+        if first {
+            if ch.is_ascii_digit() {
+                out.push('_');
+            }
+            first = false;
+        }
+        match ch {
+            '-' | '.' | '/' | ' ' => out.push('_'),
+            c if c.is_ascii_lowercase() => out.push(c.to_ascii_uppercase()),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Convert a dictionary attribute name (`Cisco-AVPair`) into a Rust
@@ -435,6 +818,129 @@ mod tests {
         assert_eq!(super::const_ident("User-Name"), "USER_NAME");
         assert_eq!(super::const_ident("Cisco-AVPair"), "CISCO_AVPAIR");
         assert_eq!(super::const_ident("MS-CHAP2-Response"), "MS_CHAP2_RESPONSE");
+    }
+
+    #[test]
+    fn pascal_ident_pascalizes_names() {
+        assert_eq!(super::pascal_ident("Tunnel-Type"), "TunnelType");
+        assert_eq!(super::pascal_ident("NAS-Port-Type"), "NasPortType");
+        assert_eq!(super::pascal_ident("MS-CHAP2-Response"), "MsChap2Response");
+        assert_eq!(super::pascal_ident("Acct-Status-Type"), "AcctStatusType");
+        // Leading digit gets prefixed so the result is a valid ident.
+        assert_eq!(super::pascal_ident("3GPP-IMSI"), "_3gppImsi");
+    }
+
+    #[test]
+    fn value_const_ident_normalizes_value_names() {
+        assert_eq!(super::value_const_ident("Framed-User"), "FRAMED_USER");
+        assert_eq!(super::value_const_ident("IEEE-802"), "IEEE_802");
+        assert_eq!(super::value_const_ident("IP-in-IP"), "IP_IN_IP");
+        // Leading digit gets prefixed.
+        assert_eq!(super::value_const_ident("3DES"), "_3DES");
+    }
+
+    #[test]
+    fn render_emits_values_module_with_newtypes() {
+        // Two attributes with VALUE enumerators: one tagged
+        // (`Tunnel-Type` → `WTaggedInteger`) and one plain
+        // (`Service-Type` → `WInteger`).
+        let d = Dictionary {
+            vendors: vec![],
+            attributes: vec![
+                Attribute {
+                    name: "Service-Type".into(),
+                    oid: Oid(vec![6]),
+                    vendor: None,
+                    typ: Type::Integer,
+                    flags: Flags::default(),
+                },
+                Attribute {
+                    name: "Tunnel-Type".into(),
+                    oid: Oid(vec![64]),
+                    vendor: None,
+                    typ: Type::Integer,
+                    flags: Flags {
+                        has_tag: true,
+                        ..Flags::default()
+                    },
+                },
+            ],
+            values: vec![
+                Value {
+                    attribute: "Service-Type".into(),
+                    name: "Framed-User".into(),
+                    number: 2,
+                },
+                Value {
+                    attribute: "Tunnel-Type".into(),
+                    name: "VLAN".into(),
+                    number: 13,
+                },
+                Value {
+                    attribute: "Tunnel-Type".into(),
+                    name: "PPTP".into(),
+                    number: 1,
+                },
+            ],
+        };
+        let s = render("test", &d);
+        // Module wrapper present.
+        assert!(s.contains("pub mod values"));
+        // Newtypes for each attribute, PascalCased.
+        assert!(s.contains("pub struct ServiceType(pub u32);"));
+        assert!(s.contains("pub struct TunnelType(pub u32);"));
+        // Associated consts present with the right values.
+        assert!(s.contains("pub const FRAMED_USER: Self = Self(2u32);"));
+        assert!(s.contains("pub const VLAN: Self = Self(13u32);"));
+        assert!(s.contains("pub const PPTP: Self = Self(1u32);"));
+        // Plain integer attribute → IntoWire<WInteger> impl on the newtype.
+        assert!(s.contains("impl IntoWire<WInteger> for ServiceType"));
+        // Tagged attribute → IntoWire<WTaggedInteger> for (u8, NewType).
+        assert!(s.contains("impl IntoWire<WTaggedInteger> for (u8, TunnelType)"));
+        assert!(s.contains("impl IntoWire<WTaggedInteger> for Tagged<TunnelType>"));
+        // Reverse-lookup accessor.
+        assert!(s.contains("pub fn name(self) -> Option<&'static str>"));
+    }
+
+    #[test]
+    fn values_module_skips_non_integer_attributes() {
+        // String attribute with a (rare) VALUE entry — we currently
+        // skip these; the reverse-lookup table still covers them.
+        let d = Dictionary {
+            vendors: vec![],
+            attributes: vec![Attribute {
+                name: "Login-Service".into(),
+                oid: Oid(vec![15]),
+                vendor: None,
+                typ: Type::String,
+                flags: Flags::default(),
+            }],
+            values: vec![Value {
+                attribute: "Login-Service".into(),
+                name: "Telnet".into(),
+                number: 0,
+            }],
+        };
+        let s = render("test", &d);
+        assert!(!s.contains("pub struct LoginService"));
+    }
+
+    #[test]
+    fn values_module_skips_cross_dictionary_values() {
+        // VALUE pointing to an attribute defined in some other
+        // dictionary group. The codegen here can't know the target
+        // type, so the newtype is skipped.
+        let d = Dictionary {
+            vendors: vec![],
+            attributes: vec![],
+            values: vec![Value {
+                attribute: "Unknown-Foreign-Attr".into(),
+                name: "Whatever".into(),
+                number: 1,
+            }],
+        };
+        let s = render("test", &d);
+        assert!(!s.contains("UnknownForeignAttr"));
     }
 
     #[test]
