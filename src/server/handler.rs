@@ -489,6 +489,145 @@ impl<'a> Request<'a> {
     }
 }
 
+/// Test-only helpers for synthesizing [`Request`] values.
+///
+/// Gated behind the `test-util` cargo feature so downstream
+/// consumers can opt in from their `[dev-dependencies]`:
+///
+/// ```toml
+/// [dev-dependencies]
+/// radius-tokio = { version = "…", features = ["test-util"] }
+/// ```
+///
+/// The helpers are also unconditionally available inside this
+/// crate's own `#[cfg(test)]` modules.
+///
+/// # Example
+///
+/// ```ignore
+/// use std::sync::Arc;
+/// use radius_tokio::server::test_support::MockRequest;
+/// use radius_tokio::server::{Client, HandlerResult};
+/// use radius_tokio::Code;
+///
+/// # async fn run<H: radius_tokio::server::Handler>(handler: &H) {
+/// let client = Arc::new(Client::new(b"shared-secret".as_slice()));
+/// // User-Name (1) = "alice"
+/// let attrs: &[u8] = &[1, 7, b'a', b'l', b'i', b'c', b'e'];
+/// let request = MockRequest::new()
+///     .code(Code::ACCESS_REQUEST)
+///     .identifier(7)
+///     .authenticator([0xAB; 16])
+///     .build(attrs, &client);
+///
+/// match handler.handle(request).await {
+///     HandlerResult::Reply(_reply) => { /* assertions */ }
+///     HandlerResult::Drop => panic!("expected reply"),
+/// }
+/// # }
+/// ```
+#[cfg(any(feature = "test-util", test))]
+pub mod test_support {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use super::{Client, Code, Request};
+
+    /// Builder for synthesizing [`Request`] values in handler unit
+    /// tests.
+    ///
+    /// All fields have sensible defaults; override only what the
+    /// test cares about. The attribute bytes and the [`Client`] are
+    /// supplied at [`build`](Self::build) time so the resulting
+    /// [`Request`] can borrow from caller-owned storage.
+    #[derive(Debug, Clone)]
+    pub struct MockRequest {
+        code: Code,
+        identifier: u8,
+        authenticator: [u8; 16],
+        src: SocketAddr,
+        dst: SocketAddr,
+    }
+
+    impl MockRequest {
+        /// Construct a builder with defaults suitable for an
+        /// Access-Request from `127.0.0.1:5000` to the standard
+        /// RADIUS auth port on `127.0.0.1`.
+        #[must_use]
+        pub fn new() -> Self {
+            Self {
+                code: Code::ACCESS_REQUEST,
+                identifier: 0,
+                authenticator: [0; 16],
+                src: SocketAddr::from(([127, 0, 0, 1], 5000)),
+                dst: SocketAddr::from(([127, 0, 0, 1], 1812)),
+            }
+        }
+
+        /// Override the RADIUS code.
+        #[must_use]
+        pub fn code(mut self, code: Code) -> Self {
+            self.code = code;
+            self
+        }
+
+        /// Override the request Identifier.
+        #[must_use]
+        pub fn identifier(mut self, identifier: u8) -> Self {
+            self.identifier = identifier;
+            self
+        }
+
+        /// Override the Request Authenticator. For Access-Request
+        /// this is the 16-byte random nonce the NAS chose; for
+        /// `Accounting` / `CoA` / `Disconnect` it is the
+        /// `MD5(packet || secret)` digest the server would normally
+        /// have verified.
+        #[must_use]
+        pub fn authenticator(mut self, authenticator: [u8; 16]) -> Self {
+            self.authenticator = authenticator;
+            self
+        }
+
+        /// Override the UDP source address.
+        #[must_use]
+        pub fn src(mut self, src: SocketAddr) -> Self {
+            self.src = src;
+            self
+        }
+
+        /// Override the local listener address the request arrived
+        /// on.
+        #[must_use]
+        pub fn dst(mut self, dst: SocketAddr) -> Self {
+            self.dst = dst;
+            self
+        }
+
+        /// Materialize a [`Request`] borrowing from `attributes` and
+        /// `client`. The returned view has the same lifetime
+        /// constraints as one produced by the live server pipeline.
+        #[must_use]
+        pub fn build<'a>(&self, attributes: &'a [u8], client: &'a Arc<Client>) -> Request<'a> {
+            Request::new(
+                self.code,
+                self.identifier,
+                self.authenticator,
+                attributes,
+                client,
+                self.src,
+                self.dst,
+            )
+        }
+    }
+
+    impl Default for MockRequest {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+}
+
 /// Consumer-supplied request handler.
 ///
 /// `Send + Sync + 'static` so the server can hold the handler in an
@@ -793,5 +932,40 @@ mod tests {
         assert_eq!(n, 4);
         assert_eq!(scratch, b"abcd");
         assert_eq!(req.eap_message(), b"abcd");
+    }
+
+    // ── test_support::MockRequest ───────────────────────────────
+
+    #[test]
+    fn mock_request_applies_overrides_and_defaults() {
+        use super::test_support::MockRequest;
+
+        let client = Arc::new(Client::new(b"s".as_slice()));
+        let attrs: &[u8] = &[1, 7, b'a', b'l', b'i', b'c', b'e'];
+        let req = MockRequest::new()
+            .code(Code::ACCOUNTING_REQUEST)
+            .identifier(99)
+            .authenticator([0x5A; 16])
+            .src("10.0.0.1:6000".parse().unwrap())
+            .dst("127.0.0.1:1813".parse().unwrap())
+            .build(attrs, &client);
+
+        assert_eq!(req.code(), Code::ACCOUNTING_REQUEST);
+        assert_eq!(req.identifier(), 99);
+        assert_eq!(req.authenticator(), &[0x5A; 16]);
+        assert_eq!(req.src().port(), 6000);
+        assert_eq!(req.dst().port(), 1813);
+        assert_eq!(req.user_name(), Some(b"alice".as_slice()));
+    }
+
+    #[test]
+    fn mock_request_default_matches_new() {
+        use super::test_support::MockRequest;
+
+        let client = Arc::new(Client::new(b"s".as_slice()));
+        let req = MockRequest::default().build(&[], &client);
+        assert_eq!(req.code(), Code::ACCESS_REQUEST);
+        assert_eq!(req.identifier(), 0);
+        assert_eq!(req.dst().port(), 1812);
     }
 }

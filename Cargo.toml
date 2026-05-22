@@ -37,6 +37,12 @@ radsec = ["aws-lc-sys/ssl", "tokio/io-util"]
 # portable Rust fallback, pure-Rust no_std). On by default.
 # Falls back to `aws-lc-sys`'s MD5 when disabled.
 fast-md5 = ["dep:fast-md5"]
+# Expose test helpers (notably `server::test_support::MockRequest`)
+# for downstream consumers writing unit tests against their
+# `Handler` implementations. Off by default — the helpers have no
+# runtime cost but live behind a feature gate so they don't widen
+# the production surface.
+test-util = []
 # IETF / RFC dictionaries (always recommended; small).
 # These forward the feature flag to the radius-tokio-dict crate.
 dict-rfc = ["radius-tokio-dict/dict-rfc"]

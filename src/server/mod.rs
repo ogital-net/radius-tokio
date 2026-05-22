@@ -19,6 +19,8 @@ pub use accounting::AcctStatusType;
 pub use cache::{CacheConfig, CachedStore};
 pub use client::{Client, ClientId, SecretBytes};
 pub use coa::{CoaConfig, CoaError, CoaOriginator, CoaOutcome};
+#[cfg(any(feature = "test-util", test))]
+pub use handler::test_support;
 pub use handler::{Handler, HandlerError, HandlerResult, Request};
 pub use runtime::{Server, ServerBuilder, ShutdownHandle};
 pub use status::{
