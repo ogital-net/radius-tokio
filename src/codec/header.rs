@@ -348,4 +348,53 @@ mod tests {
         // No special equality with any named constant.
         assert_ne!(h.code, Code::ACCESS_REQUEST);
     }
+
+    #[test]
+    fn code_name_covers_every_known_constant() {
+        let table: &[(Code, &str)] = &[
+            (Code::ACCESS_REQUEST, "Access-Request"),
+            (Code::ACCESS_ACCEPT, "Access-Accept"),
+            (Code::ACCESS_REJECT, "Access-Reject"),
+            (Code::ACCOUNTING_REQUEST, "Accounting-Request"),
+            (Code::ACCOUNTING_RESPONSE, "Accounting-Response"),
+            (Code::ACCESS_CHALLENGE, "Access-Challenge"),
+            (Code::STATUS_SERVER, "Status-Server"),
+            (Code::STATUS_CLIENT, "Status-Client"),
+            (Code::DISCONNECT_REQUEST, "Disconnect-Request"),
+            (Code::DISCONNECT_ACK, "Disconnect-ACK"),
+            (Code::DISCONNECT_NAK, "Disconnect-NAK"),
+            (Code::COA_REQUEST, "CoA-Request"),
+            (Code::COA_ACK, "CoA-ACK"),
+            (Code::COA_NAK, "CoA-NAK"),
+        ];
+        for (code, want) in table {
+            assert_eq!(code.name(), *want, "name({}) wrong", code.0);
+            // Display routes through name() for known codes.
+            assert_eq!(format!("{code}"), *want);
+        }
+    }
+
+    #[test]
+    fn code_name_and_display_for_unknown() {
+        let c = Code(0xfe);
+        assert_eq!(c.name(), "Unknown");
+        // Display falls back to the decimal byte for unknown codes.
+        assert_eq!(format!("{c}"), "Code(254)");
+    }
+
+    #[test]
+    fn header_error_display_covers_every_variant() {
+        let s = HeaderError::TooShort { got: 5 }.to_string();
+        assert!(s.contains("got 5"), "got: {s}");
+        let s = HeaderError::LengthUnderflow { length: 12 }.to_string();
+        assert!(s.contains("12"), "got: {s}");
+        let s = HeaderError::LengthOverflow { length: 5000 }.to_string();
+        assert!(s.contains("5000"), "got: {s}");
+        let s = HeaderError::LengthExceedsBuffer {
+            length: 100,
+            got: 30,
+        }
+        .to_string();
+        assert!(s.contains("100") && s.contains("30"), "got: {s}");
+    }
 }

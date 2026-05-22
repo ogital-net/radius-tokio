@@ -1318,7 +1318,18 @@ impl TlsContext {
         }
         let r = unsafe { SSL_CTX_use_PrivateKey(ctx.0.as_ptr(), key.0.as_ptr()) };
         if r != 1 {
-            return Err(TlsError::Ssl(pop_err("SSL_CTX_use_PrivateKey")));
+            // aws-lc surfaces a cert/key mismatch as
+            // `X509_R_KEY_VALUES_MISMATCH` from `SSL_CTX_use_PrivateKey`
+            // itself, before our explicit `SSL_CTX_check_private_key`
+            // call below ever runs. Map that specific case to the
+            // typed [`TlsError::KeyMismatch`] variant so consumers
+            // can distinguish operator-configuration errors from
+            // generic libssl failures.
+            let msg = pop_err("SSL_CTX_use_PrivateKey");
+            if msg.contains("KEY_VALUES_MISMATCH") {
+                return Err(TlsError::KeyMismatch);
+            }
+            return Err(TlsError::Ssl(msg));
         }
         // SAFETY: ctx valid; checks the most recently installed
         // cert against the most recently installed key.
@@ -1754,6 +1765,15 @@ impl TlsConnection {
         if out.is_empty() {
             return Ok(0);
         }
+        // Pre-handshake `SSL_read` returns `SSL_ERROR_SSL` with
+        // reason `UNINITIALIZED`, which would otherwise surface
+        // as `TlsError::Io` and be mistaken for a fatal record
+        // layer error. Treat it as "no plaintext available yet":
+        // the caller is expected to pump `process()` until the
+        // handshake completes.
+        if !self.handshake_done {
+            return Ok(0);
+        }
         // SAFETY: ssl valid; SSL_read pulls from rbio.
         let n = unsafe {
             SSL_read(
@@ -1786,6 +1806,16 @@ impl TlsConnection {
     /// layer error.
     pub fn write(&mut self, bytes: &[u8]) -> Result<usize, TlsError> {
         if bytes.is_empty() {
+            return Ok(0);
+        }
+        // Refuse plaintext writes before the handshake completes.
+        // Returning `Ok(0)` matches the WANT_READ / WANT_WRITE
+        // back-pressure contract and prevents callers from
+        // accidentally smuggling cleartext into the output BIO
+        // (libssl would emit a `SSL_ERROR_SSL / UNINITIALIZED`
+        // here, which our caller surface would otherwise classify
+        // as a fatal I/O error).
+        if !self.handshake_done {
             return Ok(0);
         }
         // SAFETY: ssl valid.

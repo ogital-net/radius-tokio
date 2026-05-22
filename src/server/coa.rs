@@ -543,3 +543,86 @@ fn validate_and_classify(
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn config_default_values() {
+        let cfg = CoaConfig::default();
+        assert_eq!(cfg.initial_timeout, Duration::from_secs(1));
+        assert_eq!(cfg.max_retries, 2);
+        assert_eq!(cfg.backoff_multiplier, 2);
+        assert_eq!(cfg.max_in_flight_per_target, 16);
+    }
+
+    #[test]
+    fn error_display_covers_every_variant() {
+        let cases: &[(CoaError, &str)] = &[
+            (CoaError::Timeout, "no reply within retry budget"),
+            (
+                CoaError::InFlightLimit,
+                "per-target in-flight limit reached",
+            ),
+            (
+                CoaError::IdentifierExhausted,
+                "every RADIUS Identifier value is in flight to this target",
+            ),
+            (
+                CoaError::AuthenticatorMismatch,
+                "reply Response Authenticator failed",
+            ),
+            (
+                CoaError::MessageAuthenticatorInvalid,
+                "reply Message-Authenticator missing or invalid",
+            ),
+            (
+                CoaError::Cancelled,
+                "originator dropped before reply arrived",
+            ),
+        ];
+        for (err, want) in cases {
+            assert_eq!(err.to_string(), *want);
+        }
+        assert_eq!(
+            CoaError::UnexpectedReplyCode(Code::ACCESS_REJECT).to_string(),
+            "unexpected reply code 3",
+        );
+        let io_err = io::Error::other("boom");
+        assert!(CoaError::Io(io_err).to_string().starts_with("i/o: "));
+        let codec_err = CodecError::WrongPacketType;
+        assert!(CoaError::Codec(codec_err)
+            .to_string()
+            .starts_with("codec: "));
+    }
+
+    #[test]
+    fn error_from_io_and_codec_round_trip() {
+        let io_err = io::Error::new(io::ErrorKind::ConnectionReset, "x");
+        let wrapped: CoaError = io_err.into();
+        assert!(matches!(wrapped, CoaError::Io(_)));
+        assert!(wrapped.source().is_some());
+
+        let codec_err = CodecError::WrongPacketType;
+        let wrapped: CoaError = codec_err.into();
+        assert!(matches!(wrapped, CoaError::Codec(_)));
+        assert!(wrapped.source().is_some());
+    }
+
+    #[test]
+    fn error_source_returns_none_for_terminal_variants() {
+        for err in [
+            CoaError::Timeout,
+            CoaError::InFlightLimit,
+            CoaError::IdentifierExhausted,
+            CoaError::AuthenticatorMismatch,
+            CoaError::MessageAuthenticatorInvalid,
+            CoaError::Cancelled,
+            CoaError::UnexpectedReplyCode(Code(0)),
+        ] {
+            assert!(err.source().is_none(), "{err:?} should have no source");
+        }
+    }
+}

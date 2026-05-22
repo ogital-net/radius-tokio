@@ -377,6 +377,17 @@ mod tests {
     }
 
     #[test]
+    fn error_display_and_debug_cover_every_variant() {
+        let e = Error::InvalidLength;
+        assert_eq!(e.to_string(), "invalid ciphertext length");
+        // Round-trip Debug and PartialEq so all derive-generated
+        // arms participate in coverage.
+        assert_eq!(format!("{e:?}"), "InvalidLength");
+        let err_dyn: &dyn std::error::Error = &e;
+        assert!(err_dyn.source().is_none());
+    }
+
+    #[test]
     fn tunnel_password_decrypt_bad_length() {
         let auth = [0u8; 16];
         let salt = [0x80, 0x00];

@@ -68,4 +68,27 @@ mod tests {
     fn fill_empty_is_noop() {
         fill(&mut []);
     }
+
+    #[test]
+    fn fill_secure_populates_buffer() {
+        let mut buf = [0u8; 32];
+        fill_secure(&mut buf);
+        // 32 zero bytes from a CSPRNG would be astronomically
+        // unlikely; treat that as a signal the call was a no-op.
+        assert_ne!(buf, [0u8; 32]);
+    }
+
+    #[test]
+    fn fill_secure_empty_is_noop() {
+        fill_secure(&mut []);
+    }
+
+    #[test]
+    fn fill_secure_independent_calls_differ() {
+        let mut a = [0u8; 16];
+        let mut b = [0u8; 16];
+        fill_secure(&mut a);
+        fill_secure(&mut b);
+        assert_ne!(a, b);
+    }
 }

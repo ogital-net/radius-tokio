@@ -742,13 +742,26 @@ mod tests {
             .unwrap()
             .unwrap();
 
+        // Wait deterministically for both expected events before
+        // shutting the server down. The reply datagram is observed
+        // by the client *before* the `reply_sent` event is emitted
+        // (the span exits after `send_to` returns), so a naive
+        // "recv then shutdown" race can drop the trailing event.
+        let saw_both = sink
+            .wait_for(Duration::from_secs(1), |evs| {
+                let names: Vec<&str> = evs.iter().map(|(_, n)| n.as_str()).collect();
+                names.contains(&"request") && names.contains(&"reply_sent")
+            })
+            .await;
+
         tx.send(true).unwrap();
         server.await.unwrap().unwrap();
 
-        let captured = sink.snapshot();
-        let names: Vec<&str> = captured.iter().map(|(_, n)| n.as_str()).collect();
-        assert!(names.contains(&"request"), "captured: {names:?}");
-        assert!(names.contains(&"reply_sent"), "captured: {names:?}");
+        assert!(
+            saw_both,
+            "expected request + reply_sent events, got {:?}",
+            sink.snapshot(),
+        );
     }
 
     #[cfg(feature = "tracing")]

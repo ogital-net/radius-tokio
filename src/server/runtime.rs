@@ -564,4 +564,42 @@ mod tests {
         let res = Server::<StaticClients, AcceptAll>::builder().build();
         assert!(res.is_err());
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_without_any_listener_errors() {
+        let client = Arc::new(Client::new(b"x".as_slice()));
+        let store = StaticClients::builder()
+            .add(IpCidr::host(Ipv4Addr::LOCALHOST.into()), client)
+            .build();
+        let server = Server::builder()
+            .clients(store)
+            .handler(AcceptAll)
+            // No listen_udp / listen_radsec calls.
+            .build()
+            .unwrap();
+        let err = server.run().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn builder_dedup_ttl_overrides_default() {
+        // dedup_ttl is a chained setter; smoke-test the chain
+        // (verifies the method body actually returns Self).
+        let client = Arc::new(Client::new(b"x".as_slice()));
+        let store = StaticClients::builder()
+            .add(IpCidr::host(Ipv4Addr::LOCALHOST.into()), client)
+            .build();
+        let server = Server::builder()
+            .clients(store)
+            .handler(AcceptAll)
+            .dedup_ttl(Duration::from_millis(250))
+            .listen_udp("127.0.0.1:0".parse().unwrap())
+            .build()
+            .unwrap();
+        let shutdown = server.shutdown_handle();
+        let task = tokio::spawn(server.run());
+        tokio::task::yield_now().await;
+        shutdown.shutdown();
+        task.await.unwrap().unwrap();
+    }
 }

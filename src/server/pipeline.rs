@@ -352,6 +352,60 @@ mod tests {
     }
 
     #[test]
+    fn validate_reports_malformed_header_for_short_packet() {
+        let client = Client::new(b"shared".as_slice());
+        // 3 bytes — well below the 20-byte header floor.
+        match validate(&[1u8, 2, 3], &client) {
+            Validated::MalformedHeader(_) => {}
+            _ => panic!("expected MalformedHeader verdict"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn dispatched_bytes_reflects_variant() {
+        let buf_a = PacketBuffer::new(Code::ACCESS_ACCEPT, 7);
+        let buf_b = PacketBuffer::new(Code::ACCESS_ACCEPT, 7);
+        let buf_a_bytes = buf_a.as_bytes().to_vec();
+        let buf_b_bytes = buf_b.as_bytes().to_vec();
+        let bytes_arc: Arc<[u8]> = Arc::from(vec![0xaa, 0xbb].into_boxed_slice());
+        let replay = Dispatched::Replay {
+            bytes: Arc::clone(&bytes_arc),
+            code: Code::ACCESS_ACCEPT,
+            identifier: 7,
+        };
+        assert_eq!(replay.bytes(), Some(&bytes_arc[..]));
+
+        let reply = Dispatched::Reply {
+            sealed: buf_a,
+            code: Code::ACCESS_ACCEPT,
+            identifier: 7,
+        };
+        assert_eq!(reply.bytes(), Some(buf_a_bytes.as_slice()));
+
+        let status_reply = Dispatched::StatusServerReply {
+            sealed: buf_b,
+            identifier: 7,
+            role: ListenerRole::Auth,
+        };
+        assert_eq!(status_reply.bytes(), Some(buf_b_bytes.as_slice()));
+
+        // The three drop variants all yield None.
+        assert!(Dispatched::HandlerDrop {
+            code: Code::ACCESS_REQUEST,
+            identifier: 7,
+        }
+        .bytes()
+        .is_none());
+        assert!(Dispatched::StatusServerDisabledPerClient { identifier: 7 }
+            .bytes()
+            .is_none());
+        assert!(Dispatched::StatusServerDisabled { identifier: 7 }
+            .bytes()
+            .is_none());
+    }
+
+    #[test]
     fn verify_request_authenticator_is_noop_for_access_request() {
         // Access-Request has a random auth that can't be checked
         // in isolation; the helper must return `true` regardless of

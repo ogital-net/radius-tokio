@@ -633,4 +633,164 @@ mod tests {
             Err(crate::CodecError::WrongPacketType),
         );
     }
+
+    // ── HandlerError plumbing ───────────────────────────────────
+
+    #[test]
+    fn handler_error_from_string_and_str() {
+        let e: HandlerError = String::from("owned").into();
+        assert!(matches!(e, HandlerError::Application(s) if s == "owned"));
+        let e: HandlerError = "borrowed".into();
+        assert!(matches!(e, HandlerError::Application(s) if s == "borrowed"));
+    }
+
+    #[test]
+    fn handler_error_from_codec_preserves_source() {
+        use std::error::Error as _;
+        let codec_err = crate::CodecError::WrongPacketType;
+        let e: HandlerError = codec_err.into();
+        assert!(matches!(e, HandlerError::Codec(_)));
+        assert!(e.source().is_some());
+        assert!(e.to_string().starts_with("codec: "));
+    }
+
+    #[test]
+    fn handler_error_application_has_no_source() {
+        use std::error::Error as _;
+        let e = HandlerError::Application("boom".into());
+        assert!(e.source().is_none());
+        assert_eq!(e.to_string(), "application: boom");
+    }
+
+    // ── Request accessor smoke tests ────────────────────────────
+
+    fn make_request_with<'a>(client: &'a Arc<Client>, attrs: &'a [u8]) -> Request<'a> {
+        Request::new(
+            Code::ACCESS_REQUEST,
+            7,
+            [0xAB; 16],
+            attrs,
+            client,
+            "10.0.0.1:5000".parse().unwrap(),
+            "127.0.0.1:1812".parse().unwrap(),
+        )
+    }
+
+    #[test]
+    fn request_exposes_addresses_and_raw_bytes() {
+        let client = Arc::new(Client::new(b"s".as_slice()));
+        let attrs: &[u8] = &[1, 4, b'x', b'y'];
+        let req = make_request_with(&client, attrs);
+        assert_eq!(req.code(), Code::ACCESS_REQUEST);
+        assert_eq!(req.identifier(), 7);
+        assert_eq!(req.authenticator()[0], 0xAB);
+        assert_eq!(req.src().port(), 5000);
+        assert_eq!(req.dst().port(), 1812);
+        assert_eq!(req.raw_attributes(), attrs);
+        // attributes_iter walks the same bytes.
+        let count = req.attributes_iter().flatten().count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn reply_with_capacity_carries_identifier() {
+        let client = Arc::new(Client::new(b"s".as_slice()));
+        let req = make_request_with(&client, &[]);
+        let reply = req.reply_with_capacity(Code::ACCESS_ACCEPT, 64);
+        let sealed = reply.seal_for(req.authenticator(), client.secret());
+        assert_eq!(sealed.header().identifier, 7);
+    }
+
+    #[test]
+    fn state_returns_value_when_present() {
+        let client = Arc::new(Client::new(b"s".as_slice()));
+        // State (24) = 0xCAFE
+        let attrs: &[u8] = &[24, 4, 0xCA, 0xFE];
+        let req = make_request_with(&client, attrs);
+        assert_eq!(req.state(), Some(&[0xCA, 0xFE][..]));
+    }
+
+    #[test]
+    fn state_returns_none_when_absent() {
+        let client = Arc::new(Client::new(b"s".as_slice()));
+        let req = make_request_with(&client, &[1, 4, b'a', b'b']);
+        assert!(req.state().is_none());
+    }
+
+    #[test]
+    fn contains_raw_short_circuits_on_match() {
+        let client = Arc::new(Client::new(b"s".as_slice()));
+        let attrs: &[u8] = &[1, 4, b'x', b'y', 5, 6, 0, 0, 0, 3];
+        let req = make_request_with(&client, attrs);
+        assert!(req.contains_raw(1));
+        assert!(req.contains_raw(5));
+        assert!(!req.contains_raw(99));
+    }
+
+    #[test]
+    fn contains_raw_returns_false_on_malformed_prefix() {
+        let client = Arc::new(Client::new(b"s".as_slice()));
+        // Length byte (0) is invalid (< 2), so the iterator surfaces
+        // a parse error before reaching any well-formed slot.
+        let attrs: &[u8] = &[1, 0, 5, 6, 0, 0, 0, 3];
+        let req = make_request_with(&client, attrs);
+        assert!(!req.contains_raw(5));
+    }
+
+    #[test]
+    fn typed_contains_matches_dict_handles() {
+        use crate::dict::rfc::attrs;
+        let client = Arc::new(Client::new(b"s".as_slice()));
+        // User-Name (1) = "u", User-Password (2) wouldn't decode but
+        // contains() is a presence check that ignores the value.
+        let attrs_bytes: &[u8] = &[1, 3, b'u'];
+        let req = make_request_with(&client, attrs_bytes);
+        assert!(req.contains(attrs::USER_NAME));
+        assert!(!req.contains(attrs::USER_PASSWORD));
+    }
+
+    #[test]
+    fn contains_vsa_finds_vendor_attribute() {
+        use crate::dict::cisco::attrs as cisco;
+        let client = Arc::new(Client::new(b"s".as_slice()));
+        // Cisco VSA wrapper: type 26, vendor-id 9, sub-attr 1
+        // (Cisco-AVPair), value "ip:vrf=red".
+        let val: &[u8] = b"ip:vrf=red";
+        let sub_len = u8::try_from(2 + val.len()).unwrap();
+        let total_len = u8::try_from(6 + 2 + val.len()).unwrap();
+        let mut attrs_bytes = vec![26u8, total_len, 0, 0, 0, 9, 1, sub_len];
+        attrs_bytes.extend_from_slice(val);
+        let req = make_request_with(&client, &attrs_bytes);
+        assert!(req.contains_vsa(cisco::CISCO_AVPAIR));
+    }
+
+    #[test]
+    fn acct_status_type_decodes_start() {
+        use crate::server::accounting::AcctStatusType;
+        let client = Arc::new(Client::new(b"s".as_slice()));
+        // Acct-Status-Type (40) = 1 (Start).
+        let attrs: &[u8] = &[40, 6, 0, 0, 0, 1];
+        let req = make_request_with(&client, attrs);
+        assert_eq!(req.acct_status_type(), Some(AcctStatusType::Start));
+    }
+
+    #[test]
+    fn acct_status_type_absent_returns_none() {
+        let client = Arc::new(Client::new(b"s".as_slice()));
+        let req = make_request_with(&client, &[1, 3, b'u']);
+        assert_eq!(req.acct_status_type(), None);
+    }
+
+    #[test]
+    fn eap_message_reassembles_fragments() {
+        let client = Arc::new(Client::new(b"s".as_slice()));
+        // Two EAP-Message (79) attributes carrying "ab" and "cd".
+        let attrs: &[u8] = &[79, 4, b'a', b'b', 79, 4, b'c', b'd'];
+        let req = make_request_with(&client, attrs);
+        let mut scratch = Vec::with_capacity(8);
+        let n = req.eap_message_into(&mut scratch);
+        assert_eq!(n, 4);
+        assert_eq!(scratch, b"abcd");
+        assert_eq!(req.eap_message(), b"abcd");
+    }
 }

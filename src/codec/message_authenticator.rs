@@ -313,6 +313,59 @@ mod tests {
     }
 
     #[test]
+    fn find_offset_returns_none_for_short_packet() {
+        // Below the 20-byte header floor — both walkers must bail.
+        assert_eq!(find_value_offset(&[1u8, 2, 3]), None);
+        assert_eq!(count_value_offsets(&[1u8, 2, 3]), 0);
+    }
+
+    #[test]
+    fn find_offset_returns_none_for_one_byte_attribute_tail() {
+        // 20-byte header + a single dangling byte (no room for a
+        // TLV header). `find` returns None, `count` short-circuits.
+        let mut pkt = vec![0u8; MIN_PACKET_LEN];
+        pkt.push(80); // looks like a type byte, but no length follows
+        assert_eq!(find_value_offset(&pkt), None);
+        assert_eq!(count_value_offsets(&pkt), 0);
+    }
+
+    #[test]
+    fn find_offset_returns_none_for_attribute_with_bogus_length() {
+        // 20-byte header + (type=80, len=1) — len < 2 is malformed.
+        let mut pkt = vec![0u8; MIN_PACKET_LEN];
+        pkt.extend_from_slice(&[TYPE, 1, 0xaa]);
+        assert_eq!(find_value_offset(&pkt), None);
+        assert_eq!(count_value_offsets(&pkt), 0);
+        // And a length that overruns the remaining bytes.
+        let mut pkt2 = vec![0u8; MIN_PACKET_LEN];
+        pkt2.extend_from_slice(&[TYPE, 99]);
+        assert_eq!(find_value_offset(&pkt2), None);
+        assert_eq!(count_value_offsets(&pkt2), 0);
+    }
+
+    #[test]
+    fn compute_tolerates_malformed_attribute_tail() {
+        // `compute` must never panic on a malformed trailing
+        // attribute — it folds the leftover bytes into the HMAC and
+        // breaks out of the loop. We don't assert the resulting
+        // tag (it's not security-meaningful for malformed input),
+        // only that the function returns a value of the right shape.
+        let mut pkt = vec![0u8; MIN_PACKET_LEN];
+        pkt[0] = 1; // Access-Request code
+        pkt.push(80); // single dangling byte (rest.len() < 2)
+        let tag = compute(&pkt, &[0u8; 16], b"secret");
+        assert_eq!(tag.len(), VALUE_LEN);
+
+        // Same shape, but a length byte that claims more than
+        // remains in the buffer — exercises the second short-circuit.
+        let mut pkt2 = vec![0u8; MIN_PACKET_LEN];
+        pkt2[0] = 1;
+        pkt2.extend_from_slice(&[80, 0xff]);
+        let tag2 = compute(&pkt2, &[0u8; 16], b"secret");
+        assert_eq!(tag2.len(), VALUE_LEN);
+    }
+
+    #[test]
     fn verify_rejects_duplicate_message_authenticator() {
         let secret = b"shared";
         let req_auth = [0x55; 16];

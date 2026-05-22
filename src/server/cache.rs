@@ -398,6 +398,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clear_drops_resolved_entries_only() {
+        let client = Arc::new(Client::new(b"x".as_slice()));
+        let inner = CountingStore::new(Some(Arc::clone(&client)));
+        let cache = CachedStore::with_defaults(inner);
+
+        // Resolve two entries; both end up in `Resolved` state.
+        cache.lookup_udp(addr("10.0.0.1")).await;
+        cache.lookup_udp(addr("10.0.0.2")).await;
+        assert_eq!(cache.inner().calls(), 2);
+
+        // `clear` evicts both resolved entries — next lookups must
+        // hit the backend again.
+        cache.clear();
+        cache.lookup_udp(addr("10.0.0.1")).await;
+        cache.lookup_udp(addr("10.0.0.2")).await;
+        assert_eq!(cache.inner().calls(), 4);
+    }
+
+    #[tokio::test]
+    async fn invalidate_is_noop_for_unknown_addr() {
+        // Invalidating an addr we've never seen must not panic and
+        // must not poison the cache for subsequent lookups.
+        let client = Arc::new(Client::new(b"x".as_slice()));
+        let inner = CountingStore::new(Some(Arc::clone(&client)));
+        let cache = CachedStore::with_defaults(inner);
+        cache.invalidate(IpAddr::V4("10.99.99.99".parse().unwrap()));
+        assert!(cache.lookup_udp(addr("10.0.0.1")).await.is_some());
+        assert_eq!(cache.inner().calls(), 1);
+    }
+
+    #[tokio::test]
     async fn returned_future_is_send() {
         // Compile-time check that the future implements Send so the
         // server's spawn loop can park it across worker tasks.

@@ -463,3 +463,293 @@ fn export_keying_material_before_handshake_is_error() {
         .expect_err("must reject pre-handshake export");
     assert!(matches!(err, TlsError::Handshake(_)), "got {err:?}");
 }
+
+// =====================================================================
+// Defensive-input tests
+// ---------------------------------------------------------------------
+// The wrapper is the only place in the crate that hands bytes from
+// the network to libssl. Every public entry point that takes
+// untrusted input must:
+//
+//   * refuse the input cleanly with a typed `TlsError`,
+//   * never panic, never abort, never UB,
+//   * never advance the state machine into an inconsistent state.
+//
+// These tests intentionally feed garbage, truncated, oversized, and
+// out-of-order bytes through `TlsContext` / `TlsConnection` and
+// assert the wrapper survives.
+// =====================================================================
+
+#[test]
+fn server_ctx_rejects_garbage_cert_pem() {
+    let pki = build_pki();
+    let err = TlsContext::server(b"not a pem", &pki.server_key_pem, &pki.ca_pem)
+        .expect_err("garbage cert must be rejected");
+    assert!(matches!(err, TlsError::Pem("certificate")), "got {err:?}");
+}
+
+#[test]
+fn server_ctx_rejects_garbage_key_pem() {
+    let pki = build_pki();
+    let err = TlsContext::server(&pki.server_chain_pem, b"not a key", &pki.ca_pem)
+        .expect_err("garbage key must be rejected");
+    assert!(matches!(err, TlsError::Pem("private key")), "got {err:?}");
+}
+
+#[test]
+fn server_ctx_rejects_garbage_ca_pem() {
+    let pki = build_pki();
+    let err = TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, b"not a ca")
+        .expect_err("garbage CA must be rejected");
+    // Empty / unparseable CA bundle surfaces as a Pem error from
+    // `install_client_cas`.
+    assert!(
+        matches!(err, TlsError::Pem(_) | TlsError::Ssl(_)),
+        "got {err:?}",
+    );
+}
+
+#[test]
+fn server_ctx_rejects_mismatched_key() {
+    // Build two independent PKIs; pair the server cert from one
+    // with the server key from the other. `SSL_CTX_check_private_key`
+    // must refuse the combination.
+    let a = build_pki();
+    let b = build_pki();
+    let err = TlsContext::server(&a.server_chain_pem, &b.server_key_pem, &a.ca_pem)
+        .expect_err("mismatched key must be rejected");
+    assert!(matches!(err, TlsError::KeyMismatch), "got {err:?}");
+}
+
+#[test]
+fn server_ctx_rejects_empty_inputs() {
+    let pki = build_pki();
+    // Empty cert.
+    assert!(matches!(
+        TlsContext::server(b"", &pki.server_key_pem, &pki.ca_pem)
+            .expect_err("empty cert must be rejected"),
+        TlsError::Pem(_),
+    ));
+    // Empty key.
+    assert!(matches!(
+        TlsContext::server(&pki.server_chain_pem, b"", &pki.ca_pem)
+            .expect_err("empty key must be rejected"),
+        TlsError::Pem(_),
+    ));
+    // Empty CA bundle.
+    assert!(matches!(
+        TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, b"")
+            .expect_err("empty CA must be rejected"),
+        TlsError::Pem(_) | TlsError::Ssl(_),
+    ));
+}
+
+#[test]
+fn feed_input_with_empty_buffer_is_noop() {
+    let pki = build_pki();
+    let ctx =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
+    let mut conn = TlsConnection::accept(&ctx).unwrap();
+    assert_eq!(conn.feed_input(&[]).unwrap(), 0);
+}
+
+#[test]
+fn take_output_with_empty_buffer_is_noop() {
+    let pki = build_pki();
+    let ctx =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
+    let mut conn = TlsConnection::accept(&ctx).unwrap();
+    let mut empty: [u8; 0] = [];
+    assert_eq!(conn.take_output(&mut empty).unwrap(), 0);
+}
+
+#[test]
+fn pending_output_is_empty_before_handshake() {
+    let pki = build_pki();
+    let ctx =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
+    let mut conn = TlsConnection::accept(&ctx).unwrap();
+    assert!(conn.pending_output().is_empty());
+}
+
+#[test]
+fn read_before_handshake_does_not_panic() {
+    // SSL_read on a fresh server with no pending plaintext must
+    // return `Ok(0)` (mapped from WANT_READ), not panic and not
+    // surface a spurious I/O error.
+    let pki = build_pki();
+    let ctx =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
+    let mut conn = TlsConnection::accept(&ctx).unwrap();
+    let mut buf = [0u8; 64];
+    assert_eq!(conn.read(&mut buf).unwrap(), 0);
+    // Empty plaintext buffer is also a no-op.
+    let mut empty: [u8; 0] = [];
+    assert_eq!(conn.read(&mut empty).unwrap(), 0);
+}
+
+#[test]
+fn write_before_handshake_does_not_panic() {
+    let pki = build_pki();
+    let ctx =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
+    let mut conn = TlsConnection::accept(&ctx).unwrap();
+    // Pre-handshake plaintext write returns 0 (WANT_READ) rather
+    // than smuggling cleartext onto the wire.
+    let n = conn.write(b"PAYLOAD").unwrap();
+    assert_eq!(n, 0);
+    // Empty plaintext is a no-op.
+    assert_eq!(conn.write(b"").unwrap(), 0);
+}
+
+#[test]
+fn peer_certificate_is_none_before_handshake() {
+    let pki = build_pki();
+    let ctx = TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, &pki.ca_pem).unwrap();
+    let conn = TlsConnection::accept(&ctx).unwrap();
+    assert!(conn.peer_certificate().is_none());
+}
+
+#[test]
+fn is_tls13_is_false_before_handshake() {
+    let pki = build_pki();
+    let ctx =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
+    let conn = TlsConnection::accept(&ctx).unwrap();
+    // Pre-negotiation `SSL_version` reports the placeholder, which
+    // must compare *below* the TLS 1.3 constant.
+    assert!(!conn.is_tls13());
+}
+
+#[test]
+fn request_key_update_noop_before_tls13() {
+    // Pre-handshake the negotiated version is unknown; the helper
+    // must safely return `Ok(false)` rather than poke libssl.
+    let pki = build_pki();
+    let ctx =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
+    let mut conn = TlsConnection::accept(&ctx).unwrap();
+    assert!(!conn.request_key_update().unwrap());
+}
+
+#[test]
+fn shutdown_before_handshake_is_safe() {
+    // Calling shutdown on a brand-new connection must not panic
+    // and must return a boolean (the exact value is libssl-defined
+    // and not part of our contract).
+    let pki = build_pki();
+    let ctx =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
+    let mut conn = TlsConnection::accept(&ctx).unwrap();
+    let _ = conn.shutdown();
+}
+
+#[test]
+fn consume_output_is_safe_when_buffer_is_empty() {
+    let pki = build_pki();
+    let ctx =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
+    let mut conn = TlsConnection::accept(&ctx).unwrap();
+    // No queued ciphertext yet; reset must still succeed.
+    conn.consume_output().expect("BIO_reset on empty BIO");
+    // Idempotent.
+    conn.consume_output().expect("second BIO_reset");
+}
+
+#[test]
+fn process_rejects_non_tls_traffic_cleanly() {
+    // A non-TLS payload (e.g. an HTTP/1.1 request mistakenly
+    // pointed at the RadSec listener) must terminate the handshake
+    // with `TlsError::Handshake`, not propagate as an I/O error or
+    // crash.
+    let pki = build_pki();
+    let ctx =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
+    let mut conn = TlsConnection::accept(&ctx).unwrap();
+    conn.feed_input(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    // Pump the state machine until it either fails or returns
+    // NeedsRead; never let it spin indefinitely.
+    let mut failed = false;
+    for _ in 0..8 {
+        match conn.process() {
+            Ok(HandshakeState::NeedsRead | HandshakeState::NeedsWrite) => {
+                // Keep pumping; libssl may demand multiple ticks
+                // before it surfaces the protocol error.
+            }
+            Ok(HandshakeState::Established) => {
+                panic!("non-TLS bytes must not yield Established");
+            }
+            Err(TlsError::Handshake(_)) => {
+                failed = true;
+                break;
+            }
+            Err(other) => panic!("expected Handshake error, got {other:?}"),
+        }
+    }
+    assert!(failed, "process() must reject non-TLS traffic");
+    assert!(conn.is_handshaking());
+}
+
+#[test]
+fn process_handles_truncated_record_header_as_want_read() {
+    // Feeding a single byte (way short of even the 5-byte TLS
+    // record header) must leave the state machine in WantRead, not
+    // crash and not error.
+    let pki = build_pki();
+    let ctx =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
+    let mut conn = TlsConnection::accept(&ctx).unwrap();
+    conn.feed_input(&[0x16]).unwrap();
+    match conn
+        .process()
+        .expect("process must not error on partial record")
+    {
+        HandshakeState::NeedsRead | HandshakeState::NeedsWrite => {}
+        HandshakeState::Established => panic!("must not establish on partial input"),
+    }
+}
+
+#[test]
+fn process_handles_zero_length_record_as_want_read() {
+    // A TLS 1.2 record header claiming length 0 is well-formed
+    // but carries no payload — must not crash and must not be
+    // mistaken for a real handshake message.
+    let pki = build_pki();
+    let ctx =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
+    let mut conn = TlsConnection::accept(&ctx).unwrap();
+    // type=handshake(22), version=0x0303, length=0x0000
+    conn.feed_input(&[0x16, 0x03, 0x03, 0x00, 0x00]).unwrap();
+    // Whatever the SSL state machine decides (WantRead or
+    // Handshake error), the call must return without panicking.
+    let _ = conn.process();
+    // And feed_input is still usable afterwards (no poisoning).
+    assert_eq!(conn.feed_input(&[]).unwrap(), 0);
+}
+
+#[test]
+fn feed_input_accepts_large_buffer_without_panicking() {
+    // 256 KiB of arbitrary bytes — well above the 16 KiB TLS
+    // record cap. The wrapper must accept it (BIOs grow on demand)
+    // and process() must terminate the handshake cleanly rather
+    // than panic on the oversized garbage.
+    let pki = build_pki();
+    let ctx =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
+    let mut conn = TlsConnection::accept(&ctx).unwrap();
+    let big = vec![0xa5u8; 256 * 1024];
+    let written = conn.feed_input(&big).expect("feed_input large");
+    assert_eq!(written, big.len());
+    // The state machine must reject the bogus content cleanly:
+    // either NeedsRead ("waiting for more") or a typed Handshake
+    // error. Established or any other error variant is forbidden.
+    // We only need a single pump — libssl decides on the first
+    // record header it parses.
+    match conn.process() {
+        Ok(HandshakeState::NeedsRead | HandshakeState::NeedsWrite) => {}
+        Ok(HandshakeState::Established) => panic!("garbage must not establish"),
+        Err(TlsError::Handshake(_)) => {}
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
+}
