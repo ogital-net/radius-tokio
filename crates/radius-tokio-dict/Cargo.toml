@@ -13,9 +13,11 @@ default = ["dict-rfc"]
 # IETF / RFC dictionaries (always recommended; small).
 dict-rfc = []
 # Per-vendor VSA dictionaries; opt in to keep generated code small.
-dict-cisco = []
+dict-airespace = []
 dict-aruba = []
 dict-ascend = []
+dict-cisco = []
+dict-eleven = []
 dict-fortinet = []
 dict-hp = []
 dict-juniper = []
@@ -27,9 +29,11 @@ dict-tplink = []
 dict-wispr = []
 # Umbrella enabling every vendored vendor dictionary.
 dict-vendor-all = [
-    "dict-cisco",
+    "dict-airespace",
     "dict-aruba",
     "dict-ascend",
+    "dict-cisco",
+    "dict-eleven",
     "dict-fortinet",
     "dict-hp",
     "dict-juniper",

@@ -40,9 +40,11 @@ fast-md5 = ["dep:fast-md5"]
 # These forward the feature flag to the radius-tokio-dict crate.
 dict-rfc = ["radius-tokio-dict/dict-rfc"]
 # Per-vendor VSA dictionaries; opt in to keep generated code small.
-dict-cisco = ["radius-tokio-dict/dict-cisco"]
+dict-airespace = ["radius-tokio-dict/dict-airespace"]
 dict-aruba = ["radius-tokio-dict/dict-aruba"]
 dict-ascend = ["radius-tokio-dict/dict-ascend"]
+dict-cisco = ["radius-tokio-dict/dict-cisco"]
+dict-eleven = ["radius-tokio-dict/dict-eleven"]
 dict-fortinet = ["radius-tokio-dict/dict-fortinet"]
 dict-hp = ["radius-tokio-dict/dict-hp"]
 dict-juniper = ["radius-tokio-dict/dict-juniper"]
@@ -54,9 +56,11 @@ dict-tplink = ["radius-tokio-dict/dict-tplink"]
 dict-wispr = ["radius-tokio-dict/dict-wispr"]
 # Umbrella enabling every vendored vendor dictionary.
 dict-vendor-all = [
-    "dict-cisco",
+    "dict-airespace",
     "dict-aruba",
     "dict-ascend",
+    "dict-cisco",
+    "dict-eleven",
     "dict-fortinet",
     "dict-hp",
     "dict-juniper",
