@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
+use radius_tokio::dict::rfc::attrs;
 use radius_tokio::server::{CoaConfig, CoaError, CoaOriginator, CoaOutcome};
 use radius_tokio::{authenticator, message_authenticator, Code, Reply};
 
@@ -159,8 +160,7 @@ async fn coa_request_round_trip_ack() {
 
     let outcome = originator
         .send_coa(nas_addr, &secret, |buf| {
-            // User-Name = "alice"
-            buf.add_attribute(1, b"alice")?;
+            buf.add(attrs::USER_NAME, "alice")?;
             Ok(())
         })
         .await
@@ -184,8 +184,7 @@ async fn disconnect_request_round_trip_nak() {
 
     let outcome = originator
         .send_disconnect(nas_addr, &secret, |buf| {
-            // Acct-Session-Id = "sess-1"
-            buf.add_attribute(44, b"sess-1")?;
+            buf.add(attrs::ACCT_SESSION_ID, "sess-1")?;
             Ok(())
         })
         .await

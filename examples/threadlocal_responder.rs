@@ -62,6 +62,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use radius_tokio::dict::rfc::attrs;
 use radius_tokio::header::{Code, Header, MAX_PACKET_LEN};
 use radius_tokio::message_authenticator::{self, Verification};
 use radius_tokio::{authenticator, PacketBuffer, Reply};
@@ -116,9 +117,9 @@ fn respond(socket: &UdpSocket, request_bytes: &[u8], src: SocketAddr) -> std::io
         // takes ownership for the duration of building + sealing.
         let mut reply = Reply::from_buffer(buf);
         reply
-            .add_attribute(8, &[10, 0, 0, 5]) // Framed-IP-Address
+            .add(attrs::FRAMED_IP_ADDRESS, Ipv4Addr::new(10, 0, 0, 5))
             .expect("fits")
-            .add_attribute(27, &3600u32.to_be_bytes()) // Session-Timeout
+            .add(attrs::SESSION_TIMEOUT, 3600u32)
             .expect("fits");
 
         // Seal hands the buffer back. Send the wire bytes

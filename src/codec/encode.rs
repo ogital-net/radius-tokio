@@ -210,7 +210,7 @@ impl Reply {
         // 24 = State (RFC 2865 §5.24). Hard-coded rather than pulled
         // from the generated dictionary so the codec layer stays
         // dictionary-agnostic; the typed handle for callers who want
-        // it is `dict::generated::rfc::attrs::STATE`.
+        // it is `dict::rfc::attrs::STATE`.
         self.add_attribute(24, value)
     }
 
@@ -293,7 +293,7 @@ impl Reply {
     /// [`super::attributes::RawAttribute::get`].
     ///
     /// ```ignore
-    /// use radius_tokio::dict::generated::rfc::attrs;
+    /// use radius_tokio::dict::rfc::attrs;
     ///
     /// reply.add(attrs::USER_NAME, "alice")?;
     /// reply.add(attrs::NAS_PORT, 12u32)?;
@@ -316,7 +316,7 @@ impl Reply {
     /// companion to [`super::attributes::RawAttribute::get_vsa`].
     ///
     /// ```ignore
-    /// use radius_tokio::dict::generated::cisco::attrs;
+    /// use radius_tokio::dict::cisco::attrs;
     ///
     /// reply.add_vsa(attrs::CISCO_AVPAIR, "shell:priv-lvl=15")?;
     /// ```
@@ -342,7 +342,7 @@ impl Reply {
     /// codegen for child entries:
     ///
     /// ```ignore
-    /// use radius_tokio::dict::generated::rfc::attrs;
+    /// use radius_tokio::dict::rfc::attrs;
     /// reply.add_tlv(attrs::IPV6_6RD_CONFIGURATION.code, |t| {
     ///     t.add(attrs::IPV6_6RD_IPV4MASKLEN, 32u8)?;
     ///     t.add(attrs::IPV6_6RD_BR_IPV4_ADDRESS,

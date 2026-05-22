@@ -58,7 +58,7 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
-use radius_tokio::dict::generated::rfc::attrs;
+use radius_tokio::dict::rfc::attrs;
 use radius_tokio::server::{
     Client, ClientStore, Handler, HandlerResult, IpCidr, Request, Server, StaticClients,
 };

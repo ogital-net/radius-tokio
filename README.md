@@ -71,7 +71,7 @@ use radius_tokio::server::{
     Client, Handler, HandlerResult, IpCidr, Request, Server, StaticClients,
 };
 use radius_tokio::Code;
-use radius_tokio::dict::generated::rfc::attrs;
+use radius_tokio::dict::rfc::attrs;
 
 struct MyApp;
 
@@ -114,8 +114,8 @@ through `Tagged<V>` so consumers never hand-roll the tag byte or the
 wire shape automatically:
 
 ```rust,no_run
-use radius_tokio::dict::generated::rfc::attrs;
-use radius_tokio::dict::typed::Tagged;
+use radius_tokio::dict::rfc::attrs;
+use radius_tokio::dict::Tagged;
 # fn demo(request: radius_tokio::server::Request<'_>) {
 # use radius_tokio::Code;
 # let mut reply = request.reply(Code::ACCESS_ACCEPT);
@@ -339,5 +339,5 @@ Licensed under the BSD 2-Clause License — see the `LICENSE` file at
 the root of the repository.
 
 The vendored FreeRADIUS dictionaries under
-`crates/radius-dict/dictionaries/` carry their own upstream licenses;
+`crates/radius-tokio-dict/dictionaries/` carry their own upstream licenses;
 see the `LICENSE` files in those directories.

@@ -18,7 +18,7 @@ their own Tokio runtime. The source tree mirrors that split:
 - `src/auth/` — PAP / CHAP / MS-CHAPv2 / EAP-MD5 helpers that
   handlers can call; the library never makes the auth decision
   itself.
-- `crates/radius-dict/` + `crates/radius-dict-codegen/` — RFC and
+- `crates/radius-tokio-dict/` + `crates/radius-tokio-dict-codegen/` — RFC and
   vendor dictionaries, parsed at build time into typed attribute
   handles.
 
@@ -109,11 +109,11 @@ choose a different crate.
 ## Adding a vendor dictionary
 
 Vendor and RFC dictionaries are vendored under
-`crates/radius-dict/dictionaries/` and compiled into typed Rust at
-build time by the `radius-dict-codegen` crate. To add a new vendor:
+`crates/radius-tokio-dict/dictionaries/` and compiled into typed Rust at
+build time by the `radius-tokio-dict-codegen` crate. To add a new vendor:
 
 1. **Drop the dictionary file in place.** Copy the FreeRADIUS-format
-   dictionary into `crates/radius-dict/dictionaries/vendor/`,
+   dictionary into `crates/radius-tokio-dict/dictionaries/vendor/`,
    keeping the upstream `dictionary.<vendor>` filename. If it
    `$INCLUDE`s other files, vendor those alongside it.
 2. **Verify the license.** FreeRADIUS dictionaries are typically
@@ -122,24 +122,24 @@ build time by the `radius-dict-codegen` crate. To add a new vendor:
    acceptable set.
 3. **Register a feature flag and codegen entry.**
    - Add `dict-<vendor> = []` to the `[features]` table in
-     `crates/radius-dict/Cargo.toml` and append the same name to the
+     `crates/radius-tokio-dict/Cargo.toml` and append the same name to the
      `dict-vendor-all` umbrella.
    - Mirror both lines in the root `Cargo.toml`, where
-     `dict-<vendor>` forwards to `radius-dict/dict-<vendor>`.
+     `dict-<vendor>` forwards to `radius-tokio-dict/dict-<vendor>`.
    - Add a `Group { feature, module, entry }` row to `GROUPS` in
-     `crates/radius-dict/build.rs`. The `module` becomes the
-     submodule name under `radius_dict::generated::*`; the `entry`
+     `crates/radius-tokio-dict/build.rs`. The `module` becomes the
+     submodule name under `radius_tokio_dict::*`; the `entry`
      is the path of the dictionary file relative to
      `CARGO_MANIFEST_DIR`.
 4. **Build with the feature on:**
    ```sh
-   cargo build -p radius-dict --features dict-<vendor>
-   cargo test  -p radius-dict --features dict-<vendor>
+   cargo build -p radius-tokio-dict --features dict-<vendor>
+   cargo test  -p radius-tokio-dict --features dict-<vendor>
    ```
    The build script writes the generated Rust into `OUT_DIR`; output
    is deterministic (sorted, no timestamps), so two clean builds
    produce byte-identical files.
-5. **Snapshot test.** The existing snapshot test in `radius-dict`
+5. **Snapshot test.** The existing snapshot test in `radius-tokio-dict`
    re-runs codegen and asserts byte-equality across runs; it will
    pick up the new dictionary automatically once the feature is on.
 

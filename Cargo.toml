@@ -1,8 +1,8 @@
 [workspace]
 members = [
     ".",
-    "crates/radius-dict-codegen",
-    "crates/radius-dict",
+    "crates/radius-tokio-dict-codegen",
+    "crates/radius-tokio-dict",
 ]
 resolver = "2"
 
@@ -37,21 +37,21 @@ radsec = ["aws-lc-sys/ssl", "tokio/io-util"]
 # Falls back to `aws-lc-sys`'s MD5 when disabled.
 fast-md5 = ["dep:fast-md5"]
 # IETF / RFC dictionaries (always recommended; small).
-# These forward the feature flag to the radius-dict crate.
-dict-rfc = ["radius-dict/dict-rfc"]
+# These forward the feature flag to the radius-tokio-dict crate.
+dict-rfc = ["radius-tokio-dict/dict-rfc"]
 # Per-vendor VSA dictionaries; opt in to keep generated code small.
-dict-cisco = ["radius-dict/dict-cisco"]
-dict-aruba = ["radius-dict/dict-aruba"]
-dict-ascend = ["radius-dict/dict-ascend"]
-dict-fortinet = ["radius-dict/dict-fortinet"]
-dict-hp = ["radius-dict/dict-hp"]
-dict-juniper = ["radius-dict/dict-juniper"]
-dict-meraki = ["radius-dict/dict-meraki"]
-dict-microsoft = ["radius-dict/dict-microsoft"]
-dict-mikrotik = ["radius-dict/dict-mikrotik"]
-dict-ruckus = ["radius-dict/dict-ruckus"]
-dict-tplink = ["radius-dict/dict-tplink"]
-dict-wispr = ["radius-dict/dict-wispr"]
+dict-cisco = ["radius-tokio-dict/dict-cisco"]
+dict-aruba = ["radius-tokio-dict/dict-aruba"]
+dict-ascend = ["radius-tokio-dict/dict-ascend"]
+dict-fortinet = ["radius-tokio-dict/dict-fortinet"]
+dict-hp = ["radius-tokio-dict/dict-hp"]
+dict-juniper = ["radius-tokio-dict/dict-juniper"]
+dict-meraki = ["radius-tokio-dict/dict-meraki"]
+dict-microsoft = ["radius-tokio-dict/dict-microsoft"]
+dict-mikrotik = ["radius-tokio-dict/dict-mikrotik"]
+dict-ruckus = ["radius-tokio-dict/dict-ruckus"]
+dict-tplink = ["radius-tokio-dict/dict-tplink"]
+dict-wispr = ["radius-tokio-dict/dict-wispr"]
 # Umbrella enabling every vendored vendor dictionary.
 dict-vendor-all = [
     "dict-cisco",
@@ -71,7 +71,7 @@ dict-vendor-all = [
 [dependencies]
 # Typed FreeRADIUS dictionary tables generated at build time.
 # Feature flags above forward dict-* selections to this crate.
-radius-dict = { path = "crates/radius-dict", version = "0.1.0" }
+radius-tokio-dict = { path = "crates/radius-tokio-dict", version = "0.1.0" }
 # Core crypto bindings (HMAC-MD5, AES, RNG, …). The `ssl` feature
 # is *not* enabled here; turn it on via the `radsec` cargo feature
 # when RadSec / TLS support is needed. Without `ssl`, the crypto-

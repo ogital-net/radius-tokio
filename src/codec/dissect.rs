@@ -50,8 +50,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use super::attributes::{AttributesIter, RawAttribute};
 use super::header::{Code, Header};
 use super::PacketBuffer;
-use crate::dict::generated::AttributeEntry;
-use crate::dict::{registry, Type};
+use crate::dict::{self, AttrInfo, AttrKind};
 
 /// Indent applied per Wireshark "tree" level.
 const INDENT: &str = "    ";
@@ -262,10 +261,10 @@ fn write_attribute(f: &mut fmt::Formatter<'_>, indent: &str, raw: RawAttribute<'
         return write_vsa(f, indent, len, val);
     }
 
-    let entry = registry::attribute(typ);
+    let entry = dict::attribute(typ);
     let name = entry.map_or("Unknown", |e| e.name);
     write!(f, "{indent}AVP: t={name}({typ}) l={len}")?;
-    write_value(f, indent, entry, val)
+    write_value(f, indent, typ, entry, val)
 }
 
 fn write_vsa(f: &mut fmt::Formatter<'_>, indent: &str, len: u8, val: &[u8]) -> fmt::Result {
@@ -277,7 +276,7 @@ fn write_vsa(f: &mut fmt::Formatter<'_>, indent: &str, len: u8, val: &[u8]) -> f
         return write_raw_hex(f, indent, val);
     };
     let pen = u32::from_be_bytes(*pen_bytes);
-    let vendor_entry = registry::vendor(pen);
+    let vendor_entry = dict::vendor(pen);
     let vendor_name = vendor_entry.map_or("Unknown", |v| v.name);
     writeln!(
         f,
@@ -309,10 +308,14 @@ fn write_vsa(f: &mut fmt::Formatter<'_>, indent: &str, len: u8, val: &[u8]) -> f
         }
     };
     let data = &data_and_rest[..data_len];
-    let entry = registry::vsa(pen, v_type);
+    let entry = dict::vsa(pen, v_type);
     let vname = entry.map_or("Unknown", |e| e.name);
     write!(f, "{inner_indent}VSA: t={vname}({v_type}) l={v_len}")?;
-    write_value(f, inner_indent, entry, data)?;
+    // `parent_code` here is the vendor-type. The RFC-namespace
+    // `tlv_child` lookup will miss for vendor TLVs (Phase B
+    // territory), so a `Tlv`-kind vendor parent falls back to the
+    // hex dump in `write_value`'s container arm.
+    write_value(f, inner_indent, v_type, entry, data)?;
 
     let trailing = &data_and_rest[data_len..];
     if !trailing.is_empty() {
@@ -328,14 +331,18 @@ fn write_vsa(f: &mut fmt::Formatter<'_>, indent: &str, len: u8, val: &[u8]) -> f
 
 /// Render the value portion (` val=…\n`) of an AVP line.
 ///
+/// `parent_code` is the surrounding attribute's 1-byte type code,
+/// needed for recursive `Tlv` resolution via [`dict::tlv_child`].
 /// `entry` is the dictionary lookup result for the surrounding
 /// attribute; it drives type-aware formatting (decimal vs hex,
 /// enumerator name vs raw integer, encrypted-marker, etc.). When
 /// `entry` is `None` we fall back to a hex dump.
+#[allow(clippy::too_many_lines)]
 fn write_value(
     f: &mut fmt::Formatter<'_>,
     indent: &str,
-    entry: Option<&'static AttributeEntry>,
+    parent_code: u8,
+    entry: Option<AttrInfo>,
     val: &[u8],
 ) -> fmt::Result {
     let Some(entry) = entry else {
@@ -344,14 +351,14 @@ fn write_value(
         return writeln!(f);
     };
 
-    if entry.flags.encrypt.is_some() {
+    if entry.encrypted {
         write!(f, " val=<encrypted ")?;
         write_hex_inline(f, val)?;
         return writeln!(f, ">");
     }
 
-    match entry.typ {
-        Type::String => {
+    match entry.kind {
+        AttrKind::String => {
             if let Ok(s) = std::str::from_utf8(val) {
                 writeln!(f, " val={s:?}")
             } else {
@@ -360,46 +367,46 @@ fn write_value(
                 writeln!(f, ">")
             }
         }
-        Type::Octets | Type::FixedOctets(_) | Type::Abinary => {
+        AttrKind::Octets => {
             write!(f, " val=")?;
             write_hex_inline(f, val)?;
             writeln!(f)
         }
-        Type::Ipaddr => match <[u8; 4]>::try_from(val) {
+        AttrKind::Ipaddr => match <[u8; 4]>::try_from(val) {
             Ok(octets) => writeln!(f, " val={}", Ipv4Addr::from(octets)),
             Err(_) => writeln!(f, " val=<bad ipv4 len={}>", val.len()),
         },
-        Type::Ipv6addr => match <[u8; 16]>::try_from(val) {
+        AttrKind::Ipv6addr => match <[u8; 16]>::try_from(val) {
             Ok(octets) => writeln!(f, " val={}", Ipv6Addr::from(octets)),
             Err(_) => writeln!(f, " val=<bad ipv6 len={}>", val.len()),
         },
-        Type::Ipv4prefix => write_ip_prefix(f, val, 4),
-        Type::Ipv6prefix => write_ip_prefix(f, val, 16),
-        Type::Byte => match val {
+        AttrKind::Ipv4prefix => write_ip_prefix(f, val, 4),
+        AttrKind::Ipv6prefix => write_ip_prefix(f, val, 16),
+        AttrKind::Byte => match val {
             [b] => write_integer(f, entry, i64::from(*b)),
             _ => writeln!(f, " val=<bad byte len={}>", val.len()),
         },
-        Type::Short => match <[u8; 2]>::try_from(val) {
+        AttrKind::Short => match <[u8; 2]>::try_from(val) {
             Ok(b) => write_integer(f, entry, i64::from(u16::from_be_bytes(b))),
             Err(_) => writeln!(f, " val=<bad short len={}>", val.len()),
         },
-        Type::Integer | Type::Uint32 => match <[u8; 4]>::try_from(val) {
+        AttrKind::Integer => match <[u8; 4]>::try_from(val) {
             Ok(b) => write_integer(f, entry, i64::from(u32::from_be_bytes(b))),
             Err(_) => writeln!(f, " val=<bad integer len={}>", val.len()),
         },
-        Type::Integer64 => match <[u8; 8]>::try_from(val) {
+        AttrKind::Integer64 => match <[u8; 8]>::try_from(val) {
             Ok(b) => writeln!(f, " val={}", u64::from_be_bytes(b)),
             Err(_) => writeln!(f, " val=<bad integer64 len={}>", val.len()),
         },
-        Type::Signed => match <[u8; 4]>::try_from(val) {
+        AttrKind::Signed => match <[u8; 4]>::try_from(val) {
             Ok(b) => write_integer(f, entry, i64::from(i32::from_be_bytes(b))),
             Err(_) => writeln!(f, " val=<bad signed len={}>", val.len()),
         },
-        Type::Date => match <[u8; 4]>::try_from(val) {
+        AttrKind::Date => match <[u8; 4]>::try_from(val) {
             Ok(b) => writeln!(f, " val={} (epoch seconds)", u32::from_be_bytes(b)),
             Err(_) => writeln!(f, " val=<bad date len={}>", val.len()),
         },
-        Type::Ether => {
+        AttrKind::Ether => {
             if let Ok(m) = <[u8; 6]>::try_from(val) {
                 writeln!(
                     f,
@@ -410,7 +417,7 @@ fn write_value(
                 writeln!(f, " val=<bad ether len={}>", val.len())
             }
         }
-        Type::Ifid => {
+        AttrKind::Ifid => {
             if val.len() == 8 {
                 write!(f, " val=")?;
                 for (i, chunk) in val.chunks(2).enumerate() {
@@ -426,17 +433,56 @@ fn write_value(
                 writeln!(f, " val=<bad ifid len={}>", val.len())
             }
         }
-        Type::Tlv | Type::Vsa | Type::Evs | Type::Extended | Type::LongExtended | Type::Struct => {
+        AttrKind::Tlv => {
+            // Walk back-to-back [type, length, value] triples and
+            // dissect each child via `dict::tlv_child`. If the
+            // first child fails to resolve we fall through to the
+            // generic container dump so vendor TLVs (Phase B) and
+            // unrecognised structures still produce useful output.
+            writeln!(f)?;
+            let cont = format!("{indent}{INDENT}");
+            let mut cursor = val;
+            let mut any_dissected = false;
+            while cursor.len() >= 2 {
+                let t = cursor[0];
+                let l = cursor[1] as usize;
+                if l < 2 || l > cursor.len() {
+                    writeln!(f, "{cont}<malformed TLV: type={t} len={l}>")?;
+                    break;
+                }
+                let child_entry = dict::tlv_child(parent_code, t);
+                let child_name = child_entry.map_or("Unknown", |e| e.name);
+                write!(f, "{cont}TLV: t={child_name}({t}) l={l}")?;
+                write_value(f, &cont, t, child_entry, &cursor[2..l])?;
+                any_dissected |= child_entry.is_some();
+                cursor = &cursor[l..];
+            }
+            if !any_dissected && cursor.len() == val.len() {
+                // Nothing parsed — show the raw payload so the
+                // operator can still inspect the bytes.
+                write_raw_hex(f, &cont, val)?;
+            } else if !cursor.is_empty() {
+                writeln!(f, "{cont}<trailing {} byte(s) in TLV>", cursor.len())?;
+                write_raw_hex(f, &cont, cursor)?;
+            }
+            Ok(())
+        }
+        AttrKind::Vsa
+        | AttrKind::Evs
+        | AttrKind::Extended
+        | AttrKind::LongExtended
+        | AttrKind::Struct => {
             // Container types — no first-class renderer yet. Dump
             // raw payload for forensic value, on a continuation line
             // so the AVP header line stays short.
-            writeln!(f, " <{:?}>", entry.typ)?;
+            writeln!(f, " <{:?}>", entry.kind)?;
             let cont = format!("{indent}{INDENT}");
             write_raw_hex(f, &cont, val)
         }
         _ => {
-            // `Type` is `#[non_exhaustive]`. Unknown variants fall
-            // back to a raw hex dump rather than refusing to render.
+            // `AttrKind` is `#[non_exhaustive]`. Unknown variants
+            // fall back to a raw hex dump rather than refusing to
+            // render.
             write!(f, " val=")?;
             write_hex_inline(f, val)?;
             writeln!(f)
@@ -444,12 +490,8 @@ fn write_value(
     }
 }
 
-fn write_integer(
-    f: &mut fmt::Formatter<'_>,
-    entry: &'static AttributeEntry,
-    n: i64,
-) -> fmt::Result {
-    match registry::value_name(entry.name, n) {
+fn write_integer(f: &mut fmt::Formatter<'_>, entry: AttrInfo, n: i64) -> fmt::Result {
+    match dict::value_name(entry.name, n) {
         Some(name) => writeln!(f, " val={name}({n})"),
         None => writeln!(f, " val={n}"),
     }
@@ -785,5 +827,36 @@ mod tests {
         );
         assert!(s.contains("User-Name"), "{s}");
         assert!(s.contains("NAS-IP-Address"), "{s}");
+    }
+
+    #[test]
+    fn dissect_tlv_recurses_into_named_children() {
+        // RFC 5447 §4.3: IPv6-6rd-Configuration (173) is a Tlv parent
+        // with children IPv6-6rd-IPv4MaskLen(1, Integer) and
+        // IPv6-6rd-BR-IPv4-Address(3, Ipaddr).
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        let mut tlv = Vec::new();
+        // child 1, len 6, integer 24
+        tlv.extend_from_slice(&[1, 6]);
+        tlv.extend_from_slice(&24u32.to_be_bytes());
+        // child 3, len 6, ipaddr 192.0.2.1
+        tlv.extend_from_slice(&[3, 6]);
+        tlv.extend_from_slice(&[192, 0, 2, 1]);
+        buf.add_attribute(173, &tlv).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("AVP: t=IPv6-6rd-Configuration(173)"), "{s}");
+        assert!(s.contains("TLV: t=IPv6-6rd-IPv4MaskLen(1) l=6"), "{s}");
+        assert!(s.contains("val=24"), "{s}");
+        assert!(s.contains("TLV: t=IPv6-6rd-BR-IPv4-Address(3) l=6"), "{s}");
+        assert!(s.contains("val=192.0.2.1"), "{s}");
+    }
+
+    #[test]
+    fn dissect_tlv_malformed_payload_does_not_panic() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // child type 1, claimed length 99 — exceeds buffer.
+        buf.add_attribute(173, &[1, 99, 0, 0]).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("<malformed TLV"), "{s}");
     }
 }

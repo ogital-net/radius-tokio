@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use radius_tokio::dict::rfc::attrs;
 use radius_tokio::server::{
     AcctStatusType, Client, Handler, HandlerResult, IpCidr, Request, Server, StaticClients,
 };
@@ -71,13 +72,10 @@ fn build_accounting_request(
     secret: &[u8],
 ) -> ([u8; 16], Vec<u8>) {
     let mut buf = PacketBuffer::new(Code::ACCOUNTING_REQUEST, identifier);
-    // Acct-Status-Type (40, integer).
-    buf.add_attribute(40, &status.to_u32().to_be_bytes())
+    buf.add(attrs::ACCT_STATUS_TYPE, status.to_u32())
         .expect("fits");
-    // Acct-Session-Id (44, string).
-    buf.add_attribute(44, session_id.as_bytes()).expect("fits");
-    // User-Name (1, string).
-    buf.add_attribute(1, b"alice").expect("fits");
+    buf.add(attrs::ACCT_SESSION_ID, session_id).expect("fits");
+    buf.add(attrs::USER_NAME, "alice").expect("fits");
 
     let sealed = buf.seal_as_zeroed_request(secret);
     let auth = sealed.header().authenticator;

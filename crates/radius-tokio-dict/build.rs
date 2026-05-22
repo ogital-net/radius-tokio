@@ -1,7 +1,7 @@
 //! Build-time codegen for `FreeRADIUS` dictionary tables.
 //!
 //! Each `dict-*` Cargo feature picks a dictionary entry-point under
-//! `dictionaries/`, parses it using [`radius_dict_codegen`], and writes a
+//! `dictionaries/`, parses it using [`radius_tokio_dict_codegen`], and writes a
 //! Rust source file into `OUT_DIR`. The library `include!`s those files
 //! from `src/generated.rs`.
 //!
@@ -13,7 +13,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use radius_dict_codegen::{FsLoader, Parser};
+use radius_tokio_dict_codegen::{FsLoader, Parser};
 
 struct Group {
     /// Cargo feature name (without the `feature = "…"` envelope).
@@ -122,7 +122,7 @@ fn main() {
         let parsed = parser
             .parse(&entry)
             .unwrap_or_else(|e| panic!("failed to parse dictionary `{}`: {e}", entry.display()));
-        let rendered = radius_dict_codegen::codegen::render(group.module, &parsed);
+        let rendered = radius_tokio_dict_codegen::codegen::render(group.module, &parsed);
 
         let dest = out_dir.join(format!("dict_{}.rs", group.module));
         write_if_changed(&dest, &rendered);

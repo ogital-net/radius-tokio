@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use radius_tokio::dict::rfc::attrs;
 use radius_tokio::server::{
     Client, Handler, HandlerResult, IpCidr, ListenerRole, Request, Server, StaticClients,
     StatusAction, StatusContext, StatusResponder, StatusServerPolicy,
@@ -333,18 +334,18 @@ async fn custom_responder_injects_reply_message() {
     assert_eq!(reply[0], Code::ACCESS_ACCEPT.0);
     assert!(authenticator::verify_response(&reply, &req_auth, &secret));
 
-    // Walk the attribute list looking for Reply-Message (type 18)
+    // Walk the attribute list looking for Reply-Message
     // == "queue=0".
-    let attrs = &reply[20..];
+    let attrs_blob = &reply[20..];
     let mut found = false;
     let mut idx = 0;
-    while idx + 2 <= attrs.len() {
-        let typ = attrs[idx];
-        let len = attrs[idx + 1] as usize;
-        if len < 2 || idx + len > attrs.len() {
+    while idx + 2 <= attrs_blob.len() {
+        let typ = attrs_blob[idx];
+        let len = attrs_blob[idx + 1] as usize;
+        if len < 2 || idx + len > attrs_blob.len() {
             break;
         }
-        if typ == 18 && &attrs[idx + 2..idx + len] == b"queue=0" {
+        if typ == attrs::REPLY_MESSAGE.code && &attrs_blob[idx + 2..idx + len] == b"queue=0" {
             found = true;
         }
         idx += len;

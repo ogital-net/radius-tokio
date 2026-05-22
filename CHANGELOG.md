@@ -171,8 +171,8 @@ Initial release. Pre-1.0 \u2014 the API may evolve.
   dictionaries (Cisco, Aruba, Juniper, Ruckus, MikroTik, Meraki,
   Microsoft, Fortinet, HP, Ascend, WISPr, Ubiquiti) opt-in via
   `dict-*` features. Workspace split: runtime tables live in the
-  `radius-dict` crate, the parser + renderer in the build-only
-  `radius-dict-codegen` crate.
+  `radius-tokio-dict` crate, the parser + renderer in the build-only
+  `radius-tokio-dict-codegen` crate.
 - **Observability.** Optional `tracing` and `metrics` features with
   a fixed event vocabulary under the `radius_tokio` target / metric
   prefix; macros expand to nothing when the features are off.

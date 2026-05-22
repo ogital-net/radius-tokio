@@ -653,17 +653,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
-name = "radius-dict"
-version = "0.1.0"
-dependencies = [
- "radius-dict-codegen",
-]
-
-[[package]]
-name = "radius-dict-codegen"
-version = "0.1.0"
-
-[[package]]
 name = "radius-tokio"
 version = "0.1.0"
 dependencies = [
@@ -674,12 +663,23 @@ dependencies = [
  "fast-md5",
  "libc",
  "metrics",
- "radius-dict",
+ "radius-tokio-dict",
  "rusqlite",
  "socket2",
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "radius-tokio-dict"
+version = "0.1.0"
+dependencies = [
+ "radius-tokio-dict-codegen",
+]
+
+[[package]]
+name = "radius-tokio-dict-codegen"
+version = "0.1.0"
 
 [[package]]
 name = "rapidhash"

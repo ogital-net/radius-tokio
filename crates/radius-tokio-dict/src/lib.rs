@@ -1,53 +1,77 @@
 //! Typed FreeRADIUS dictionary tables for RADIUS attribute encoding/decoding.
 //!
-//! At build time, a code-generator (see `build.rs` and the `radius-dict-codegen`
+//! At build time, a code-generator (see `build.rs` and the `radius-tokio-dict-codegen`
 //! crate) parses the FreeRADIUS dictionary files under `dictionaries/` and emits
-//! typed Rust static tables. Those tables are re-exported from the [`generated`]
-//! module; the [`registry`] module provides runtime lookup helpers over them.
+//! typed Rust source per dictionary group. Each group is re-exported at the
+//! crate root and exposes:
 //!
-//! The [`Type`] and [`Flags`] types describe every attribute's wire format and
-//! flag bag. They appear in the public `AttributeEntry` structs emitted by the
-//! generator and are re-exported here for consumers that inspect those entries.
+//! - typed `attrs::*` and `values::*` handles used on the encode path
+//!   (e.g. `radius_tokio_dict::rfc::attrs::USER_NAME`);
+//! - `pub const fn` dispatchers (`attrs::lookup`, `attrs::lookup_vsa`,
+//!   `attrs::lookup_tlv`, `values::value_name`) used internally by the
+//!   crate-level lookup helpers ([`attribute`], [`vsa`], [`vendor`],
+//!   [`tlv_child`], [`value_name`]) for diagnostics.
+//!
+//! Older revisions of this crate emitted `pub static ATTRIBUTES` and
+//! `pub static VENDORS` slices of full `AttributeEntry`/`VendorEntry`
+//! records. Those have been replaced by the `match`-based dispatchers
+//! above, which are dramatically smaller in `.rodata` and let the compiler
+//! turn name lookups into jump tables.
+//!
+//! The [`AttrKind`] enum surfaces the small subset of an attribute's
+//! dictionary type that the diagnostic path actually consumes (string vs
+//! integer vs hex-dump vs container). [`AttrInfo`] and [`VendorInfo`] are
+//! the cheap by-value records returned from the lookup helpers.
 
 #![warn(missing_docs)]
 
-pub mod generated;
-pub mod registry;
-pub mod typed;
+mod generated;
+mod registry;
+mod typed;
 
-// ── Type ────────────────────────────────────────────────────────────────────
+// Flatten the public surface: consumers import from the crate root
+// (`radius_tokio_dict::USER_NAME`, `radius_tokio_dict::attribute(…)`,
+// `radius_tokio_dict::Attr<T>`) rather than threading through the
+// internal module hierarchy. The three sub-modules expose disjoint
+// item sets so the glob re-exports do not collide.
+pub use generated::*;
+pub use registry::*;
+pub use typed::*;
 
-/// RADIUS attribute data type, as named in dictionary files.
+// ── AttrKind ────────────────────────────────────────────────────────────────
+
+/// Coarse classification of a RADIUS attribute's wire shape, as needed
+/// by the dissection / diagnostic path.
 ///
-/// Names mirror the `FreeRADIUS` dictionary syntax and the data-type
-/// terminology in RFC 6158 / RFC 8044. The code generator turns each
-/// variant into a concrete encoder/decoder selector.
+/// This is a deliberately reduced form of the dictionary `TYPE` keyword:
+/// the encode path is already type-safe via the `attrs::*` typed handles
+/// (`Attr<WText>`, `Attr<WInteger>`, …) emitted alongside, so the runtime
+/// classification only needs enough resolution to drive value-formatting
+/// in the crate-level lookup consumers. `uint32` is folded into
+/// [`AttrKind::Integer`]; `octets[N]` is folded into [`AttrKind::Octets`].
 ///
-/// These variants must stay in sync with the identically-named enum in
-/// `radius-dict-codegen`. The generator emits Rust source referencing these
-/// by name; a mismatch is caught at compile time.
+/// `#[repr(u8)]` keeps the enum to a single byte so [`AttrInfo`] stays small.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 #[non_exhaustive]
-pub enum Type {
+pub enum AttrKind {
     /// UTF-8 text without a trailing NUL (RFC 8044 §3.4).
     String,
-    /// Variable-length opaque bytes.
+    /// Opaque bytes (variable- or fixed-length, including `abinary`).
     Octets,
-    /// Fixed-length opaque bytes (`octets[N]` in dictionary syntax).
-    FixedOctets(u16),
     /// IPv4 address, 4 bytes.
     Ipaddr,
     /// IPv6 address, 16 bytes.
     Ipv6addr,
-    /// IPv4 prefix (RFC 6572): reserved + prefix-length + address bytes.
+    /// IPv4 prefix (RFC 6572).
     Ipv4prefix,
-    /// IPv6 prefix (RFC 3162): reserved + prefix-length + address bytes.
+    /// IPv6 prefix (RFC 3162).
     Ipv6prefix,
     /// 8-bit unsigned integer.
     Byte,
     /// 16-bit unsigned integer.
     Short,
-    /// 32-bit unsigned integer.
+    /// 32-bit unsigned integer (covers `integer` and `uint32`).
     Integer,
     /// 64-bit unsigned integer.
     Integer64,
@@ -59,53 +83,48 @@ pub enum Type {
     Ifid,
     /// 6-byte Ethernet MAC.
     Ether,
-    /// Filter-Id-style ASCII binary blob (legacy).
-    Abinary,
     /// Type-Length-Value container.
     Tlv,
     /// Vendor-Specific Attribute container (attribute 26).
     Vsa,
     /// Extended-Vendor-Specific (RFC 6929 §2.4).
     Evs,
-    /// RFC 6929 §2.1 extended attribute (one-byte continuation reserved).
+    /// RFC 6929 §2.1 extended attribute.
     Extended,
-    /// RFC 6929 §2.2 long-extended attribute (Flags byte includes `M` bit).
+    /// RFC 6929 §2.2 long-extended attribute.
     LongExtended,
     /// Composite of fixed-layout subfields (RFC 8044 §3.13).
     Struct,
-    /// Synonym for [`Type::Integer`] used in some vendor dictionaries (`uint32`).
-    ///
-    /// Treated identically on the wire; kept as a distinct variant so codegen
-    /// can preserve the exact source spelling.
-    Uint32,
 }
 
-// ── Flags ────────────────────────────────────────────────────────────────────
+// ── AttrInfo / VendorInfo ───────────────────────────────────────────────────
 
-/// Per-attribute flags parsed from the trailing flag list of an `ATTRIBUTE`
-/// line. Multiple flags may be combined with commas.
+/// Diagnostic record for a top-level attribute or single-component VSA,
+/// returned by [`attribute`] / [`vsa`].
 ///
-/// These fields must stay in sync with the identically-named struct in
-/// `radius-dict-codegen`. The generator emits Rust source referencing these
-/// by field name; a mismatch is caught at compile time.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)] // mirrors the dictionary flag set
-pub struct Flags {
-    /// `encrypt=N` — encryption scheme (1 = User-Password, 2 = Tunnel-Password,
-    /// 3 = Ascend, …). `None` means no encryption.
-    pub encrypt: Option<u8>,
-    /// `has_tag` — RFC 2868 §3.5 tagged attribute.
-    pub has_tag: bool,
-    /// `concat` — RFC 3579 §3.1 fragment concatenation (e.g. EAP-Message).
-    pub concat: bool,
-    /// `array` — repeats indicate an ordered list (RFC 8044 §2.5).
-    pub array: bool,
-    /// `virtual` — synthesised, never on the wire.
-    pub virtual_: bool,
-    /// `internal` — server-internal bookkeeping attribute.
-    pub internal: bool,
-    /// `secret` — value is sensitive and should not be logged.
-    pub secret: bool,
+/// Returned by value: the underlying data is `&'static`, but the record
+/// itself is a small (`Copy`) struct rather than a `&'static AttributeEntry`,
+/// so the generator no longer needs to materialise a per-attribute record
+/// in `.rodata`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AttrInfo {
+    /// Attribute name as written in the dictionary (e.g. `User-Name`).
+    pub name: &'static str,
+    /// Coarse wire-shape classification driving value rendering.
+    pub kind: AttrKind,
+    /// True iff the dictionary marks this attribute as `encrypt=N` for
+    /// any `N`. The diagnostic path only cares about presence, not the
+    /// specific scheme, so the scheme number is discarded.
+    pub encrypted: bool,
+}
+
+/// Diagnostic record for a vendor entry, returned by [`vendor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VendorInfo {
+    /// Vendor name as written in the dictionary (e.g. `Cisco`).
+    pub name: &'static str,
+    /// IANA Private Enterprise Number.
+    pub id: u32,
 }
 
 // ── Integration tests ────────────────────────────────────────────────────────
@@ -115,7 +134,7 @@ mod tests {
     use std::collections::HashMap;
     use std::path::Path;
 
-    use radius_dict_codegen::{Attribute, FsLoader, Parser, Type, Value};
+    use radius_tokio_dict_codegen::{Attribute, FsLoader, Parser, Type, Value};
 
     #[test]
     fn parses_full_vendored_rfc_tree() {

@@ -147,7 +147,7 @@ jobs:
   # Intentionally not run. The only `unsafe` in the workspace lives in
   # `src/crypto/`, which is a thin shim over `aws-lc-sys` (FFI) — miri
   # cannot execute foreign functions. The pure-Rust workspace members
-  # (`radius-dict`, `radius-dict-codegen`) have no `unsafe` worth
+  # (`radius-tokio-dict`, `radius-tokio-dict-codegen`) have no `unsafe` worth
   # checking. The FFI surface is exercised under AddressSanitizer in
   # the `asan` job below.
 
@@ -186,10 +186,10 @@ jobs:
   # path-deps are actually on crates.io (chicken-and-egg with workspace
   # publish chains).
   publish_dryrun:
-    name: publish dry-run (radius-dict-codegen)
+    name: publish dry-run (radius-tokio-dict-codegen)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo publish --dry-run -p radius-dict-codegen
+      - run: cargo publish --dry-run -p radius-tokio-dict-codegen

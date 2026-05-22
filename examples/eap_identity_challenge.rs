@@ -49,6 +49,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use radius_tokio::auth::eap_md5;
+use radius_tokio::dict::rfc::attrs;
 use radius_tokio::eap;
 use radius_tokio::server::{
     Client, Handler, HandlerResult, IpCidr, Request, Server, StaticClients,
@@ -134,7 +135,14 @@ impl Handler for EapMd5 {
                 if eap_md5::verify_response(id, PASSWORD, &challenge, &response) {
                     let mut reply = request.reply(Code::ACCESS_ACCEPT);
                     if let Some(name) = request.user_name() {
-                        reply.add_attribute(1, name).expect("user-name fits");
+                        // `name` is `&[u8]` (the wire stays bytes), so
+                        // we go through the raw `add_attribute` API but
+                        // still use the generated `attrs::USER_NAME`
+                        // const for the type code — no `1` magic
+                        // number in sight.
+                        reply
+                            .add_attribute(attrs::USER_NAME.code, name)
+                            .expect("user-name fits");
                     }
                     reply
                         .add_eap_success(eap_pkt.identifier())

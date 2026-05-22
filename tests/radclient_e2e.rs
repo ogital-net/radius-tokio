@@ -28,7 +28,7 @@ use radius_tokio::Code;
 ///
 /// Built by hand here so the test stays free of the `dict-cisco`
 /// Cargo feature; the codegen emits the equivalent
-/// `dict::generated::cisco::attrs::CISCO_AVPAIR` const when that
+/// `dict::cisco::attrs::CISCO_AVPAIR` const when that
 /// feature is on.
 const CISCO_AVPAIR: VsaAttr<WText> = VsaAttr::new(9, 1);
 

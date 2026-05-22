@@ -548,14 +548,14 @@ mod tests {
     }
 
     // Full-tree tests against the vendored FreeRADIUS dictionaries live in
-    // `radius-dict` (which owns the `dictionaries/` directory). See
-    // `crates/radius-dict/src/lib.rs` `#[cfg(test)]` section.
+    // `radius-tokio-dict` (which owns the `dictionaries/` directory). See
+    // `crates/radius-tokio-dict/src/lib.rs` `#[cfg(test)]` section.
     //
-    // NOTE: tests below this line were moved to radius-dict to avoid a
+    // NOTE: tests below this line were moved to radius-tokio-dict to avoid a
     // path-dependency on the dictionaries directory from this build-only crate.
 
     #[test]
-    #[ignore = "dictionary files live in radius-dict; run from that crate"]
+    #[ignore = "dictionary files live in radius-tokio-dict; run from that crate"]
     fn parses_full_vendored_rfc_tree() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("dictionaries")
@@ -598,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "dictionary files live in radius-dict; run from that crate"]
+    #[ignore = "dictionary files live in radius-tokio-dict; run from that crate"]
     fn parses_full_vendored_vendor_tree() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("dictionaries")

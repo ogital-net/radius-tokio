@@ -1,5 +1,5 @@
 //! Renders a parsed [`Dictionary`] to a Rust source file consumed by
-//! the `radius-dict` crate's `generated` module.
+//! the `radius-tokio-dict` crate's `generated` module.
 //!
 //! Used by `build.rs` at compile time and by the in-tree determinism /
 //! snapshot tests. Output is deterministic: the parser preserves source
@@ -10,8 +10,13 @@ use std::fmt::Write;
 
 use super::{Dictionary, Flags, Type};
 
-/// Render `dict` to a string suitable for `include!()` inside a module
-/// rooted one level below `crate::dict` (so `super::Type::Foo` resolves).
+/// Render `dict` to a string suitable for `include!()` inside a
+/// dictionary-group submodule of `radius_tokio_dict`.
+///
+/// The emitted source references `AttrInfo`, `AttrKind`, and
+/// `VendorInfo` from the enclosing `generated` module (imported by
+/// each per-group `use super::{...}` line in `generated.rs`), plus the
+/// codec wire-shape markers in `crate::typed`.
 ///
 /// `module_label` is embedded in the file header comment for human
 /// orientation and has no semantic effect.
@@ -31,72 +36,11 @@ pub fn render(module_label: &str, dict: &Dictionary) -> String {
     .unwrap();
     writeln!(out).unwrap();
 
-    write_vendors(&mut out, dict);
-    writeln!(out).unwrap();
-    write_attributes(&mut out, dict);
-    writeln!(out).unwrap();
-    write_values(&mut out, dict);
-    writeln!(out).unwrap();
     write_attrs_module(&mut out, dict);
     writeln!(out).unwrap();
     write_values_module(&mut out, dict);
 
     out
-}
-
-fn write_vendors(out: &mut String, dict: &Dictionary) {
-    writeln!(out, "pub static VENDORS: &[VendorEntry] = &[").unwrap();
-    for v in &dict.vendors {
-        writeln!(
-            out,
-            "    VendorEntry {{ name: {name:?}, id: {id}, type_len: {type_len}, length_len: {length_len}, has_continuation: {cont} }},",
-            name = v.name,
-            id = v.id,
-            type_len = v.type_len,
-            length_len = v.length_len,
-            cont = v.has_continuation,
-        )
-        .unwrap();
-    }
-    writeln!(out, "];").unwrap();
-}
-
-fn write_attributes(out: &mut String, dict: &Dictionary) {
-    writeln!(out, "pub static ATTRIBUTES: &[AttributeEntry] = &[").unwrap();
-    for a in &dict.attributes {
-        let vendor = match a.vendor {
-            Some(v) => format!("Some({v})"),
-            None => "None".to_owned(),
-        };
-        let typ = match a.typ {
-            Type::FixedOctets(n) => format!("super::Type::FixedOctets({n})"),
-            other => type_literal(other).to_owned(),
-        };
-        writeln!(
-            out,
-            "    AttributeEntry {{ name: {name:?}, oid: &{oid}, vendor: {vendor}, typ: {typ}, flags: {flags} }},",
-            name = a.name,
-            oid = oid_literal(&a.oid.0),
-            flags = flags_literal(a.flags),
-        )
-        .unwrap();
-    }
-    writeln!(out, "];").unwrap();
-}
-
-fn write_values(out: &mut String, dict: &Dictionary) {
-    writeln!(out, "pub static VALUES: &[ValueEntry] = &[").unwrap();
-    for v in &dict.values {
-        writeln!(
-            out,
-            "    ValueEntry {{ attribute: {attr:?}, name: {name:?}, number: {n} }},",
-            attr = v.attribute,
-            name = v.name,
-            n = v.number,
-        )
-        .unwrap();
-    }
-    writeln!(out, "];").unwrap();
 }
 
 /// Emit `pub mod attrs { ... }` with one typed const per attribute.
@@ -155,7 +99,7 @@ fn write_attrs_module(out: &mut String, dict: &Dictionary) {
     .unwrap();
     writeln!(
         out,
-        "#[allow(missing_docs, unused_imports, clippy::wildcard_imports)]"
+        "#[allow(unused_imports, clippy::wildcard_imports, clippy::match_single_binding, clippy::too_many_lines)]"
     )
     .unwrap();
     writeln!(out, "pub mod attrs {{").unwrap();
@@ -216,7 +160,237 @@ fn write_attrs_module(out: &mut String, dict: &Dictionary) {
             _ => {}
         }
     }
+
+    // Diagnostic dispatchers consumed by `crate::registry`.
+    write_attr_lookups(out, dict);
+    write_vendor_lookup(out, dict);
+
     writeln!(out, "}}").unwrap();
+}
+
+/// Emit `pub const fn lookup(u8) -> Option<AttrInfo>`,
+/// `pub const fn lookup_vsa(u32, u8) -> Option<AttrInfo>`, and
+/// `pub const fn lookup_tlv(u8, u8) -> Option<AttrInfo>` inside the
+/// surrounding `pub mod attrs { … }`.
+///
+/// `lookup` matches single-component, non-vendor attribute codes;
+/// `lookup_vsa` matches single-component vendor attributes keyed by
+/// `(pen, vendor-type)`; `lookup_tlv` matches two-component,
+/// non-vendor children keyed by `(parent, child)` — used by the
+/// dissector to recurse into RFC-namespace TLV containers. Deeper
+/// (3+ component) and vendor-side TLV children remain reachable via
+/// the typed `TlvAttr<T>` / `VsaTlvAttr<T>` consts above.
+#[allow(clippy::too_many_lines)]
+fn write_attr_lookups(out: &mut String, dict: &Dictionary) {
+    use std::collections::BTreeMap;
+
+    // Some FreeRADIUS dictionaries restate the same attribute code
+    // across successor RFCs (or alias an old name). The legacy
+    // linear-scan registry returned the *first* hit; preserve that by
+    // building the lookup map with `entry().or_insert(...)`, which
+    // keeps the earliest occurrence in source order. The `BTreeMap`
+    // then yields the surviving entries in ascending key order, so
+    // the generated `match` arms are sorted — both human-readable
+    // and easier to diff across dictionary updates.
+
+    // ── top-level (non-vendor, single-component) ───────────────────
+    let mut by_code: BTreeMap<u8, &super::Attribute> = BTreeMap::new();
+    for a in &dict.attributes {
+        if a.vendor.is_some() || a.oid.0.len() != 1 {
+            continue;
+        }
+        let Ok(code) = u8::try_from(a.oid.0[0]) else {
+            continue;
+        };
+        by_code.entry(code).or_insert(a);
+    }
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "    /// Resolve a top-level attribute code (RFC namespace) to its diagnostic record."
+    )
+    .unwrap();
+    writeln!(out, "    #[must_use]").unwrap();
+    writeln!(
+        out,
+        "    pub const fn lookup(code: u8) -> Option<super::AttrInfo> {{"
+    )
+    .unwrap();
+    writeln!(out, "        match code {{").unwrap();
+    for (code, a) in &by_code {
+        writeln!(
+            out,
+            "            {code}u8 => Some(super::AttrInfo {{ name: {name:?}, kind: {kind}, encrypted: {enc} }}),",
+            name = a.name,
+            kind = attr_kind_literal(a.typ),
+            enc = a.flags.encrypt.is_some(),
+        )
+        .unwrap();
+    }
+    writeln!(out, "            _ => None,").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+
+    // ── single-component VSAs ──────────────────────────────────────
+    let mut by_pen_vt: BTreeMap<(u32, u8), &super::Attribute> = BTreeMap::new();
+    for a in &dict.attributes {
+        let Some(pen) = a.vendor else {
+            continue;
+        };
+        if a.oid.0.len() != 1 {
+            continue;
+        }
+        let Ok(vt) = u8::try_from(a.oid.0[0]) else {
+            continue;
+        };
+        by_pen_vt.entry((pen, vt)).or_insert(a);
+    }
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "    /// Resolve a Vendor-Specific attribute (`pen`, `vendor-type`) to its diagnostic record."
+    )
+    .unwrap();
+    writeln!(out, "    #[must_use]").unwrap();
+    writeln!(
+        out,
+        "    pub const fn lookup_vsa(pen: u32, vt: u8) -> Option<super::AttrInfo> {{"
+    )
+    .unwrap();
+    writeln!(out, "        match (pen, vt) {{").unwrap();
+    for ((pen, vt), a) in &by_pen_vt {
+        writeln!(
+            out,
+            "            ({pen}u32, {vt}u8) => Some(super::AttrInfo {{ name: {name:?}, kind: {kind}, encrypted: {enc} }}),",
+            name = a.name,
+            kind = attr_kind_literal(a.typ),
+            enc = a.flags.encrypt.is_some(),
+        )
+        .unwrap();
+    }
+    writeln!(out, "            _ => None,").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+
+    // ── top-level TLV children ─────────────────────────────────────
+    // Children of a `type=tlv` parent in the RFC namespace. The
+    // dictionary expresses these as a 2-component OID (parent.child)
+    // with no owning vendor; e.g. `IPv6-6rd-Configuration.IPv4MaskLen`
+    // is `173.1`. The dispatcher lets the dissector resolve each
+    // inner TLV slot inside a `Tlv`-kind parent attribute.
+    let mut by_parent_child: BTreeMap<(u8, u8), &super::Attribute> = BTreeMap::new();
+    for a in &dict.attributes {
+        if a.vendor.is_some() || a.oid.0.len() != 2 {
+            continue;
+        }
+        let Ok(parent) = u8::try_from(a.oid.0[0]) else {
+            continue;
+        };
+        let Ok(child) = u8::try_from(a.oid.0[1]) else {
+            continue;
+        };
+        by_parent_child.entry((parent, child)).or_insert(a);
+    }
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "    /// Resolve a TLV child (`parent`, `child`) in the RFC namespace to its diagnostic record."
+    )
+    .unwrap();
+    writeln!(out, "    #[must_use]").unwrap();
+    writeln!(
+        out,
+        "    pub const fn lookup_tlv(parent: u8, child: u8) -> Option<super::AttrInfo> {{"
+    )
+    .unwrap();
+    writeln!(out, "        match (parent, child) {{").unwrap();
+    for ((parent, child), a) in &by_parent_child {
+        writeln!(
+            out,
+            "            ({parent}u8, {child}u8) => Some(super::AttrInfo {{ name: {name:?}, kind: {kind}, encrypted: {enc} }}),",
+            name = a.name,
+            kind = attr_kind_literal(a.typ),
+            enc = a.flags.encrypt.is_some(),
+        )
+        .unwrap();
+    }
+    writeln!(out, "            _ => None,").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+}
+
+/// Emit `pub const fn lookup_vendor(u32) -> Option<VendorInfo>` inside
+/// `pub mod attrs { … }`. Maps an IANA Private Enterprise Number to a
+/// human-readable vendor record. Vendor framing fields (`type_len`,
+/// `length_len`, `has_continuation`) are not surfaced today; no
+/// caller honours non-default framing yet. Reintroduce when the
+/// dissector grows `format=t,l[,c]` support.
+fn write_vendor_lookup(out: &mut String, dict: &Dictionary) {
+    use std::collections::BTreeMap;
+
+    // Same first-wins + sorted-by-key emission as `write_attr_lookups`.
+    let mut by_pen: BTreeMap<u32, &super::Vendor> = BTreeMap::new();
+    for v in &dict.vendors {
+        by_pen.entry(v.id).or_insert(v);
+    }
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "    /// Resolve an IANA Private Enterprise Number to its vendor record."
+    )
+    .unwrap();
+    writeln!(out, "    #[must_use]").unwrap();
+    writeln!(
+        out,
+        "    pub const fn lookup_vendor(pen: u32) -> Option<super::VendorInfo> {{"
+    )
+    .unwrap();
+    writeln!(out, "        match pen {{").unwrap();
+    for (id, v) in &by_pen {
+        writeln!(
+            out,
+            "            {id}u32 => Some(super::VendorInfo {{ name: {name:?}, id: {id}u32 }}),",
+            name = v.name,
+        )
+        .unwrap();
+    }
+    writeln!(out, "            _ => None,").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+}
+
+/// Map a dictionary [`Type`] to the runtime [`AttrKind`] literal as it
+/// appears in generated source. Folds `Uint32` → `Integer` and any
+/// `FixedOctets(_)` / `Abinary` → `Octets`, mirroring the loss-of-
+/// detail in [`crate::AttrKind`] (the dissector treats them
+/// identically anyway).
+fn attr_kind_literal(t: Type) -> &'static str {
+    match t {
+        Type::String => "super::AttrKind::String",
+        Type::Octets | Type::FixedOctets(_) | Type::Abinary => "super::AttrKind::Octets",
+        Type::Ipaddr => "super::AttrKind::Ipaddr",
+        Type::Ipv6addr => "super::AttrKind::Ipv6addr",
+        Type::Ipv4prefix => "super::AttrKind::Ipv4prefix",
+        Type::Ipv6prefix => "super::AttrKind::Ipv6prefix",
+        Type::Byte => "super::AttrKind::Byte",
+        Type::Short => "super::AttrKind::Short",
+        Type::Integer | Type::Uint32 => "super::AttrKind::Integer",
+        Type::Integer64 => "super::AttrKind::Integer64",
+        Type::Signed => "super::AttrKind::Signed",
+        Type::Date => "super::AttrKind::Date",
+        Type::Ifid => "super::AttrKind::Ifid",
+        Type::Ether => "super::AttrKind::Ether",
+        Type::Tlv => "super::AttrKind::Tlv",
+        Type::Vsa => "super::AttrKind::Vsa",
+        Type::Evs => "super::AttrKind::Evs",
+        Type::Extended => "super::AttrKind::Extended",
+        Type::LongExtended => "super::AttrKind::LongExtended",
+        Type::Struct => "super::AttrKind::Struct",
+    }
 }
 
 /// Emit `pub mod values { ... }` with one Rust newtype per
@@ -235,6 +409,7 @@ fn write_attrs_module(out: &mut String, dict: &Dictionary) {
 /// references (an enumerator pointing to an attribute defined in a
 /// different group) are also skipped because the target type is
 /// unknown at this codegen site.
+#[allow(clippy::too_many_lines)]
 fn write_values_module(out: &mut String, dict: &Dictionary) {
     use std::collections::BTreeMap;
 
@@ -303,11 +478,16 @@ fn write_values_module(out: &mut String, dict: &Dictionary) {
     writeln!(out, "/// types.").unwrap();
     writeln!(
         out,
-        "#[allow(missing_docs, non_upper_case_globals, unused_imports, clippy::unreadable_literal, clippy::wildcard_imports)]"
+        "#[allow(unused_imports, clippy::wildcard_imports, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::match_single_binding, clippy::too_many_lines)]"
     )
     .unwrap();
     writeln!(out, "pub mod values {{").unwrap();
     writeln!(out, "    use crate::typed::*;").unwrap();
+
+    // Record `(attribute_name, type_ident, inner_type)` for every
+    // attribute we emit a newtype for, so the end-of-module dispatcher
+    // can route a `(name, number)` pair to the right `T::name()` impl.
+    let mut emitted: Vec<(&str, String, &'static str)> = Vec::new();
 
     for attr_name in order {
         let Some(attr) = attrs_by_name.get(attr_name).copied() else {
@@ -319,8 +499,53 @@ fn write_values_module(out: &mut String, dict: &Dictionary) {
         let Some(shape) = value_shape(attr.typ, attr.flags) else {
             continue;
         };
+        emitted.push((attr_name, pascal_ident(&attr.name), shape.inner));
         write_value_newtype(out, &attr.name, &shape, &groups[attr_name]);
     }
+
+    // Per-group reverse-lookup dispatcher. Routes a dictionary
+    // attribute name + raw integer to the matching newtype's
+    // `name()` method. Used by `crate::registry::value_name` to
+    // resolve enumerator names during packet dissection.
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "    /// Resolve `attr`'s enumerator number to its dictionary name."
+    )
+    .unwrap();
+    writeln!(out, "    ///").unwrap();
+    writeln!(
+        out,
+        "    /// Returns `None` for unknown attributes / values. Generated"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// dispatcher used by `crate::registry::value_name`."
+    )
+    .unwrap();
+    writeln!(out, "    #[must_use]").unwrap();
+    writeln!(
+        out,
+        "    pub fn value_name(attr: &str, number: i64) -> Option<&'static str> {{"
+    )
+    .unwrap();
+    if emitted.is_empty() {
+        writeln!(out, "        let _ = (attr, number);").unwrap();
+        writeln!(out, "        None").unwrap();
+    } else {
+        writeln!(out, "        match attr {{").unwrap();
+        for (attr_name, type_ident, inner) in &emitted {
+            writeln!(
+                out,
+                "            {attr_name:?} => {type_ident}(number as {inner}).name(),"
+            )
+            .unwrap();
+        }
+        writeln!(out, "            _ => None,").unwrap();
+        writeln!(out, "        }}").unwrap();
+    }
+    writeln!(out, "    }}").unwrap();
 
     writeln!(out, "}}").unwrap();
 }
@@ -676,64 +901,6 @@ fn wire_marker(t: Type, flags: Flags) -> &'static str {
     }
 }
 
-fn oid_literal(parts: &[u32]) -> String {
-    let mut s = String::from("[");
-    for (i, p) in parts.iter().enumerate() {
-        if i > 0 {
-            s.push_str(", ");
-        }
-        let _ = write!(s, "{p}u32");
-    }
-    s.push(']');
-    s
-}
-
-fn type_literal(t: Type) -> &'static str {
-    match t {
-        Type::String => "super::Type::String",
-        Type::Octets => "super::Type::Octets",
-        Type::Ipaddr => "super::Type::Ipaddr",
-        Type::Ipv6addr => "super::Type::Ipv6addr",
-        Type::Ipv4prefix => "super::Type::Ipv4prefix",
-        Type::Ipv6prefix => "super::Type::Ipv6prefix",
-        Type::Byte => "super::Type::Byte",
-        Type::Short => "super::Type::Short",
-        Type::Integer => "super::Type::Integer",
-        Type::Integer64 => "super::Type::Integer64",
-        Type::Signed => "super::Type::Signed",
-        Type::Date => "super::Type::Date",
-        Type::Ifid => "super::Type::Ifid",
-        Type::Ether => "super::Type::Ether",
-        Type::Abinary => "super::Type::Abinary",
-        Type::Tlv => "super::Type::Tlv",
-        Type::Vsa => "super::Type::Vsa",
-        Type::Evs => "super::Type::Evs",
-        Type::Extended => "super::Type::Extended",
-        Type::LongExtended => "super::Type::LongExtended",
-        Type::Struct => "super::Type::Struct",
-        Type::Uint32 => "super::Type::Uint32",
-        // FixedOctets carries a length and is rendered separately by
-        // the attribute writer.
-        Type::FixedOctets(_) => unreachable!("FixedOctets handled inline"),
-    }
-}
-
-fn flags_literal(f: Flags) -> String {
-    let encrypt = match f.encrypt {
-        Some(n) => format!("Some({n})"),
-        None => "None".to_owned(),
-    };
-    format!(
-        "super::Flags {{ encrypt: {encrypt}, has_tag: {tag}, concat: {concat}, array: {array}, virtual_: {virt}, internal: {internal}, secret: {secret} }}",
-        tag = f.has_tag,
-        concat = f.concat,
-        array = f.array,
-        virt = f.virtual_,
-        internal = f.internal,
-        secret = f.secret,
-    )
-}
-
 fn estimate_capacity(dict: &Dictionary) -> usize {
     // Rough lower bound; saves repeated reallocations on the larger
     // generated files (RFC: ~1k attributes, vendor: several thousand).
@@ -760,6 +927,13 @@ mod tests {
                     oid: Oid(vec![1]),
                     vendor: None,
                     typ: Type::String,
+                    flags: Flags::default(),
+                },
+                Attribute {
+                    name: "Service-Type".into(),
+                    oid: Oid(vec![6]),
+                    vendor: None,
+                    typ: Type::Integer,
                     flags: Flags::default(),
                 },
                 Attribute {
@@ -791,14 +965,33 @@ mod tests {
     #[test]
     fn render_emits_expected_sections() {
         let s = render("test", &fixture());
-        assert!(s.contains("pub static VENDORS"));
-        assert!(s.contains("pub static ATTRIBUTES"));
-        assert!(s.contains("pub static VALUES"));
-        assert!(s.contains("name: \"Acme\""));
-        assert!(s.contains("name: \"User-Name\""));
-        assert!(s.contains("vendor: Some(99)"));
-        assert!(s.contains("encrypt: Some(2)"));
-        assert!(s.contains("has_tag: true"));
+        // Diagnostic dispatchers live inside `pub mod attrs`.
+        assert!(s.contains("pub mod attrs"));
+        assert!(s.contains("pub const fn lookup(code: u8) -> Option<super::AttrInfo>"));
+        assert!(s.contains("pub const fn lookup_vsa(pen: u32, vt: u8) -> Option<super::AttrInfo>"));
+        assert!(s.contains("pub const fn lookup_vendor(pen: u32) -> Option<super::VendorInfo>"));
+        // The old `pub static` slices and `Type`/`Flags`/`AttributeEntry`
+        // record literals have been retired.
+        assert!(!s.contains("pub static VENDORS"));
+        assert!(!s.contains("pub static ATTRIBUTES"));
+        assert!(!s.contains("pub static VALUES"));
+        assert!(!s.contains("AttributeEntry"));
+        assert!(!s.contains("VendorEntry"));
+        assert!(!s.contains("super::Type::"));
+        assert!(!s.contains("super::Flags"));
+        // Values dispatcher is unchanged.
+        assert!(s.contains("pub mod values"));
+        assert!(s.contains("pub fn value_name"));
+        // Attribute and vendor names appear inside the lookup matches.
+        assert!(s.contains(r#"name: "Acme""#));
+        assert!(s.contains(r#"name: "User-Name""#));
+        // Vendor record dispatch.
+        assert!(s.contains("99u32 => Some(super::VendorInfo"));
+        // VSA dispatch keyed by (pen, vt).
+        assert!(s.contains("(99u32, 1u8) => Some(super::AttrInfo"));
+        // Encrypted attribute surfaces `encrypted: true`.
+        assert!(s.contains("encrypted: true"));
+        // Enumerator name lives in the per-newtype reverse-lookup table.
         assert!(s.contains("Framed-User"));
     }
 
@@ -900,6 +1093,11 @@ mod tests {
         assert!(s.contains("impl IntoWire<WTaggedInteger> for Tagged<TunnelType>"));
         // Reverse-lookup accessor.
         assert!(s.contains("pub fn name(self) -> Option<&'static str>"));
+        // Group-level dispatcher routes (name, number) into the right
+        // newtype's `name()` impl.
+        assert!(s.contains("pub fn value_name(attr: &str, number: i64) -> Option<&'static str>"));
+        assert!(s.contains("\"Service-Type\" => ServiceType(number as u32).name()"));
+        assert!(s.contains("\"Tunnel-Type\" => TunnelType(number as u32).name()"));
     }
 
     #[test]

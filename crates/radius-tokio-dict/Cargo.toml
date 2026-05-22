@@ -1,5 +1,5 @@
 [package]
-name = "radius-dict"
+name = "radius-tokio-dict"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.83"
@@ -42,10 +42,10 @@ dict-vendor-all = [
 ]
 
 [build-dependencies]
-radius-dict-codegen = { path = "../radius-dict-codegen", version = "0.1.0" }
+radius-tokio-dict-codegen = { path = "../radius-tokio-dict-codegen", version = "0.1.0" }
 
 [dev-dependencies]
-radius-dict-codegen = { path = "../radius-dict-codegen", version = "0.1.0" }
+radius-tokio-dict-codegen = { path = "../radius-tokio-dict-codegen", version = "0.1.0" }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

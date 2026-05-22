@@ -1,5 +1,5 @@
 [package]
-name = "radius-dict-codegen"
+name = "radius-tokio-dict-codegen"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.83"

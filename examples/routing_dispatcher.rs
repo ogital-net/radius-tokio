@@ -34,7 +34,7 @@
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use radius_tokio::dict::generated::rfc::attrs;
+use radius_tokio::dict::rfc::attrs;
 use radius_tokio::server::{
     Client, Handler, HandlerResult, IpCidr, ListenerRole, Request, Server, StaticClients,
 };

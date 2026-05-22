@@ -201,8 +201,8 @@ impl<'a> Request<'a> {
     /// surface:
     ///
     /// ```ignore
-    /// use radius_tokio::dict::generated::rfc::attrs;
-    /// use radius_tokio::dict::generated::cisco::vsas;
+    /// use radius_tokio::dict::rfc::attrs;
+    /// use radius_tokio::dict::cisco::vsas;
     ///
     /// let (mut has_eap, mut has_pap, mut has_chap, mut has_cisco_av) =
     ///     (false, false, false, false);
@@ -297,7 +297,7 @@ impl<'a> Request<'a> {
     pub fn user_name(&self) -> Option<&'a [u8]> {
         // 1 = User-Name (RFC 2865 §5.1). Hard-coded for parity with
         // `state()` — the typed handle for callers who want it is
-        // `dict::generated::rfc::attrs::USER_NAME`.
+        // `dict::rfc::attrs::USER_NAME`.
         self.first_raw(1).ok().flatten().map(|raw| raw.value())
     }
 
@@ -330,7 +330,7 @@ impl<'a> Request<'a> {
     /// attribute slot matching `attr`. The payload is *not* decoded
     /// under `T`, which is exactly what a top-level dispatch needs:
     /// ```ignore
-    /// use radius_tokio::dict::generated::rfc::attrs;
+    /// use radius_tokio::dict::rfc::attrs;
     ///
     /// if req.contains(attrs::EAP_MESSAGE) {
     ///     handle_eap(req).await

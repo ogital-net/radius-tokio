@@ -13,7 +13,7 @@
 //! [`first_vsa`](super::attributes::first_vsa) (find-first by code).
 //!
 //! ```ignore
-//! use radius_tokio::dict::generated::rfc::attrs;
+//! use radius_tokio::dict::rfc::attrs;
 //!
 //! for attr in packet.attributes_iter() {
 //!     if let Some(name) = attr.get(attrs::USER_NAME) {
@@ -22,7 +22,10 @@
 //! }
 //! ```
 //!
-//! The types themselves live in `radius-dict` and are re-exported here so
+//! The types themselves live in `radius-tokio-dict` and are re-exported here so
 //! codec consumers can reference them via the familiar `codec::typed` path.
 
-pub use radius_dict::typed::*;
+pub use radius_tokio_dict::{
+    Attr, IntoWire, Tagged, TlvAttr, VsaAttr, VsaTlvAttr, WByte, WBytes, WEther, WIfid, WInteger,
+    WInteger64, WIpv4, WIpv6, WShort, WSigned, WTaggedInteger, WTaggedText, WText, WireType,
+};

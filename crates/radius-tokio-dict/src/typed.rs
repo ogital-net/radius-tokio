@@ -11,7 +11,7 @@
 //! lookups in `radius_tokio::attributes`.
 //!
 //! ```ignore
-//! use radius_tokio::dict::generated::rfc::attrs;
+//! use radius_tokio::dict::rfc::attrs;
 //!
 //! for attr in packet.attributes_iter() {
 //!     if let Some(name) = attr.get(attrs::USER_NAME) {

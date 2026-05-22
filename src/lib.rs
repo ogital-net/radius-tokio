@@ -11,9 +11,9 @@ mod crypto;
 pub use crypto::ZeroizingBytes;
 /// FreeRADIUS dictionary types and compile-time generated attribute tables.
 ///
-/// This re-exports the `radius-dict` crate so that consumers can use paths
-/// such as `radius_tokio::dict::generated::rfc::attrs::USER_NAME`.
-pub use radius_dict as dict;
+/// This re-exports the `radius-tokio-dict` crate so that consumers can use paths
+/// such as `radius_tokio::dict::rfc::attrs::USER_NAME`.
+pub use radius_tokio_dict as dict;
 #[macro_use]
 mod obs;
 pub mod server;
