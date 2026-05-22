@@ -626,6 +626,46 @@ fn write_value_newtype(
     writeln!(out, "    }}").unwrap();
     writeln!(out).unwrap();
 
+    // Symmetric `PartialEq` against the underlying scalar so callers
+    // can write `st == ServiceType::LOGIN_USER` directly against the
+    // raw integer returned by `attr.get(...)` — no `.as_u32()` round-trip.
+    writeln!(out, "    impl PartialEq<{inner}> for {type_ident} {{").unwrap();
+    writeln!(out, "        #[inline]").unwrap();
+    writeln!(
+        out,
+        "        fn eq(&self, other: &{inner}) -> bool {{ self.0 == *other }}"
+    )
+    .unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    impl PartialEq<{type_ident}> for {inner} {{").unwrap();
+    writeln!(out, "        #[inline]").unwrap();
+    writeln!(
+        out,
+        "        fn eq(&self, other: &{type_ident}) -> bool {{ *self == other.0 }}"
+    )
+    .unwrap();
+    writeln!(out, "    }}").unwrap();
+    // `From` conversions in both directions so callers can move
+    // between the newtype and its underlying scalar without poking
+    // at the public `.0` field.
+    writeln!(out, "    impl From<{inner}> for {type_ident} {{").unwrap();
+    writeln!(out, "        #[inline]").unwrap();
+    writeln!(
+        out,
+        "        fn from(value: {inner}) -> Self {{ Self(value) }}"
+    )
+    .unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    impl From<{type_ident}> for {inner} {{").unwrap();
+    writeln!(out, "        #[inline]").unwrap();
+    writeln!(
+        out,
+        "        fn from(value: {type_ident}) -> Self {{ value.0 }}"
+    )
+    .unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
     // IntoWire impls — one for the direct shape, plus a tagged
     // pair impl when the attribute has `has_tag`.
     let marker = shape.marker;
@@ -1088,6 +1128,13 @@ mod tests {
         assert!(s.contains("pub const PPTP: Self = Self(1u32);"));
         // Plain integer attribute → IntoWire<WInteger> impl on the newtype.
         assert!(s.contains("impl IntoWire<WInteger> for ServiceType"));
+        // Symmetric PartialEq with the inner scalar so callers can
+        // compare an `attr.get(...)` result directly against a const.
+        assert!(s.contains("impl PartialEq<u32> for ServiceType"));
+        assert!(s.contains("impl PartialEq<ServiceType> for u32"));
+        // `From` round-trips between the newtype and its inner scalar.
+        assert!(s.contains("impl From<u32> for ServiceType"));
+        assert!(s.contains("impl From<ServiceType> for u32"));
         // Tagged attribute → IntoWire<WTaggedInteger> for (u8, NewType).
         assert!(s.contains("impl IntoWire<WTaggedInteger> for (u8, TunnelType)"));
         assert!(s.contains("impl IntoWire<WTaggedInteger> for Tagged<TunnelType>"));
