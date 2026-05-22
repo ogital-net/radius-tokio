@@ -682,6 +682,14 @@ name = "radius-tokio-dict-codegen"
 version = "0.1.0"
 
 [[package]]
+name = "radius-tokio-eap"
+version = "0.1.0"
+dependencies = [
+ "radius-tokio",
+ "tokio",
+]
+
+[[package]]
 name = "rapidhash"
 version = "4.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -24,6 +24,31 @@ pub(crate) fn fill(buf: &mut [MaybeUninit<u8>]) {
     assert_eq!(ret, 1, "RAND_bytes failed");
 }
 
+/// Fills `buf` with cryptographically secure random bytes from
+/// aws-lc's `RAND_bytes`.
+///
+/// Suitable for nonces, EAP session identifiers, RADIUS Request
+/// Authenticators, MS-MPPE salts, and other places that require an
+/// unpredictable bit string. The underlying generator is the same
+/// CSPRNG used by the TLS stack in this crate.
+///
+/// # Panics
+///
+/// Panics if `RAND_bytes` returns an error. aws-lc always returns 1
+/// for non-empty buffers; the assert exists to catch any future
+/// behavioral change rather than silently shipping deterministic
+/// bytes into security-critical code paths.
+pub fn fill_secure(buf: &mut [u8]) {
+    if buf.is_empty() {
+        return;
+    }
+    // SAFETY: buf is a valid, writable slice for buf.len() bytes;
+    // RAND_bytes writes exactly that many bytes. Return value
+    // asserted below.
+    let ret = unsafe { aws_lc_sys::RAND_bytes(buf.as_mut_ptr(), buf.len()) };
+    assert_eq!(ret, 1, "RAND_bytes failed");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

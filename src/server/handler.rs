@@ -233,6 +233,18 @@ impl<'a> Request<'a> {
         attributes::iter(self.attributes)
     }
 
+    /// Borrow the raw attribute region as a contiguous byte slice.
+    ///
+    /// Useful for handlers that need to **own** a copy of the
+    /// inbound attribute payload across an `.await` (the borrowed
+    /// [`Request`] doesn't survive a future) and re-walk it later
+    /// with [`crate::codec::attributes::iter`]. For inline single-
+    /// pass inspection prefer [`Self::attributes_iter`].
+    #[must_use]
+    pub fn raw_attributes(&self) -> &'a [u8] {
+        self.attributes
+    }
+
     /// Find the first well-formed attribute with the given type byte.
     /// Returns `Ok(None)` if no attribute of that type was present;
     /// returns `Err` if a malformed attribute was hit before one

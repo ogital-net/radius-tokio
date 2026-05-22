@@ -1938,6 +1938,27 @@ impl TlsConnection {
         matches!(err, SSL_ERROR_WANT_READ | SSL_ERROR_WANT_WRITE)
     }
 
+    /// Returns `true` iff the negotiated record-layer version is
+    /// TLS 1.3 or later. Returns `false` before the handshake has
+    /// progressed past `ServerHello` (i.e. while `SSL_version` is
+    /// still reporting the placeholder value).
+    ///
+    /// EAP methods that derive keying material need this to pick
+    /// the right exporter label (RFC 5216's `"client EAP
+    /// encryption"` vs. RFC 9190's
+    /// `"EXPORTER_EAP_TLS_Key_Material"`) and to know whether to
+    /// emit the RFC 9190 §2.5 commitment message before computing
+    /// the MSK.
+    #[must_use]
+    pub fn is_tls13(&self) -> bool {
+        // SAFETY: ssl valid; SSL_version returns the negotiated
+        // protocol number, or the configured max version before
+        // negotiation completes. Comparing with the TLS 1.3
+        // constant from aws-lc's bindings.
+        let version = unsafe { SSL_version(self.ssl.0.as_ptr()) };
+        version >= TLS1_3_VERSION
+    }
+
     /// Request a TLS 1.3 traffic-key update (RFC 8446 §4.6.3).
     ///
     /// Used by the RadSec connection driver to bound the data

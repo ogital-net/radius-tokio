@@ -5,12 +5,12 @@
 //! `eap_identifier` is the single-byte `Identifier` field copied from
 //! the EAP-Request that carried the challenge.
 //!
-//! Full EAP method termination is an explicit non-goal of this
-//! library; the codec relays `EAP-Message`
-//! attributes and this module exposes the raw computation needed by
-//! consumers that wish to terminate EAP-MD5 in their handler. The
-//! state machine — issuing the request, tracking the `State`
-//! attribute, etc. — is the consumer's responsibility.
+//! This module exposes only the **raw crypto primitive** — it does
+//! not own the EAP state machine, identifier allocation, or `State`
+//! cookie management. Consumers that want a drop-in EAP-MD5 server
+//! should use the `EapMd5Factory` shipped by the companion
+//! `radius-tokio-eap` crate, which wraps these primitives in the
+//! `EapMethod` / `EapHandler` surface.
 //!
 //! No shared-secret obfuscation: the password is hashed directly. The
 //! [`Client`](crate::server::Client) shared secret is therefore

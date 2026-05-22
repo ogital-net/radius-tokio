@@ -18,6 +18,15 @@
 //! | MS-CHAPv2                    | [`mschap`] | RFC 2759 / RFC 2548 | implemented |
 //! | EAP-MD5-Challenge            | [`eap_md5`] | RFC 3748 §5.4 | response computation |
 //!
+//! The credential primitives in this module are deliberately
+//! state-machine-free — they verify one credential against an
+//! expected value and return. For a full EAP server state machine
+//! that drives these primitives over the `EAP-Message` codec
+//! (including identity capture, identifier allocation, and `State`
+//! cookie management), see the companion `radius-tokio-eap` crate:
+//! its `EapMd5Factory` wraps [`eap_md5`] and the PEAP / EAP-TTLS
+//! factories wrap [`mschap`].
+//!
 //! # Pattern
 //!
 //! ```ignore

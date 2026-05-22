@@ -31,7 +31,7 @@ pub(crate) mod md5;
 pub(crate) mod password;
 #[cfg(feature = "radsec")]
 pub mod pki;
-pub(crate) mod rand;
+pub mod rand;
 pub(crate) mod sha1;
 #[cfg(feature = "radsec")]
 pub mod tls;
@@ -40,7 +40,14 @@ pub mod tls;
 ///
 /// Returns `false` immediately if the lengths differ (length is not secret).
 /// Otherwise delegates to `CRYPTO_memcmp` to avoid timing side-channels.
-pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+///
+/// Exposed publicly so that EAP method implementations in the
+/// companion `radius-tokio-eap` crate — and any out-of-tree handler
+/// that compares a peer-supplied secret against an expected value —
+/// can share the same primitive instead of hand-rolling their own
+/// XOR-accumulator loop.
+#[must_use]
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

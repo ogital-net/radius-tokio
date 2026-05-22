@@ -1,0 +1,63 @@
+[package]
+name = "radius-tokio-eap"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+description = "TLS-tunnelled EAP methods (EAP-TLS, PEAP, EAP-TTLS) for radius-tokio"
+license = "BSD-2-Clause"
+repository = "https://github.com/example/radius-tokio"
+keywords = ["radius", "eap", "peap", "eap-tls", "eap-ttls"]
+categories = ["network-programming", "authentication"]
+
+[features]
+# No default features — methods are opt-in so downstreams that only
+# need the auth primitives in `radius-tokio` core pay nothing for
+# this crate's wire drivers. The TLS-tunnelled methods all pull
+# `radius-tokio/radsec` because they rely on `TlsContext` /
+# `TlsConnection` from the core crate's TLS module; EAP-MD5 has
+# no extra dependencies.
+default = []
+
+# EAP-MD5-Challenge (RFC 3748 §5.4). Bare, untunneled. No MSK / no
+# mutual auth — fine for low-stakes wired 802.1X and as a codec
+# regression target; use a TLS-tunnelled method for WPA2/3 Enterprise.
+eap-md5 = []
+
+# Native (bare) EAP-MSCHAPv2 (EAP type 26,
+# `draft-kamath-pppext-eap-mschapv2`). No outer TLS, no MSK (RFC
+# 3079 GetMasterKey not wired in). Provided for legacy wired
+# 802.1X interoperability; use PEAP / EAP-TTLS for wireless.
+eap-mschapv2 = []
+
+# EAP-TLS (RFC 5216 / RFC 9190). Server-authenticated or mutually
+# authenticated TLS session whose exporter output (RFC 5705 §4)
+# becomes the MSK.
+eap-tls = ["radius-tokio/radsec"]
+
+# PEAP v0 / v1 (`draft-josefsson-pppext-eap-tls-eap`, IETF de-facto
+# standard). Outer TLS session protects an inner EAP method
+# (typically EAP-MSCHAPv2) negotiated over the TLS record stream.
+peap = ["radius-tokio/radsec"]
+
+# EAP-TTLS (RFC 5281). Outer TLS session carries inner attribute
+# AVPs (PAP / CHAP / MS-CHAP / inner EAP).
+eap-ttls = ["radius-tokio/radsec"]
+
+# Umbrella enabling every EAP method this crate ships.
+all-methods = ["eap-md5", "eap-mschapv2", "eap-tls", "peap", "eap-ttls"]
+
+[dependencies]
+radius-tokio = { path = "../..", version = "0.1.0" }
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }
+radius-tokio = { path = "../..", version = "0.1.0", features = ["radsec"] }
+
+[[example]]
+name = "peap_mschapv2"
+required-features = ["peap"]
+
+[[example]]
+name = "multi_method"
+required-features = ["peap", "eap-md5"]

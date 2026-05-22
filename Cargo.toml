@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/radius-tokio-dict-codegen",
     "crates/radius-tokio-dict",
+    "crates/radius-tokio-eap",
 ]
 resolver = "2"
 
