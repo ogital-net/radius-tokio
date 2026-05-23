@@ -508,17 +508,17 @@ impl<'a> Request<'a> {
 /// use std::sync::Arc;
 /// use radius_tokio::server::test_support::MockRequest;
 /// use radius_tokio::server::{Client, HandlerResult};
+/// use radius_tokio::dict::rfc::attrs;
 /// use radius_tokio::Code;
 ///
 /// # async fn run<H: radius_tokio::server::Handler>(handler: &H) {
 /// let client = Arc::new(Client::new(b"shared-secret".as_slice()));
-/// // User-Name (1) = "alice"
-/// let attrs: &[u8] = &[1, 7, b'a', b'l', b'i', b'c', b'e'];
-/// let request = MockRequest::new()
+/// let mut mock = MockRequest::new()
 ///     .code(Code::ACCESS_REQUEST)
 ///     .identifier(7)
-///     .authenticator([0xAB; 16])
-///     .build(attrs, &client);
+///     .authenticator([0xAB; 16]);
+/// mock.add(attrs::USER_NAME, "alice").unwrap();
+/// let request = mock.build(&client);
 ///
 /// match handler.handle(request).await {
 ///     HandlerResult::Reply(_reply) => { /* assertions */ }
@@ -531,22 +531,39 @@ pub mod test_support {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
+    use crate::codec::typed::{Attr, IntoWire, VsaAttr, WireType};
+    use crate::codec::{CodecError, PacketBuffer, TlvWriter};
+
     use super::{Client, Code, Request};
 
     /// Builder for synthesizing [`Request`] values in handler unit
     /// tests.
     ///
-    /// All fields have sensible defaults; override only what the
-    /// test cares about. The attribute bytes and the [`Client`] are
-    /// supplied at [`build`](Self::build) time so the resulting
-    /// [`Request`] can borrow from caller-owned storage.
-    #[derive(Debug, Clone)]
+    /// All header-shaped fields have sensible defaults; override
+    /// only what the test cares about. Attributes are appended
+    /// through the [`add`](Self::add) / [`add_vsa`](Self::add_vsa) /
+    /// [`add_tlv`](Self::add_tlv) /
+    /// [`add_vsa_tlv`](Self::add_vsa_tlv) /
+    /// [`add_attribute`](Self::add_attribute) helpers, which encode
+    /// values through the same machinery the live encoder uses — so
+    /// callers don't need to hand-craft TLV bytes unless they want
+    /// to. Call [`build`](Self::build) to materialize a [`Request`]
+    /// borrowing from the builder's internal storage and the
+    /// supplied [`Client`].
+    #[derive(Debug)]
     pub struct MockRequest {
         code: Code,
         identifier: u8,
         authenticator: [u8; 16],
         src: SocketAddr,
         dst: SocketAddr,
+        /// Internal buffer used solely as a scratch encoder for the
+        /// attribute region. Only `buf.attributes()` is observed at
+        /// [`build`](Self::build) time; the header bytes are not
+        /// consulted (they exist only to satisfy `PacketBuffer`'s
+        /// invariants and to allow reuse of the live attribute
+        /// encoders).
+        buf: PacketBuffer,
     }
 
     impl MockRequest {
@@ -561,6 +578,7 @@ pub mod test_support {
                 authenticator: [0; 16],
                 src: SocketAddr::from(([127, 0, 0, 1], 5000)),
                 dst: SocketAddr::from(([127, 0, 0, 1], 1812)),
+                buf: PacketBuffer::new(Code::ACCESS_REQUEST, 0),
             }
         }
 
@@ -604,16 +622,95 @@ pub mod test_support {
             self
         }
 
-        /// Materialize a [`Request`] borrowing from `attributes` and
-        /// `client`. The returned view has the same lifetime
-        /// constraints as one produced by the live server pipeline.
+        /// Append a top-level attribute by typed handle. Mirrors
+        /// [`crate::Reply::add`].
+        ///
+        /// # Errors
+        ///
+        /// Forwards every [`CodecError`] surfaced by the encoder
+        /// (value too long, packet length budget exceeded, …).
+        pub fn add<T, V>(&mut self, attr: Attr<T>, value: V) -> Result<&mut Self, CodecError>
+        where
+            T: WireType,
+            V: IntoWire<T>,
+        {
+            self.buf.add(attr, value)?;
+            Ok(self)
+        }
+
+        /// Append a Vendor-Specific Attribute by typed handle.
+        /// Mirrors [`crate::Reply::add_vsa`].
+        ///
+        /// # Errors
+        ///
+        /// Forwards every [`CodecError`] surfaced by the encoder.
+        pub fn add_vsa<T, V>(&mut self, attr: VsaAttr<T>, value: V) -> Result<&mut Self, CodecError>
+        where
+            T: WireType,
+            V: IntoWire<T>,
+        {
+            self.buf.add_vsa(attr, value)?;
+            Ok(self)
+        }
+
+        /// Append a top-level TLV-typed parent attribute, building
+        /// its children inside the supplied closure. Mirrors
+        /// [`crate::Reply::add_tlv`].
+        ///
+        /// # Errors
+        ///
+        /// Forwards every [`CodecError`] surfaced by the encoder.
+        pub fn add_tlv<F>(&mut self, parent_type: u8, build: F) -> Result<&mut Self, CodecError>
+        where
+            F: FnOnce(&mut TlvWriter<'_>) -> Result<(), CodecError>,
+        {
+            self.buf.add_tlv(parent_type, build)?;
+            Ok(self)
+        }
+
+        /// Append a vendor-specific TLV-typed parent attribute,
+        /// building its children inside the supplied closure.
+        /// Mirrors [`crate::Reply::add_vsa_tlv`].
+        ///
+        /// # Errors
+        ///
+        /// Forwards every [`CodecError`] surfaced by the encoder.
+        pub fn add_vsa_tlv<F>(
+            &mut self,
+            vendor: u32,
+            vendor_type: u8,
+            build: F,
+        ) -> Result<&mut Self, CodecError>
+        where
+            F: FnOnce(&mut TlvWriter<'_>) -> Result<(), CodecError>,
+        {
+            self.buf.add_vsa_tlv(vendor, vendor_type, build)?;
+            Ok(self)
+        }
+
+        /// Append a raw attribute by `(type, value)` bytes. Escape
+        /// hatch for tests that want to exercise malformed payloads
+        /// or attribute types without a typed handle.
+        ///
+        /// # Errors
+        ///
+        /// Forwards every [`CodecError`] surfaced by the encoder.
+        pub fn add_attribute(&mut self, typ: u8, value: &[u8]) -> Result<&mut Self, CodecError> {
+            self.buf.add_attribute(typ, value)?;
+            Ok(self)
+        }
+
+        /// Materialize a [`Request`] borrowing from this builder's
+        /// internal attribute storage and the supplied [`Client`].
+        /// The returned view has the same lifetime constraints as
+        /// one produced by the live server pipeline.
         #[must_use]
-        pub fn build<'a>(&self, attributes: &'a [u8], client: &'a Arc<Client>) -> Request<'a> {
+        pub fn build<'a>(&'a self, client: &'a Arc<Client>) -> Request<'a> {
             Request::new(
                 self.code,
                 self.identifier,
                 self.authenticator,
-                attributes,
+                self.buf.attributes(),
                 client,
                 self.src,
                 self.dst,
@@ -939,16 +1036,17 @@ mod tests {
     #[test]
     fn mock_request_applies_overrides_and_defaults() {
         use super::test_support::MockRequest;
+        use crate::dict::rfc::attrs;
 
         let client = Arc::new(Client::new(b"s".as_slice()));
-        let attrs: &[u8] = &[1, 7, b'a', b'l', b'i', b'c', b'e'];
-        let req = MockRequest::new()
+        let mut mock = MockRequest::new()
             .code(Code::ACCOUNTING_REQUEST)
             .identifier(99)
             .authenticator([0x5A; 16])
             .src("10.0.0.1:6000".parse().unwrap())
-            .dst("127.0.0.1:1813".parse().unwrap())
-            .build(attrs, &client);
+            .dst("127.0.0.1:1813".parse().unwrap());
+        mock.add(attrs::USER_NAME, "alice").unwrap();
+        let req = mock.build(&client);
 
         assert_eq!(req.code(), Code::ACCOUNTING_REQUEST);
         assert_eq!(req.identifier(), 99);
@@ -963,9 +1061,22 @@ mod tests {
         use super::test_support::MockRequest;
 
         let client = Arc::new(Client::new(b"s".as_slice()));
-        let req = MockRequest::default().build(&[], &client);
+        let mock = MockRequest::default();
+        let req = mock.build(&client);
         assert_eq!(req.code(), Code::ACCESS_REQUEST);
         assert_eq!(req.identifier(), 0);
         assert_eq!(req.dst().port(), 1812);
+        assert!(req.raw_attributes().is_empty());
+    }
+
+    #[test]
+    fn mock_request_add_raw_attribute() {
+        use super::test_support::MockRequest;
+
+        let client = Arc::new(Client::new(b"s".as_slice()));
+        let mut mock = MockRequest::new();
+        mock.add_attribute(1, b"bob").unwrap();
+        let req = mock.build(&client);
+        assert_eq!(req.user_name(), Some(b"bob".as_slice()));
     }
 }
