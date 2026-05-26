@@ -96,7 +96,7 @@ impl StaticCredentials {
 }
 
 impl Credentials for StaticCredentials {
-    async fn lookup(&self, username: &[u8]) -> Option<Vec<u8>> {
+    async fn lookup<'a>(&'a self, username: &'a [u8]) -> Option<Vec<u8>> {
         if username == self.username.as_slice() {
             Some(self.password.clone())
         } else {

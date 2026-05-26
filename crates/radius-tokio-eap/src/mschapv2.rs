@@ -180,7 +180,7 @@ impl StaticCredentials {
 }
 
 impl Credentials for StaticCredentials {
-    async fn lookup(&self, username: &[u8]) -> Option<CredentialSecret> {
+    async fn lookup<'a>(&'a self, username: &'a [u8]) -> Option<CredentialSecret> {
         if username == self.username.as_slice() {
             Some(match &self.secret {
                 CredentialSecret::Cleartext(s) => CredentialSecret::Cleartext(s.clone()),

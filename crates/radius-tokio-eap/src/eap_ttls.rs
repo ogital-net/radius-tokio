@@ -249,7 +249,7 @@ impl StaticPapCredentials {
 }
 
 impl PapCredentials for StaticPapCredentials {
-    async fn verify(&self, username: &[u8], password: &[u8]) -> bool {
+    async fn verify<'a>(&'a self, username: &'a [u8], password: &'a [u8]) -> bool {
         // Constant-time compare on the password to avoid timing
         // leaks on the secret half; username equality is fine to
         // short-circuit.
