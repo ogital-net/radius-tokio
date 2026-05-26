@@ -187,18 +187,17 @@ impl<M: EapMethod + 'static> SessionStore for InMemorySessionStore<M> {
 mod tests {
     use super::*;
     use crate::method::MethodOutcome;
-    use crate::Error;
 
     struct Dummy;
     impl EapMethod for Dummy {
         fn typ(&self) -> radius_tokio::eap::Type {
             radius_tokio::eap::Type::TLS
         }
-        fn start(&mut self) -> Result<MethodOutcome, Error> {
-            Ok(MethodOutcome::Continue(vec![]))
+        fn start(&mut self) -> crate::method::MethodFuture<'_> {
+            Box::pin(async move { Ok(MethodOutcome::Continue(vec![])) })
         }
-        fn step(&mut self, _: &[u8]) -> Result<MethodOutcome, Error> {
-            Ok(MethodOutcome::Failure)
+        fn step<'a>(&'a mut self, _: &'a [u8]) -> crate::method::MethodFuture<'a> {
+            Box::pin(async move { Ok(MethodOutcome::Failure) })
         }
     }
 

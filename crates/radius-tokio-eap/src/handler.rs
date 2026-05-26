@@ -105,19 +105,33 @@ pub trait AcceptDecorator: Send + Sync + 'static {
     /// Stamp authorisation attributes on `reply` for the user
     /// described by `ctx`.
     ///
+    /// The returned future is `Send` so the EAP handler can
+    /// `.await` it across runtime boundaries (e.g. while talking
+    /// to a policy backend).
+    ///
     /// # Errors
     ///
     /// Any [`CodecError`] (e.g. an attribute value too long for
     /// its 253-byte slot) causes the handler to drop the request.
-    fn decorate(&self, ctx: &AcceptContext<'_>, reply: &mut Reply) -> Result<(), CodecError>;
+    fn decorate<'a>(
+        &'a self,
+        ctx: &'a AcceptContext<'a>,
+        reply: &'a mut Reply,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CodecError>> + Send + 'a>>;
 }
 
 impl<F> AcceptDecorator for F
 where
     F: Fn(&AcceptContext<'_>, &mut Reply) -> Result<(), CodecError> + Send + Sync + 'static,
 {
-    fn decorate(&self, ctx: &AcceptContext<'_>, reply: &mut Reply) -> Result<(), CodecError> {
-        (self)(ctx, reply)
+    fn decorate<'a>(
+        &'a self,
+        ctx: &'a AcceptContext<'a>,
+        reply: &'a mut Reply,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CodecError>> + Send + 'a>>
+    {
+        let result = (self)(ctx, reply);
+        Box::pin(async move { result })
     }
 }
 
@@ -292,6 +306,7 @@ where
                 &raw_attributes,
                 self.accept_decorator.as_deref(),
             )
+            .await
         }
     }
 }
@@ -330,7 +345,7 @@ where
             if let Some(id) = peer_identity.as_deref() {
                 method.notify_peer_identity(id);
             }
-            let outcome = method.start()?;
+            let outcome = method.start().await?;
             let method_typ = method.typ();
             let mut session = Session::new(method);
             session.peer_identity = peer_identity;
@@ -351,7 +366,7 @@ where
                 eap_identifier: peer_id,
             });
         }
-        let outcome = session.method.step(pkt.type_data())?;
+        let outcome = session.method.step(pkt.type_data()).await?;
         commit_outcome(&self.store, outcome, session, peer_id, method_typ).await
     }
 }
@@ -376,7 +391,7 @@ pub(crate) enum Dispatch {
     Drop,
 }
 
-pub(crate) fn render_dispatch(
+pub(crate) async fn render_dispatch(
     outcome: Dispatch,
     radius_identifier: u8,
     req_auth: &[u8; 16],
@@ -429,7 +444,7 @@ pub(crate) fn render_dispatch(
                     user_name,
                     raw_attributes,
                 };
-                if decorator.decorate(&ctx, &mut reply).is_err() {
+                if decorator.decorate(&ctx, &mut reply).await.is_err() {
                     return HandlerResult::Drop;
                 }
             }

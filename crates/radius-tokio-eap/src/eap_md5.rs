@@ -61,12 +61,18 @@ use crate::Error;
 ///
 /// Implementors typically wrap a backend store (LDAP, SQL,
 /// configuration file). The trait is `Sync` because a single
-/// `Arc<dyn Credentials>` is shared across every session the
-/// listener accepts.
+/// `Arc<C>` is shared across every session the listener accepts.
 pub trait Credentials: Send + Sync + 'static {
     /// Resolve `username` to the cleartext password used to derive
     /// the expected response. Returns `None` for an unknown user.
-    fn lookup(&self, username: &[u8]) -> Option<Vec<u8>>;
+    ///
+    /// The returned future is `Send` so the EAP driver can `.await`
+    /// it across runtime boundaries (e.g. while talking to a
+    /// database or LDAP backend).
+    fn lookup<'a>(
+        &'a self,
+        username: &'a [u8],
+    ) -> impl std::future::Future<Output = Option<Vec<u8>>> + Send + 'a;
 }
 
 /// In-memory single-user credential store. Useful for tests and
@@ -90,7 +96,7 @@ impl StaticCredentials {
 }
 
 impl Credentials for StaticCredentials {
-    fn lookup(&self, username: &[u8]) -> Option<Vec<u8>> {
+    async fn lookup(&self, username: &[u8]) -> Option<Vec<u8>> {
         if username == self.username.as_slice() {
             Some(self.password.clone())
         } else {
@@ -149,19 +155,21 @@ impl<C: Credentials> EapMethod for EapMd5<C> {
         }
     }
 
-    fn start(&mut self) -> Result<MethodOutcome, Error> {
-        if !matches!(self.state, State::Init) {
-            return Err(Error::Framing("EAP-MD5 start called after start"));
-        }
-        let mut challenge = [0u8; primitives::RESPONSE_LEN];
-        rand::fill_secure(&mut challenge);
-        self.state = State::AwaitingResponse {
-            challenge,
-            request_id: None,
-        };
-        Ok(MethodOutcome::Continue(build_challenge_type_data(
-            &challenge,
-        )))
+    fn start(&mut self) -> crate::method::MethodFuture<'_> {
+        Box::pin(async move {
+            if !matches!(self.state, State::Init) {
+                return Err(Error::Framing("EAP-MD5 start called after start"));
+            }
+            let mut challenge = [0u8; primitives::RESPONSE_LEN];
+            rand::fill_secure(&mut challenge);
+            self.state = State::AwaitingResponse {
+                challenge,
+                request_id: None,
+            };
+            Ok(MethodOutcome::Continue(build_challenge_type_data(
+                &challenge,
+            )))
+        })
     }
 
     fn notify_request_id(&mut self, eap_id: u8) {
@@ -170,34 +178,37 @@ impl<C: Credentials> EapMethod for EapMd5<C> {
         }
     }
 
-    fn step(&mut self, peer_type_data: &[u8]) -> Result<MethodOutcome, Error> {
-        let State::AwaitingResponse {
-            challenge,
-            request_id,
-        } = &self.state
-        else {
-            return Err(Error::Framing("EAP-MD5 step called before start"));
-        };
+    fn step<'a>(&'a mut self, peer_type_data: &'a [u8]) -> crate::method::MethodFuture<'a> {
+        Box::pin(async move {
+            let State::AwaitingResponse {
+                challenge,
+                request_id,
+            } = &self.state
+            else {
+                return Err(Error::Framing("EAP-MD5 step called before start"));
+            };
+            let challenge = *challenge;
+            let request_id = request_id.ok_or(Error::Framing("EAP-MD5 missing request id"))?;
 
-        let response = parse_response_type_data(peer_type_data)
-            .ok_or(Error::Framing("EAP-MD5 response malformed"))?;
-        let request_id = request_id.ok_or(Error::Framing("EAP-MD5 missing request id"))?;
+            let response = parse_response_type_data(peer_type_data)
+                .ok_or(Error::Framing("EAP-MD5 response malformed"))?;
 
-        let Some(password) = self.creds.lookup(&self.username) else {
-            return Ok(MethodOutcome::Failure);
-        };
+            let Some(password) = self.creds.lookup(&self.username).await else {
+                return Ok(MethodOutcome::Failure);
+            };
 
-        if primitives::verify_response(request_id, &password, challenge, &response) {
-            // EAP-MD5 derives no keying material; emit Success with
-            // empty MSK / EMSK. The handler honors empty MSK by
-            // skipping MS-MPPE key emission.
-            Ok(MethodOutcome::Success {
-                msk: Vec::new(),
-                emsk: Vec::new(),
-            })
-        } else {
-            Ok(MethodOutcome::Failure)
-        }
+            if primitives::verify_response(request_id, &password, &challenge, &response) {
+                // EAP-MD5 derives no keying material; emit Success with
+                // empty MSK / EMSK. The handler honors empty MSK by
+                // skipping MS-MPPE key emission.
+                Ok(MethodOutcome::Success {
+                    msk: Vec::new(),
+                    emsk: Vec::new(),
+                })
+            } else {
+                Ok(MethodOutcome::Failure)
+            }
+        })
     }
 }
 
@@ -286,12 +297,12 @@ mod tests {
         assert_eq!(parsed, [0xCD; 16]);
     }
 
-    #[test]
-    fn success_path_via_handler_calls() {
+    #[tokio::test]
+    async fn success_path_via_handler_calls() {
         let creds = Arc::new(StaticCredentials::cleartext(b"alice".to_vec(), b"hello"));
         let mut method = EapMd5::new(Arc::clone(&creds));
         method.notify_peer_identity(b"alice");
-        let MethodOutcome::Continue(req_type_data) = method.start().expect("start ok") else {
+        let MethodOutcome::Continue(req_type_data) = method.start().await.expect("start ok") else {
             panic!("expected Continue from start()");
         };
         // simulate handler allocating id 7 for the outbound request
@@ -306,7 +317,7 @@ mod tests {
         let mut resp_type_data = vec![16u8];
         resp_type_data.extend_from_slice(&response);
 
-        match method.step(&resp_type_data).expect("step ok") {
+        match method.step(&resp_type_data).await.expect("step ok") {
             MethodOutcome::Success { msk, emsk } => {
                 assert!(msk.is_empty(), "EAP-MD5 derives no MSK");
                 assert!(emsk.is_empty(), "EAP-MD5 derives no EMSK");
@@ -315,12 +326,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn wrong_password_fails() {
+    #[tokio::test]
+    async fn wrong_password_fails() {
         let creds = Arc::new(StaticCredentials::cleartext(b"alice".to_vec(), b"hello"));
         let mut method = EapMd5::new(Arc::clone(&creds));
         method.notify_peer_identity(b"alice");
-        let MethodOutcome::Continue(req_type_data) = method.start().expect("start ok") else {
+        let MethodOutcome::Continue(req_type_data) = method.start().await.expect("start ok") else {
             panic!("expected Continue");
         };
         method.notify_request_id(9);
@@ -332,18 +343,18 @@ mod tests {
         let mut resp_type_data = vec![16u8];
         resp_type_data.extend_from_slice(&bad_response);
 
-        match method.step(&resp_type_data).expect("step ok") {
+        match method.step(&resp_type_data).await.expect("step ok") {
             MethodOutcome::Failure => {}
             other => panic!("expected Failure, got {other:?}"),
         }
     }
 
-    #[test]
-    fn unknown_user_fails() {
+    #[tokio::test]
+    async fn unknown_user_fails() {
         let creds = Arc::new(StaticCredentials::cleartext(b"alice".to_vec(), b"hello"));
         let mut method = EapMd5::new(Arc::clone(&creds));
         method.notify_peer_identity(b"unknown");
-        let MethodOutcome::Continue(req_type_data) = method.start().expect("start ok") else {
+        let MethodOutcome::Continue(req_type_data) = method.start().await.expect("start ok") else {
             panic!("expected Continue");
         };
         method.notify_request_id(1);
@@ -355,7 +366,7 @@ mod tests {
         let mut resp_type_data = vec![16u8];
         resp_type_data.extend_from_slice(&response);
 
-        match method.step(&resp_type_data).expect("step ok") {
+        match method.step(&resp_type_data).await.expect("step ok") {
             MethodOutcome::Failure => {}
             other => panic!("expected Failure for unknown user, got {other:?}"),
         }

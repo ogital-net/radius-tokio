@@ -25,7 +25,17 @@
 //! representations. Method drivers own the framing/reassembly
 //! state internally so the handler adapter remains method-agnostic.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use crate::Error;
+
+/// Convenience alias for the boxed-future return type that
+/// [`EapMethod::start`] / [`EapMethod::step`] produce. Boxing keeps
+/// the trait object-safe (`Box<dyn EapMethod>` / [`BoxedEapMethod`])
+/// so the [`crate::EapRouter`] can hold heterogeneous methods
+/// behind one type-erased pointer.
+pub type MethodFuture<'a> = Pin<Box<dyn Future<Output = Result<MethodOutcome, Error>> + Send + 'a>>;
 
 /// Outcome of a single [`EapMethod::step`] (or the initial
 /// [`EapMethod::start`]).
@@ -74,6 +84,13 @@ pub enum MethodOutcome {
 /// worker tasks.
 ///
 /// See [`crate::eap_tls::EapTls`] for the canonical implementation.
+///
+/// `start` and `step` return boxed futures rather than `async fn`
+/// or RPITIT so the trait stays object-safe behind
+/// [`BoxedEapMethod`] — the [`crate::EapRouter`] needs to hold
+/// heterogeneous method state machines through one trait object.
+/// Implementations typically `Box::pin(async move { … })` around
+/// the body.
 pub trait EapMethod: Send {
     /// EAP Type byte this method advertises in `EAP-Request /
     /// Response` packets it emits and accepts.
@@ -89,7 +106,7 @@ pub trait EapMethod: Send {
     ///
     /// Method-specific. EAP-TLS surfaces [`Error::Tls`] on context
     /// initialization failure.
-    fn start(&mut self) -> Result<MethodOutcome, Error>;
+    fn start(&mut self) -> MethodFuture<'_>;
 
     /// Informational hook called by the handler adapter on the
     /// initial round (after [`MethodFactory::create`], before
@@ -138,7 +155,7 @@ pub trait EapMethod: Send {
     ///   fragments.
     /// - [`Error::Tls`] for TLS record-layer or handshake errors.
     /// - [`Error::Eap`] for EAP-layer encoder failures.
-    fn step(&mut self, peer_type_data: &[u8]) -> Result<MethodOutcome, Error>;
+    fn step<'a>(&'a mut self, peer_type_data: &'a [u8]) -> MethodFuture<'a>;
 }
 
 /// Per-session factory: the handler adapter calls
@@ -178,7 +195,7 @@ impl<T: EapMethod + ?Sized> EapMethod for Box<T> {
     fn typ(&self) -> radius_tokio::eap::Type {
         (**self).typ()
     }
-    fn start(&mut self) -> Result<MethodOutcome, Error> {
+    fn start(&mut self) -> MethodFuture<'_> {
         (**self).start()
     }
     fn notify_peer_identity(&mut self, identity: &[u8]) {
@@ -187,7 +204,7 @@ impl<T: EapMethod + ?Sized> EapMethod for Box<T> {
     fn notify_request_id(&mut self, eap_id: u8) {
         (**self).notify_request_id(eap_id);
     }
-    fn step(&mut self, peer_type_data: &[u8]) -> Result<MethodOutcome, Error> {
+    fn step<'a>(&'a mut self, peer_type_data: &'a [u8]) -> MethodFuture<'a> {
         (**self).step(peer_type_data)
     }
 }
@@ -272,8 +289,8 @@ mod tests {
         fn typ(&self) -> EapType {
             EapType::MD5_CHALLENGE
         }
-        fn start(&mut self) -> Result<MethodOutcome, Error> {
-            Ok(MethodOutcome::Continue(b"start".to_vec()))
+        fn start(&mut self) -> MethodFuture<'_> {
+            Box::pin(async move { Ok(MethodOutcome::Continue(b"start".to_vec())) })
         }
         fn notify_peer_identity(&mut self, _identity: &[u8]) {
             self.identity_notifications
@@ -283,9 +300,9 @@ mod tests {
             self.id_notifications.set(self.id_notifications.get() + 1);
             self.last_step.set(Some(eap_id));
         }
-        fn step(&mut self, peer_type_data: &[u8]) -> Result<MethodOutcome, Error> {
+        fn step<'a>(&'a mut self, peer_type_data: &'a [u8]) -> MethodFuture<'a> {
             self.last_step.set(peer_type_data.first().copied());
-            Ok(MethodOutcome::Failure)
+            Box::pin(async move { Ok(MethodOutcome::Failure) })
         }
     }
 
@@ -301,8 +318,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn box_dyn_forwards_every_method() {
+    #[tokio::test]
+    async fn box_dyn_forwards_every_method() {
         let mut boxed: BoxedEapMethod = Box::new(Tracer {
             identity_notifications: Cell::new(0),
             id_notifications: Cell::new(0),
@@ -311,9 +328,9 @@ mod tests {
         assert_eq!(boxed.typ(), EapType::MD5_CHALLENGE);
         boxed.notify_peer_identity(b"alice");
         boxed.notify_request_id(42);
-        let out = boxed.start().unwrap();
+        let out = boxed.start().await.unwrap();
         assert!(matches!(out, MethodOutcome::Continue(_)));
-        let out = boxed.step(&[0xCC]).unwrap();
+        let out = boxed.step(&[0xCC]).await.unwrap();
         assert!(matches!(out, MethodOutcome::Failure));
     }
 

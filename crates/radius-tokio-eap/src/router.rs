@@ -317,6 +317,7 @@ where
                 &raw_attributes,
                 self.accept_decorator.as_deref(),
             )
+            .await
         }
     }
 }
@@ -355,7 +356,7 @@ where
             if let Some(id) = peer_identity.as_deref() {
                 method.notify_peer_identity(id);
             }
-            let outcome = method.start()?;
+            let outcome = method.start().await?;
             debug!(
                 event = "session_started",
                 method = preferred_typ.0,
@@ -427,7 +428,7 @@ where
             if let Some(id) = session.peer_identity.as_deref() {
                 method.notify_peer_identity(id);
             }
-            let outcome = method.start()?;
+            let outcome = method.start().await?;
             // Replace the session's method, keep peer_identity /
             // tried_types / next_eap_id.
             session.method = method;
@@ -452,7 +453,7 @@ where
                 eap_identifier: peer_id,
             });
         }
-        let outcome = session.method.step(pkt.type_data())?;
+        let outcome = session.method.step(pkt.type_data()).await?;
         commit_outcome(&self.store, outcome, session, peer_id, current_typ).await
     }
 }
@@ -473,19 +474,23 @@ mod tests {
         fn typ(&self) -> EapType {
             self.typ
         }
-        fn start(&mut self) -> Result<MethodOutcome, Error> {
-            self.started = true;
-            Ok(MethodOutcome::Continue(b"hello".to_vec()))
+        fn start(&mut self) -> crate::method::MethodFuture<'_> {
+            Box::pin(async move {
+                self.started = true;
+                Ok(MethodOutcome::Continue(b"hello".to_vec()))
+            })
         }
-        fn step(&mut self, _: &[u8]) -> Result<MethodOutcome, Error> {
-            if self.succeed {
-                Ok(MethodOutcome::Success {
-                    msk: vec![0u8; 64],
-                    emsk: vec![],
-                })
-            } else {
-                Ok(MethodOutcome::Failure)
-            }
+        fn step<'a>(&'a mut self, _: &'a [u8]) -> crate::method::MethodFuture<'a> {
+            Box::pin(async move {
+                if self.succeed {
+                    Ok(MethodOutcome::Success {
+                        msk: vec![0u8; 64],
+                        emsk: vec![],
+                    })
+                } else {
+                    Ok(MethodOutcome::Failure)
+                }
+            })
         }
     }
 

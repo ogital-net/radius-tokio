@@ -113,15 +113,20 @@ pub const DEFAULT_SERVER_NAME: &[u8] = b"radius-tokio";
 /// [`MsChapSecret`]). Returning `None` triggers an inner
 /// EAP-Failure.
 ///
-/// Implementors typically wrap a backend store (LDAP, SQL,
-/// configuration file). The trait is `Sync` because a single
-/// `Arc<dyn Credentials>` is shared across every PEAP session
-/// the listener accepts.
+/// `Arc<C>` is shared across every PEAP session the listener
+/// accepts.
 pub trait Credentials: Send + Sync + 'static {
     /// Resolve `username` to the credential the server will use
     /// to compute the expected NT-Response. Returns `None` for an
     /// unknown user.
-    fn lookup(&self, username: &[u8]) -> Option<CredentialSecret>;
+    ///
+    /// The returned future is `Send` so the EAP driver can `.await`
+    /// it across runtime boundaries (e.g. while talking to a
+    /// database or LDAP backend).
+    fn lookup<'a>(
+        &'a self,
+        username: &'a [u8],
+    ) -> impl std::future::Future<Output = Option<CredentialSecret>> + Send + 'a;
 }
 
 /// Cleartext-or-NT-hash secret returned from [`Credentials::lookup`].
@@ -175,7 +180,7 @@ impl StaticCredentials {
 }
 
 impl Credentials for StaticCredentials {
-    fn lookup(&self, username: &[u8]) -> Option<CredentialSecret> {
+    async fn lookup(&self, username: &[u8]) -> Option<CredentialSecret> {
         if username == self.username.as_slice() {
             Some(match &self.secret {
                 CredentialSecret::Cleartext(s) => CredentialSecret::Cleartext(s.clone()),
@@ -245,115 +250,123 @@ impl<C: Credentials> MsChapV2Server<C> {
 }
 
 #[cfg(feature = "peap")]
+#[allow(clippy::manual_async_fn)] // explicit `+ Send` bound on the RPITIT future
 impl<C: Credentials> InnerEap for MsChapV2Server<C> {
-    fn start(&mut self) -> Result<Vec<u8>, Error> {
-        // Inner EAP-Request/Identity. RFC 3748 §5.1 says the
-        // Type-Data may carry a UTF-8 prompt; we leave it empty —
-        // wpa_supplicant ignores the prompt either way.
-        let id = self.next_id();
-        let mut out = Vec::with_capacity(5);
-        eap::write_request(&mut out, id, EapType::IDENTITY, &[]).map_err(Error::Eap)?;
-        Ok(out)
+    fn start(&mut self) -> impl std::future::Future<Output = Result<Vec<u8>, Error>> + Send + '_ {
+        async move {
+            // Inner EAP-Request/Identity. RFC 3748 §5.1 says the
+            // Type-Data may carry a UTF-8 prompt; we leave it empty —
+            // wpa_supplicant ignores the prompt either way.
+            let id = self.next_id();
+            let mut out = Vec::with_capacity(5);
+            eap::write_request(&mut out, id, EapType::IDENTITY, &[]).map_err(Error::Eap)?;
+            Ok(out)
+        }
     }
 
-    fn step(&mut self, peer_packet: &[u8]) -> Result<InnerOutcome, Error> {
-        let pkt = EapPacket::parse(peer_packet).map_err(Error::Eap)?;
-        if pkt.code() != EapCode::RESPONSE {
-            return Err(Error::Framing("inner EAP packet was not a Response"));
-        }
-
-        match (&self.state, pkt.typ()) {
-            (State::AwaitingIdentity, Some(EapType::IDENTITY)) => {
-                let username = pkt.type_data().to_vec();
-                let mut auth_challenge = [0u8; 16];
-                rand::fill_secure(&mut auth_challenge);
-                let ms_id = self.eap_id; // mschap id mirrors next eap id
-                let eap_id = self.next_id();
-                let frame = build_challenge(eap_id, ms_id, &auth_challenge, &self.server_name);
-                self.state = State::AwaitingChallengeResponse {
-                    username,
-                    auth_challenge,
-                };
-                Ok(InnerOutcome::Continue(frame))
+    fn step<'a>(
+        &'a mut self,
+        peer_packet: &'a [u8],
+    ) -> impl std::future::Future<Output = Result<InnerOutcome, Error>> + Send + 'a {
+        async move {
+            let pkt = EapPacket::parse(peer_packet).map_err(Error::Eap)?;
+            if pkt.code() != EapCode::RESPONSE {
+                return Err(Error::Framing("inner EAP packet was not a Response"));
             }
-            (
-                State::AwaitingChallengeResponse {
-                    username,
-                    auth_challenge,
-                },
-                Some(EapType::MSCHAPV2),
-            ) => {
-                let type_data = pkt.type_data();
-                let op = type_data
-                    .first()
-                    .copied()
-                    .ok_or(Error::Framing("MSCHAPv2 Response missing opcode byte"))?;
-                if op != OP_RESPONSE {
-                    return Err(Error::Framing("expected MSCHAPv2 opcode 2 (Response)"));
-                }
-                // body starts after opcode+id+length (4 bytes)
-                let body = type_data
-                    .get(4..)
-                    .ok_or(Error::Framing("MSCHAPv2 Response truncated"))?;
-                let resp = parse_response_body(body)
-                    .ok_or(Error::Framing("MSCHAPv2 Response body malformed"))?;
 
-                let Some(secret) = self.creds.lookup(username) else {
+            match (&self.state, pkt.typ()) {
+                (State::AwaitingIdentity, Some(EapType::IDENTITY)) => {
+                    let username = pkt.type_data().to_vec();
+                    let mut auth_challenge = [0u8; 16];
+                    rand::fill_secure(&mut auth_challenge);
+                    let ms_id = self.eap_id; // mschap id mirrors next eap id
+                    let eap_id = self.next_id();
+                    let frame = build_challenge(eap_id, ms_id, &auth_challenge, &self.server_name);
+                    self.state = State::AwaitingChallengeResponse {
+                        username,
+                        auth_challenge,
+                    };
+                    Ok(InnerOutcome::Continue(frame))
+                }
+                (
+                    State::AwaitingChallengeResponse {
+                        username,
+                        auth_challenge,
+                    },
+                    Some(EapType::MSCHAPV2),
+                ) => {
+                    let type_data = pkt.type_data();
+                    let op = type_data
+                        .first()
+                        .copied()
+                        .ok_or(Error::Framing("MSCHAPv2 Response missing opcode byte"))?;
+                    if op != OP_RESPONSE {
+                        return Err(Error::Framing("expected MSCHAPv2 opcode 2 (Response)"));
+                    }
+                    // body starts after opcode+id+length (4 bytes)
+                    let body = type_data
+                        .get(4..)
+                        .ok_or(Error::Framing("MSCHAPv2 Response truncated"))?;
+                    let resp = parse_response_body(body)
+                        .ok_or(Error::Framing("MSCHAPv2 Response body malformed"))?;
+
+                    let Some(secret) = self.creds.lookup(username).await else {
+                        let ms_id = self.eap_id;
+                        let eap_id = self.next_id();
+                        let frame = build_failure(eap_id, ms_id);
+                        self.state = State::AwaitingFailureAck;
+                        return Ok(InnerOutcome::Continue(frame));
+                    };
+
+                    let expected = mschap::v2_nt_response(
+                        auth_challenge,
+                        &resp.peer_challenge,
+                        username,
+                        secret.as_mschap(),
+                    );
+                    if expected != resp.nt_response {
+                        let ms_id = self.eap_id;
+                        let eap_id = self.next_id();
+                        let frame = build_failure(eap_id, ms_id);
+                        self.state = State::AwaitingFailureAck;
+                        return Ok(InnerOutcome::Continue(frame));
+                    }
+
+                    let auth_resp = mschap::v2_authenticator_response(
+                        auth_challenge,
+                        &resp.peer_challenge,
+                        &resp.nt_response,
+                        username,
+                        secret.as_mschap(),
+                    );
                     let ms_id = self.eap_id;
                     let eap_id = self.next_id();
-                    let frame = build_failure(eap_id, ms_id);
-                    self.state = State::AwaitingFailureAck;
-                    return Ok(InnerOutcome::Continue(frame));
-                };
-
-                let expected = mschap::v2_nt_response(
-                    auth_challenge,
-                    &resp.peer_challenge,
-                    username,
-                    secret.as_mschap(),
-                );
-                if expected != resp.nt_response {
-                    let ms_id = self.eap_id;
-                    let eap_id = self.next_id();
-                    let frame = build_failure(eap_id, ms_id);
-                    self.state = State::AwaitingFailureAck;
-                    return Ok(InnerOutcome::Continue(frame));
+                    let frame = build_success(eap_id, ms_id, &auth_resp);
+                    self.state = State::AwaitingSuccessAck;
+                    Ok(InnerOutcome::Continue(frame))
                 }
-
-                let auth_resp = mschap::v2_authenticator_response(
-                    auth_challenge,
-                    &resp.peer_challenge,
-                    &resp.nt_response,
-                    username,
-                    secret.as_mschap(),
-                );
-                let ms_id = self.eap_id;
-                let eap_id = self.next_id();
-                let frame = build_success(eap_id, ms_id, &auth_resp);
-                self.state = State::AwaitingSuccessAck;
-                Ok(InnerOutcome::Continue(frame))
-            }
-            (State::AwaitingSuccessAck, Some(EapType::MSCHAPV2)) => {
-                let op = pkt
-                    .type_data()
-                    .first()
-                    .copied()
-                    .ok_or(Error::Framing("MSCHAPv2 ack missing opcode byte"))?;
-                if op == OP_SUCCESS {
-                    Ok(InnerOutcome::Success)
-                } else {
+                (State::AwaitingSuccessAck, Some(EapType::MSCHAPV2)) => {
+                    let op = pkt
+                        .type_data()
+                        .first()
+                        .copied()
+                        .ok_or(Error::Framing("MSCHAPv2 ack missing opcode byte"))?;
+                    if op == OP_SUCCESS {
+                        Ok(InnerOutcome::Success)
+                    } else {
+                        Ok(InnerOutcome::Failure)
+                    }
+                }
+                (State::AwaitingFailureAck, Some(EapType::MSCHAPV2)) => {
+                    // Peer must ack the failure (or send a Change-Password
+                    // request, which we don't support). Either way the
+                    // outcome is the same.
                     Ok(InnerOutcome::Failure)
                 }
+                _ => Err(Error::Framing(
+                    "unexpected inner EAP type for MSCHAPv2 state",
+                )),
             }
-            (State::AwaitingFailureAck, Some(EapType::MSCHAPV2)) => {
-                // Peer must ack the failure (or send a Change-Password
-                // request, which we don't support). Either way the
-                // outcome is the same.
-                Ok(InnerOutcome::Failure)
-            }
-            _ => Err(Error::Framing(
-                "unexpected inner EAP type for MSCHAPv2 state",
-            )),
         }
     }
 }
@@ -616,99 +629,104 @@ impl<C: Credentials> EapMethod for EapMsChapV2<C> {
         }
     }
 
-    fn start(&mut self) -> Result<MethodOutcome, Error> {
-        if !matches!(self.state, NativeState::Init) {
-            return Err(Error::Framing("EAP-MSCHAPv2 start called after start"));
-        }
-        let mut auth_challenge = [0u8; 16];
-        rand::fill_secure(&mut auth_challenge);
-        // MSCHAPv2 id is independent of the EAP id and only needs
-        // to be unguessably fresh per server message; one random
-        // byte at the start, monotonically incremented, matches the
-        // inner driver's convention.
-        let mut ms_id_buf = [0u8; 1];
-        rand::fill_secure(&mut ms_id_buf);
-        let ms_id = ms_id_buf[0];
-        let frame = build_challenge_type_data(ms_id, &auth_challenge, &self.server_name);
-        self.state = NativeState::AwaitingResponse {
-            auth_challenge,
-            ms_id,
-        };
-        Ok(MethodOutcome::Continue(frame))
-    }
-
-    fn step(&mut self, peer_type_data: &[u8]) -> Result<MethodOutcome, Error> {
-        let op = peer_type_data
-            .first()
-            .copied()
-            .ok_or(Error::Framing("MSCHAPv2 packet missing opcode byte"))?;
-        match &self.state {
-            NativeState::Init => Err(Error::Framing("EAP-MSCHAPv2 step called before start")),
-            NativeState::AwaitingResponse {
+    fn start(&mut self) -> crate::method::MethodFuture<'_> {
+        Box::pin(async move {
+            if !matches!(self.state, NativeState::Init) {
+                return Err(Error::Framing("EAP-MSCHAPv2 start called after start"));
+            }
+            let mut auth_challenge = [0u8; 16];
+            rand::fill_secure(&mut auth_challenge);
+            // MSCHAPv2 id is independent of the EAP id and only needs
+            // to be unguessably fresh per server message; one random
+            // byte at the start, monotonically incremented, matches the
+            // inner driver's convention.
+            let mut ms_id_buf = [0u8; 1];
+            rand::fill_secure(&mut ms_id_buf);
+            let ms_id = ms_id_buf[0];
+            let frame = build_challenge_type_data(ms_id, &auth_challenge, &self.server_name);
+            self.state = NativeState::AwaitingResponse {
                 auth_challenge,
                 ms_id,
-            } => {
-                if op != OP_RESPONSE {
-                    return Err(Error::Framing("expected MSCHAPv2 opcode 2 (Response)"));
-                }
-                let body = peer_type_data
-                    .get(4..)
-                    .ok_or(Error::Framing("MSCHAPv2 Response truncated"))?;
-                let resp = parse_response_body(body)
-                    .ok_or(Error::Framing("MSCHAPv2 Response body malformed"))?;
+            };
+            Ok(MethodOutcome::Continue(frame))
+        })
+    }
 
-                let next_ms_id = ms_id.wrapping_add(1);
-                let Some(secret) = self.creds.lookup(&self.username) else {
-                    let frame = build_failure_type_data(next_ms_id);
-                    self.state = NativeState::AwaitingFailureAck;
-                    return Ok(MethodOutcome::Continue(frame));
-                };
-
-                let expected = mschap::v2_nt_response(
+    fn step<'a>(&'a mut self, peer_type_data: &'a [u8]) -> crate::method::MethodFuture<'a> {
+        Box::pin(async move {
+            let op = peer_type_data
+                .first()
+                .copied()
+                .ok_or(Error::Framing("MSCHAPv2 packet missing opcode byte"))?;
+            match &self.state {
+                NativeState::Init => Err(Error::Framing("EAP-MSCHAPv2 step called before start")),
+                NativeState::AwaitingResponse {
                     auth_challenge,
-                    &resp.peer_challenge,
-                    &self.username,
-                    secret.as_mschap(),
-                );
-                if expected != resp.nt_response {
-                    let frame = build_failure_type_data(next_ms_id);
-                    self.state = NativeState::AwaitingFailureAck;
-                    return Ok(MethodOutcome::Continue(frame));
-                }
+                    ms_id,
+                } => {
+                    if op != OP_RESPONSE {
+                        return Err(Error::Framing("expected MSCHAPv2 opcode 2 (Response)"));
+                    }
+                    let body = peer_type_data
+                        .get(4..)
+                        .ok_or(Error::Framing("MSCHAPv2 Response truncated"))?;
+                    let resp = parse_response_body(body)
+                        .ok_or(Error::Framing("MSCHAPv2 Response body malformed"))?;
 
-                let auth_resp = mschap::v2_authenticator_response(
-                    auth_challenge,
-                    &resp.peer_challenge,
-                    &resp.nt_response,
-                    &self.username,
-                    secret.as_mschap(),
-                );
-                let frame = build_success_type_data(next_ms_id, &auth_resp);
-                self.state = NativeState::AwaitingSuccessAck;
-                Ok(MethodOutcome::Continue(frame))
-            }
-            NativeState::AwaitingSuccessAck => {
-                if op == OP_SUCCESS {
-                    // Bare EAP-MSCHAPv2 doesn't derive an MSK here
-                    // (RFC 3079 GetMasterKey is not wired in); the
-                    // handler honors empty MSK by skipping the
-                    // MS-MPPE keys, restricting deployments to wired
-                    // `key_mgmt=IEEE8021X` flows.
-                    Ok(MethodOutcome::Success {
-                        msk: Vec::new(),
-                        emsk: Vec::new(),
-                    })
-                } else {
+                    let next_ms_id = ms_id.wrapping_add(1);
+                    let auth_challenge = *auth_challenge;
+                    let Some(secret) = self.creds.lookup(&self.username).await else {
+                        let frame = build_failure_type_data(next_ms_id);
+                        self.state = NativeState::AwaitingFailureAck;
+                        return Ok(MethodOutcome::Continue(frame));
+                    };
+
+                    let expected = mschap::v2_nt_response(
+                        &auth_challenge,
+                        &resp.peer_challenge,
+                        &self.username,
+                        secret.as_mschap(),
+                    );
+                    if expected != resp.nt_response {
+                        let frame = build_failure_type_data(next_ms_id);
+                        self.state = NativeState::AwaitingFailureAck;
+                        return Ok(MethodOutcome::Continue(frame));
+                    }
+
+                    let auth_resp = mschap::v2_authenticator_response(
+                        &auth_challenge,
+                        &resp.peer_challenge,
+                        &resp.nt_response,
+                        &self.username,
+                        secret.as_mschap(),
+                    );
+                    let frame = build_success_type_data(next_ms_id, &auth_resp);
+                    self.state = NativeState::AwaitingSuccessAck;
+                    Ok(MethodOutcome::Continue(frame))
+                }
+                NativeState::AwaitingSuccessAck => {
+                    if op == OP_SUCCESS {
+                        // Bare EAP-MSCHAPv2 doesn't derive an MSK here
+                        // (RFC 3079 GetMasterKey is not wired in); the
+                        // handler honors empty MSK by skipping the
+                        // MS-MPPE keys, restricting deployments to wired
+                        // `key_mgmt=IEEE8021X` flows.
+                        Ok(MethodOutcome::Success {
+                            msk: Vec::new(),
+                            emsk: Vec::new(),
+                        })
+                    } else {
+                        Ok(MethodOutcome::Failure)
+                    }
+                }
+                NativeState::AwaitingFailureAck => {
+                    // Peer must ack the failure (or send a
+                    // Change-Password request, which we don't support).
+                    // Either way the outcome is the same.
                     Ok(MethodOutcome::Failure)
                 }
             }
-            NativeState::AwaitingFailureAck => {
-                // Peer must ack the failure (or send a
-                // Change-Password request, which we don't support).
-                // Either way the outcome is the same.
-                Ok(MethodOutcome::Failure)
-            }
-        }
+        })
     }
 }
 
@@ -783,11 +801,11 @@ mod native_tests {
         build_envelope_type_data(ms_id, OP_RESPONSE, &body)
     }
 
-    #[test]
-    fn happy_path_succeeds_after_ack() {
+    #[tokio::test]
+    async fn happy_path_succeeds_after_ack() {
         let creds = Arc::new(StaticCredentials::cleartext(b"alice".to_vec(), "hello"));
         let mut m = run_native(creds);
-        let MethodOutcome::Continue(challenge_td) = m.start().expect("start") else {
+        let MethodOutcome::Continue(challenge_td) = m.start().await.expect("start") else {
             panic!("start did not Continue");
         };
         let (auth_chal, ms_id) = parse_challenge(&challenge_td);
@@ -800,7 +818,8 @@ mod native_tests {
             MsChapSecret::Cleartext("hello"),
         );
         let response_td = build_response_type_data(ms_id, peer_chal, nt);
-        let MethodOutcome::Continue(success_td) = m.step(&response_td).expect("step response")
+        let MethodOutcome::Continue(success_td) =
+            m.step(&response_td).await.expect("step response")
         else {
             panic!("did not produce a Success request");
         };
@@ -808,21 +827,21 @@ mod native_tests {
 
         // Peer acks the Success.
         let ack = [OP_SUCCESS];
-        let outcome = m.step(&ack).expect("step ack");
+        let outcome = m.step(&ack).await.expect("step ack");
         assert!(
             matches!(outcome, MethodOutcome::Success { ref msk, .. } if msk.is_empty()),
             "expected empty-MSK Success, got {outcome:?}",
         );
     }
 
-    #[test]
-    fn wrong_password_emits_failure_then_failure_outcome() {
+    #[tokio::test]
+    async fn wrong_password_emits_failure_then_failure_outcome() {
         let creds = Arc::new(StaticCredentials::cleartext(
             b"alice".to_vec(),
             "correct-horse",
         ));
         let mut m = run_native(creds);
-        let MethodOutcome::Continue(challenge_td) = m.start().unwrap() else {
+        let MethodOutcome::Continue(challenge_td) = m.start().await.unwrap() else {
             unreachable!()
         };
         let (auth_chal, ms_id) = parse_challenge(&challenge_td);
@@ -834,34 +853,37 @@ mod native_tests {
             MsChapSecret::Cleartext("battery-staple"),
         );
         let resp = build_response_type_data(ms_id, peer_chal, bad_nt);
-        let MethodOutcome::Continue(fail_td) = m.step(&resp).expect("step") else {
+        let MethodOutcome::Continue(fail_td) = m.step(&resp).await.expect("step") else {
             panic!("expected Continue with Failure type-data");
         };
         assert_eq!(fail_td[0], OP_FAILURE);
         let ack = [OP_FAILURE];
-        assert!(matches!(m.step(&ack).unwrap(), MethodOutcome::Failure));
+        assert!(matches!(
+            m.step(&ack).await.unwrap(),
+            MethodOutcome::Failure
+        ));
     }
 
-    #[test]
-    fn unknown_user_emits_failure() {
+    #[tokio::test]
+    async fn unknown_user_emits_failure() {
         let creds = Arc::new(StaticCredentials::cleartext(b"bob".to_vec(), "x"));
         let mut m = run_native(creds);
-        let MethodOutcome::Continue(challenge_td) = m.start().unwrap() else {
+        let MethodOutcome::Continue(challenge_td) = m.start().await.unwrap() else {
             unreachable!()
         };
         let (_, ms_id) = parse_challenge(&challenge_td);
         let resp = build_response_type_data(ms_id, [0u8; 16], [0u8; 24]);
-        let MethodOutcome::Continue(fail_td) = m.step(&resp).expect("step") else {
+        let MethodOutcome::Continue(fail_td) = m.step(&resp).await.expect("step") else {
             panic!("expected Continue Failure");
         };
         assert_eq!(fail_td[0], OP_FAILURE);
     }
 
-    #[test]
-    fn step_before_start_errors() {
+    #[tokio::test]
+    async fn step_before_start_errors() {
         let creds = Arc::new(StaticCredentials::cleartext(b"alice".to_vec(), "x"));
         let mut m = EapMsChapV2::new(creds);
         m.notify_peer_identity(b"alice");
-        assert!(m.step(&[OP_RESPONSE, 0, 0, 4]).is_err());
+        assert!(m.step(&[OP_RESPONSE, 0, 0, 4]).await.is_err());
     }
 }

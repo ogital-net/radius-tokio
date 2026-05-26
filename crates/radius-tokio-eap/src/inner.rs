@@ -29,6 +29,8 @@
 //! allocation for the outer EAP conversation, RADIUS `State`, or
 //! MS-MPPE key emission. The outer driver owns all of that.
 
+use std::future::Future;
+
 use crate::Error;
 
 /// Server-side inner EAP state machine.
@@ -52,7 +54,7 @@ pub trait InnerEap: Send {
     ///
     /// Returns [`Error::Eap`] if packet construction fails or
     /// [`Error::Tls`] for unexpected lower-layer failures.
-    fn start(&mut self) -> Result<Vec<u8>, Error>;
+    fn start(&mut self) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + '_;
 
     /// Process one inner EAP-Response from the peer, returning the
     /// next outcome. `peer_packet` is a full EAP packet
@@ -62,7 +64,10 @@ pub trait InnerEap: Send {
     ///
     /// Returns [`Error::Eap`] on malformed inner packets or
     /// [`Error::Tls`] / method-specific errors otherwise.
-    fn step(&mut self, peer_packet: &[u8]) -> Result<InnerOutcome, Error>;
+    fn step<'a>(
+        &'a mut self,
+        peer_packet: &'a [u8],
+    ) -> impl Future<Output = Result<InnerOutcome, Error>> + Send + 'a;
 }
 
 /// Outcome of one inner [`InnerEap::step`] (or [`InnerEap::start`]

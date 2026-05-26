@@ -248,126 +248,130 @@ impl<I: InnerEap> EapMethod for Peap<I> {
         Type::PEAP
     }
 
-    fn start(&mut self) -> Result<MethodOutcome, Error> {
-        // RFC 5216 §3.2 / PEAP §2.1: server-issued Start frame is
-        // a single Flags byte with S set.
-        Ok(MethodOutcome::Continue(tls_tunnel::start_frame()))
+    fn start(&mut self) -> crate::method::MethodFuture<'_> {
+        Box::pin(async move {
+            // RFC 5216 §3.2 / PEAP §2.1: server-issued Start frame is
+            // a single Flags byte with S set.
+            Ok(MethodOutcome::Continue(tls_tunnel::start_frame()))
+        })
     }
 
     #[allow(clippy::too_many_lines)] // intentionally a single-flow step()
-    fn step(&mut self, peer_type_data: &[u8]) -> Result<MethodOutcome, Error> {
-        // 1. Ingest the peer's PEAP fragment and, if a full TLS
-        //    message just reassembled, feed libssl + drive the
-        //    handshake.
-        if let Some(tls_bytes) = self.tunnel.ingest_peer_frame(peer_type_data)? {
-            self.tunnel.feed_tls(&tls_bytes)?;
-            let just_completed = self.tunnel.drive_handshake()?;
-            if just_completed && self.tunnel.tls().is_tls13() {
-                // RFC 9190 §2.5: on TLS 1.3 the server emits a
-                // 0x00 commitment record. PEAP doesn't reference
-                // this directly, but libssl + hostap interop
-                // relies on it when TLS 1.3 is negotiated.
-                self.tunnel.write_tls13_commitment()?;
-            }
-        }
-
-        // 2. Once the handshake is up, pull any decrypted inner
-        //    EAP bytes out of libssl.
-        if self.tunnel.is_handshake_done() {
-            self.tunnel.drain_decrypted(&mut self.inner_rx_buf)?;
-        }
-
-        // 3. Drain ciphertext libssl produced (handshake
-        //    completion records or earlier inner writes) into
-        //    the outbound buffer, then send the next fragment if
-        //    any remains.
-        //
-        //    CRITICAL: we MUST drain the handshake completion
-        //    records before queueing the first inner
-        //    EAP-Request — `wpa_supplicant` rejects an inner
-        //    `EAP-Request/Identity` that is piggy-backed in the
-        //    same TLS flight as the server `Finished`
-        //    ("Application Data in Finished message" → exit 252).
-        self.tunnel.refill_pending_tx()?;
-        if self.tunnel.has_pending_tx() {
-            return Ok(MethodOutcome::Continue(
-                self.tunnel.emit_next_outbound_fragment(),
-            ));
-        }
-
-        // 4. Handshake done and ciphertext fully flushed; kick off
-        //    the inner method on the next round-trip after the
-        //    peer ACKs our last handshake fragment.
-        if self.tunnel.is_handshake_done() && !self.inner_started {
-            self.inner_started = true;
-            let msg = self.inner.start()?;
-            self.write_inner(&msg)?;
-        }
-
-        // 5. Drive the inner method while we have complete inner
-        //    EAP packets to feed it and the inner conversation
-        //    hasn't terminated yet. After inner termination, run
-        //    the PEAPv0 Result-TLV exchange before announcing
-        //    the outer outcome (hostap requires this when
-        //    `crypto_binding != NO_BINDING`, which is the
-        //    default).
-        while let Some(pkt_bytes) = self.try_extract_inner_packet() {
-            if pkt_bytes.len() >= 2 {
-                self.last_inner_peer_id = pkt_bytes[1];
-            }
-            if self.awaiting_result_ack {
-                // Expect a full-EAP Response/TLV from the peer
-                // matching our Result-TLV request id.
-                if is_result_tlv_response(&pkt_bytes, self.result_tlv_id) {
-                    self.awaiting_result_ack = false;
-                    // inner_terminator already set; fall through.
-                }
-                // Either way, no further inner work.
-                break;
-            }
-            if self.inner_terminator.is_some() {
-                break;
-            }
-            match self.inner.step(&pkt_bytes)? {
-                InnerOutcome::Continue(msg) => self.write_inner(&msg)?,
-                InnerOutcome::Success => {
-                    self.inner_terminator = Some(InnerResult::Success);
-                    self.send_result_tlv(ResultTlvStatus::Success)?;
-                }
-                InnerOutcome::Failure => {
-                    self.inner_terminator = Some(InnerResult::Failure);
-                    self.send_result_tlv(ResultTlvStatus::Failure)?;
+    fn step<'a>(&'a mut self, peer_type_data: &'a [u8]) -> crate::method::MethodFuture<'a> {
+        Box::pin(async move {
+            // 1. Ingest the peer's PEAP fragment and, if a full TLS
+            //    message just reassembled, feed libssl + drive the
+            //    handshake.
+            if let Some(tls_bytes) = self.tunnel.ingest_peer_frame(peer_type_data)? {
+                self.tunnel.feed_tls(&tls_bytes)?;
+                let just_completed = self.tunnel.drive_handshake()?;
+                if just_completed && self.tunnel.tls().is_tls13() {
+                    // RFC 9190 §2.5: on TLS 1.3 the server emits a
+                    // 0x00 commitment record. PEAP doesn't reference
+                    // this directly, but libssl + hostap interop
+                    // relies on it when TLS 1.3 is negotiated.
+                    self.tunnel.write_tls13_commitment()?;
                 }
             }
-        }
 
-        // 6. Drain any ciphertext produced by step 4 / step 5
-        //    and ship it.
-        self.tunnel.refill_pending_tx()?;
-        if self.tunnel.has_pending_tx() {
-            return Ok(MethodOutcome::Continue(
-                self.tunnel.emit_next_outbound_fragment(),
-            ));
-        }
+            // 2. Once the handshake is up, pull any decrypted inner
+            //    EAP bytes out of libssl.
+            if self.tunnel.is_handshake_done() {
+                self.tunnel.drain_decrypted(&mut self.inner_rx_buf)?;
+            }
 
-        // 7. Nothing left to send. If the inner method has
-        //    terminated AND the PEAPv0 Result-TLV has been
-        //    acked, declare outcome.
-        if let Some(term) = self.inner_terminator {
-            if !self.awaiting_result_ack {
-                return Ok(match term {
-                    InnerResult::Success => {
-                        let (msk, emsk) = self.export_msk_emsk()?;
-                        MethodOutcome::Success { msk, emsk }
+            // 3. Drain ciphertext libssl produced (handshake
+            //    completion records or earlier inner writes) into
+            //    the outbound buffer, then send the next fragment if
+            //    any remains.
+            //
+            //    CRITICAL: we MUST drain the handshake completion
+            //    records before queueing the first inner
+            //    EAP-Request — `wpa_supplicant` rejects an inner
+            //    `EAP-Request/Identity` that is piggy-backed in the
+            //    same TLS flight as the server `Finished`
+            //    ("Application Data in Finished message" → exit 252).
+            self.tunnel.refill_pending_tx()?;
+            if self.tunnel.has_pending_tx() {
+                return Ok(MethodOutcome::Continue(
+                    self.tunnel.emit_next_outbound_fragment(),
+                ));
+            }
+
+            // 4. Handshake done and ciphertext fully flushed; kick off
+            //    the inner method on the next round-trip after the
+            //    peer ACKs our last handshake fragment.
+            if self.tunnel.is_handshake_done() && !self.inner_started {
+                self.inner_started = true;
+                let msg = self.inner.start().await?;
+                self.write_inner(&msg)?;
+            }
+
+            // 5. Drive the inner method while we have complete inner
+            //    EAP packets to feed it and the inner conversation
+            //    hasn't terminated yet. After inner termination, run
+            //    the PEAPv0 Result-TLV exchange before announcing
+            //    the outer outcome (hostap requires this when
+            //    `crypto_binding != NO_BINDING`, which is the
+            //    default).
+            while let Some(pkt_bytes) = self.try_extract_inner_packet() {
+                if pkt_bytes.len() >= 2 {
+                    self.last_inner_peer_id = pkt_bytes[1];
+                }
+                if self.awaiting_result_ack {
+                    // Expect a full-EAP Response/TLV from the peer
+                    // matching our Result-TLV request id.
+                    if is_result_tlv_response(&pkt_bytes, self.result_tlv_id) {
+                        self.awaiting_result_ack = false;
+                        // inner_terminator already set; fall through.
                     }
-                    InnerResult::Failure => MethodOutcome::Failure,
-                });
+                    // Either way, no further inner work.
+                    break;
+                }
+                if self.inner_terminator.is_some() {
+                    break;
+                }
+                match self.inner.step(&pkt_bytes).await? {
+                    InnerOutcome::Continue(msg) => self.write_inner(&msg)?,
+                    InnerOutcome::Success => {
+                        self.inner_terminator = Some(InnerResult::Success);
+                        self.send_result_tlv(ResultTlvStatus::Success)?;
+                    }
+                    InnerOutcome::Failure => {
+                        self.inner_terminator = Some(InnerResult::Failure);
+                        self.send_result_tlv(ResultTlvStatus::Failure)?;
+                    }
+                }
             }
-        }
 
-        // 8. Otherwise the peer is mid-fragmentation or just
-        //    ACKed an interim message — emit our own ACK.
-        Ok(MethodOutcome::Continue(tls_tunnel::ack_frame()))
+            // 6. Drain any ciphertext produced by step 4 / step 5
+            //    and ship it.
+            self.tunnel.refill_pending_tx()?;
+            if self.tunnel.has_pending_tx() {
+                return Ok(MethodOutcome::Continue(
+                    self.tunnel.emit_next_outbound_fragment(),
+                ));
+            }
+
+            // 7. Nothing left to send. If the inner method has
+            //    terminated AND the PEAPv0 Result-TLV has been
+            //    acked, declare outcome.
+            if let Some(term) = self.inner_terminator {
+                if !self.awaiting_result_ack {
+                    return Ok(match term {
+                        InnerResult::Success => {
+                            let (msk, emsk) = self.export_msk_emsk()?;
+                            MethodOutcome::Success { msk, emsk }
+                        }
+                        InnerResult::Failure => MethodOutcome::Failure,
+                    });
+                }
+            }
+
+            // 8. Otherwise the peer is mid-fragmentation or just
+            //    ACKed an interim message — emit our own ACK.
+            Ok(MethodOutcome::Continue(tls_tunnel::ack_frame()))
+        })
     }
 }
 

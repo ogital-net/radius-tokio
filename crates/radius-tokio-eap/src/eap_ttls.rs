@@ -184,7 +184,10 @@ pub trait TtlsInner: Send {
     /// # Errors
     ///
     /// Returns [`Error::Framing`] on inner-method protocol errors.
-    fn process(&mut self, avps: &[Avp]) -> Result<TtlsInnerOutcome, Error>;
+    fn process<'a>(
+        &'a mut self,
+        avps: &'a [Avp],
+    ) -> impl std::future::Future<Output = Result<TtlsInnerOutcome, Error>> + Send + 'a;
 }
 
 /// Outcome of a single [`TtlsInner::process`] call.
@@ -216,7 +219,15 @@ pub trait TtlsInnerFactory: Send + Sync + 'static {
 pub trait PapCredentials: Send + Sync + 'static {
     /// Returns `true` iff `password` is the correct cleartext
     /// password for `username`.
-    fn verify(&self, username: &[u8], password: &[u8]) -> bool;
+    ///
+    /// The returned future is `Send` so the inner method can
+    /// `.await` it across runtime boundaries (e.g. while talking
+    /// to a database or LDAP backend).
+    fn verify<'a>(
+        &'a self,
+        username: &'a [u8],
+        password: &'a [u8],
+    ) -> impl std::future::Future<Output = bool> + Send + 'a;
 }
 
 /// Single-user PAP credential store. Useful for tests and
@@ -238,7 +249,7 @@ impl StaticPapCredentials {
 }
 
 impl PapCredentials for StaticPapCredentials {
-    fn verify(&self, username: &[u8], password: &[u8]) -> bool {
+    async fn verify(&self, username: &[u8], password: &[u8]) -> bool {
         // Constant-time compare on the password to avoid timing
         // leaks on the secret half; username equality is fine to
         // short-circuit.
@@ -267,32 +278,38 @@ impl<C: PapCredentials> PapInner<C> {
     }
 }
 
+#[allow(clippy::manual_async_fn)] // explicit `+ Send` bound on the RPITIT future
 impl<C: PapCredentials> TtlsInner for PapInner<C> {
-    fn process(&mut self, avps: &[Avp]) -> Result<TtlsInnerOutcome, Error> {
-        let mut user = None;
-        let mut pass = None;
-        for avp in avps {
-            if avp.vendor.is_some() {
-                continue;
+    fn process<'a>(
+        &'a mut self,
+        avps: &'a [Avp],
+    ) -> impl std::future::Future<Output = Result<TtlsInnerOutcome, Error>> + Send + 'a {
+        async move {
+            let mut user = None;
+            let mut pass = None;
+            for avp in avps {
+                if avp.vendor.is_some() {
+                    continue;
+                }
+                match avp.code {
+                    AVP_USER_NAME => user = Some(avp.data.as_slice()),
+                    AVP_USER_PASSWORD => pass = Some(avp.data.as_slice()),
+                    _ => {}
+                }
             }
-            match avp.code {
-                AVP_USER_NAME => user = Some(avp.data.as_slice()),
-                AVP_USER_PASSWORD => pass = Some(avp.data.as_slice()),
-                _ => {}
+            let (Some(user), Some(pass)) = (user, pass) else {
+                return Ok(TtlsInnerOutcome::Failure);
+            };
+            // Strip trailing NUL padding from the password AVP.
+            let trimmed = match pass.iter().rposition(|&b| b != 0) {
+                Some(idx) => &pass[..=idx],
+                None => &[][..],
+            };
+            if self.creds.verify(user, trimmed).await {
+                Ok(TtlsInnerOutcome::Success)
+            } else {
+                Ok(TtlsInnerOutcome::Failure)
             }
-        }
-        let (Some(user), Some(pass)) = (user, pass) else {
-            return Ok(TtlsInnerOutcome::Failure);
-        };
-        // Strip trailing NUL padding from the password AVP.
-        let trimmed = match pass.iter().rposition(|&b| b != 0) {
-            Some(idx) => &pass[..=idx],
-            None => &[][..],
-        };
-        if self.creds.verify(user, trimmed) {
-            Ok(TtlsInnerOutcome::Success)
-        } else {
-            Ok(TtlsInnerOutcome::Failure)
         }
     }
 }
@@ -383,92 +400,96 @@ impl<I: TtlsInner> EapMethod for EapTtls<I> {
         Type::TTLS
     }
 
-    fn start(&mut self) -> Result<MethodOutcome, Error> {
-        // RFC 5281 §7.1: server-issued Start frame is a single
-        // Flags byte with S set (and the low 3 bits as version,
-        // which we leave at 0 for TTLSv0 — the only deployed
-        // version).
-        Ok(MethodOutcome::Continue(tls_tunnel::start_frame()))
+    fn start(&mut self) -> crate::method::MethodFuture<'_> {
+        Box::pin(async move {
+            // RFC 5281 §7.1: server-issued Start frame is a single
+            // Flags byte with S set (and the low 3 bits as version,
+            // which we leave at 0 for TTLSv0 — the only deployed
+            // version).
+            Ok(MethodOutcome::Continue(tls_tunnel::start_frame()))
+        })
     }
 
-    fn step(&mut self, peer_type_data: &[u8]) -> Result<MethodOutcome, Error> {
-        // 1. Ingest the peer's TTLS fragment and, if a full TLS
-        //    message just reassembled, feed libssl + drive the
-        //    handshake.
-        if let Some(tls_bytes) = self.tunnel.ingest_peer_frame(peer_type_data)? {
-            self.tunnel.feed_tls(&tls_bytes)?;
-            self.tunnel.drive_handshake()?;
-        }
+    fn step<'a>(&'a mut self, peer_type_data: &'a [u8]) -> crate::method::MethodFuture<'a> {
+        Box::pin(async move {
+            // 1. Ingest the peer's TTLS fragment and, if a full TLS
+            //    message just reassembled, feed libssl + drive the
+            //    handshake.
+            if let Some(tls_bytes) = self.tunnel.ingest_peer_frame(peer_type_data)? {
+                self.tunnel.feed_tls(&tls_bytes)?;
+                self.tunnel.drive_handshake()?;
+            }
 
-        // 2. Once the handshake is up, pull any decrypted AVP
-        //    bytes out of libssl.
-        if self.tunnel.is_handshake_done() {
-            self.tunnel.drain_decrypted(&mut self.inner_rx_buf)?;
-        }
+            // 2. Once the handshake is up, pull any decrypted AVP
+            //    bytes out of libssl.
+            if self.tunnel.is_handshake_done() {
+                self.tunnel.drain_decrypted(&mut self.inner_rx_buf)?;
+            }
 
-        // 3. Drain ciphertext libssl produced into the outbound
-        //    buffer and ship the next fragment first. Mirrors
-        //    the PEAP driver's "flush Finished before queueing
-        //    app data" invariant.
-        self.tunnel.refill_pending_tx()?;
-        if self.tunnel.has_pending_tx() {
-            return Ok(MethodOutcome::Continue(
-                self.tunnel.emit_next_outbound_fragment(),
-            ));
-        }
+            // 3. Drain ciphertext libssl produced into the outbound
+            //    buffer and ship the next fragment first. Mirrors
+            //    the PEAP driver's "flush Finished before queueing
+            //    app data" invariant.
+            self.tunnel.refill_pending_tx()?;
+            if self.tunnel.has_pending_tx() {
+                return Ok(MethodOutcome::Continue(
+                    self.tunnel.emit_next_outbound_fragment(),
+                ));
+            }
 
-        // 4. Handshake done and ciphertext fully flushed. If the
-        //    peer has delivered any AVP bytes, dispatch them to
-        //    the inner method (unless we already terminated).
-        if self.tunnel.is_handshake_done()
-            && self.inner_terminator.is_none()
-            && !self.inner_rx_buf.is_empty()
-        {
-            // Hand the buffer to the inner method and leave a
-            // fresh empty Vec in place for the next batch —
-            // cheaper than `drain(..).collect()` since we reuse
-            // the existing allocation only when the next call
-            // re-grows it.
-            let avp_bytes = std::mem::take(&mut self.inner_rx_buf);
-            let avps = parse_avps(&avp_bytes)?;
-            match self.inner.process(&avps)? {
-                TtlsInnerOutcome::Continue(reply) => {
-                    if !reply.is_empty() {
-                        self.tunnel.write_app_data(&reply)?;
+            // 4. Handshake done and ciphertext fully flushed. If the
+            //    peer has delivered any AVP bytes, dispatch them to
+            //    the inner method (unless we already terminated).
+            if self.tunnel.is_handshake_done()
+                && self.inner_terminator.is_none()
+                && !self.inner_rx_buf.is_empty()
+            {
+                // Hand the buffer to the inner method and leave a
+                // fresh empty Vec in place for the next batch —
+                // cheaper than `drain(..).collect()` since we reuse
+                // the existing allocation only when the next call
+                // re-grows it.
+                let avp_bytes = std::mem::take(&mut self.inner_rx_buf);
+                let avps = parse_avps(&avp_bytes)?;
+                match self.inner.process(&avps).await? {
+                    TtlsInnerOutcome::Continue(reply) => {
+                        if !reply.is_empty() {
+                            self.tunnel.write_app_data(&reply)?;
+                        }
+                    }
+                    TtlsInnerOutcome::Success => {
+                        self.inner_terminator = Some(InnerResult::Success);
+                    }
+                    TtlsInnerOutcome::Failure => {
+                        self.inner_terminator = Some(InnerResult::Failure);
                     }
                 }
-                TtlsInnerOutcome::Success => {
-                    self.inner_terminator = Some(InnerResult::Success);
-                }
-                TtlsInnerOutcome::Failure => {
-                    self.inner_terminator = Some(InnerResult::Failure);
-                }
             }
-        }
 
-        // 5. Drain any ciphertext produced by step 4 and ship it.
-        self.tunnel.refill_pending_tx()?;
-        if self.tunnel.has_pending_tx() {
-            return Ok(MethodOutcome::Continue(
-                self.tunnel.emit_next_outbound_fragment(),
-            ));
-        }
+            // 5. Drain any ciphertext produced by step 4 and ship it.
+            self.tunnel.refill_pending_tx()?;
+            if self.tunnel.has_pending_tx() {
+                return Ok(MethodOutcome::Continue(
+                    self.tunnel.emit_next_outbound_fragment(),
+                ));
+            }
 
-        // 6. Nothing left to send. If the inner method has
-        //    terminated, declare the outer outcome.
-        if let Some(term) = self.inner_terminator {
-            return Ok(match term {
-                InnerResult::Success => {
-                    let (msk, emsk) = self.export_msk_emsk()?;
-                    MethodOutcome::Success { msk, emsk }
-                }
-                InnerResult::Failure => MethodOutcome::Failure,
-            });
-        }
+            // 6. Nothing left to send. If the inner method has
+            //    terminated, declare the outer outcome.
+            if let Some(term) = self.inner_terminator {
+                return Ok(match term {
+                    InnerResult::Success => {
+                        let (msk, emsk) = self.export_msk_emsk()?;
+                        MethodOutcome::Success { msk, emsk }
+                    }
+                    InnerResult::Failure => MethodOutcome::Failure,
+                });
+            }
 
-        // 7. Otherwise the peer is mid-fragmentation or just
-        //    ACKed an interim message — emit our own ACK.
-        Ok(MethodOutcome::Continue(tls_tunnel::ack_frame()))
+            // 7. Otherwise the peer is mid-fragmentation or just
+            //    ACKed an interim message — emit our own ACK.
+            Ok(MethodOutcome::Continue(tls_tunnel::ack_frame()))
+        })
     }
 }
 
@@ -558,8 +579,8 @@ mod tests {
         assert!(parse_avps(&buf).is_err());
     }
 
-    #[test]
-    fn pap_inner_accepts_correct_creds() {
+    #[tokio::test]
+    async fn pap_inner_accepts_correct_creds() {
         let creds = Arc::new(StaticPapCredentials::new("alice", "hello123"));
         let mut inner = PapInner::new(creds);
         let avps = vec![
@@ -576,14 +597,14 @@ mod tests {
                 data: b"hello123\0\0\0\0\0\0\0\0".to_vec(),
             },
         ];
-        match inner.process(&avps).unwrap() {
+        match inner.process(&avps).await.unwrap() {
             TtlsInnerOutcome::Success => {}
             other => panic!("expected Success, got {other:?}"),
         }
     }
 
-    #[test]
-    fn pap_inner_rejects_wrong_password() {
+    #[tokio::test]
+    async fn pap_inner_rejects_wrong_password() {
         let creds = Arc::new(StaticPapCredentials::new("alice", "hello123"));
         let mut inner = PapInner::new(creds);
         let avps = vec![
@@ -600,7 +621,7 @@ mod tests {
                 data: b"wrong\0\0\0\0\0\0\0\0\0\0\0".to_vec(),
             },
         ];
-        match inner.process(&avps).unwrap() {
+        match inner.process(&avps).await.unwrap() {
             TtlsInnerOutcome::Failure => {}
             other => panic!("expected Failure, got {other:?}"),
         }

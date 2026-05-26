@@ -732,9 +732,24 @@ pub mod test_support {
 pub trait Handler: Send + Sync + 'static {
     /// Produce a [`HandlerResult`] for the given request.
     ///
-    /// The returned future is polled on the same task that decoded
-    /// the packet; long-running work should be offloaded explicitly
-    /// (e.g. `tokio::spawn`) so the receive loop is not stalled.
+    /// Where the returned future is polled depends on the transport:
+    ///
+    /// - **UDP**: each datagram is dispatched on a fresh
+    ///   `tokio::spawn`ed task, so handler futures run
+    ///   independently of the receive loop and of one another.
+    ///   Long handler latencies do not stall the socket.
+    /// - **`RadSec`**: frames within a single TLS connection are
+    ///   processed serially on the per-connection task (RADIUS
+    ///   request/response ordering on a stream is otherwise
+    ///   undefined). The accept loop is unaffected, but a slow
+    ///   handler will back-pressure subsequent frames on the same
+    ///   connection.
+    ///
+    /// In either case the returned future must be `Send`. CPU-bound
+    /// or blocking work should be offloaded with
+    /// [`tokio::task::spawn_blocking`] (or an explicit
+    /// `tokio::spawn` for fire-and-forget side effects) rather than
+    /// run inline.
     fn handle(&self, request: Request<'_>) -> impl Future<Output = HandlerResult> + Send;
 }
 
