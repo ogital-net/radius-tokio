@@ -54,6 +54,7 @@ use radius_tokio::eap;
 use radius_tokio::server::{
     Client, Handler, HandlerResult, IpCidr, Request, Server, StaticClients,
 };
+use radius_tokio::AttributesView;
 use radius_tokio::Code;
 
 /// Cleartext password the simulated user knows. A real handler

@@ -34,7 +34,7 @@
 //! would require an OEM codepage dependency.
 
 use super::VerifyOutcome;
-use crate::codec::attributes::AttributeError;
+use crate::codec::attributes::{AttributeError, AttributesView};
 use crate::crypto::{cleanse, ct_eq, des::DesKey, md4, sha1::Sha1};
 use crate::server::Request;
 

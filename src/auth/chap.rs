@@ -9,7 +9,7 @@
 //! shared secret on the [`Client`](crate::server::Client) is therefore
 //! unused by this helper.
 
-use crate::codec::attributes::AttributeError;
+use crate::codec::attributes::{AttributeError, AttributesView};
 use crate::codec::constants::{
     CHAP_CHALLENGE as CHAP_CHALLENGE_TYPE, CHAP_PASSWORD as CHAP_PASSWORD_TYPE,
 };

@@ -64,6 +64,7 @@ use std::sync::Arc;
 
 use radius_tokio::eap::{self, Code as EapCode, Packet as EapPacket, Type as EapType};
 use radius_tokio::server::{Handler, HandlerResult, Request};
+use radius_tokio::AttributesView;
 
 use crate::handler::{
     commit_outcome, render_dispatch, resolve_peer_identity, AcceptDecorator, Dispatch,
@@ -304,7 +305,10 @@ where
         let raw_attributes: Vec<u8> = request.raw_attributes().to_vec();
 
         async move {
-            let outcome = match self.dispatch(state, &eap_buf, user_name.clone()).await {
+            let outcome = match self
+                .dispatch_round(state, &eap_buf, user_name.clone(), &raw_attributes)
+                .await
+            {
                 Ok(o) => o,
                 Err(_e) => Dispatch::Drop,
             };
@@ -330,11 +334,12 @@ where
     // pedantic default; the control flow itself is still a single
     // linear dispatcher and splitting it would obscure the spec mapping.
     #[allow(clippy::too_many_lines)]
-    async fn dispatch(
+    async fn dispatch_round(
         &self,
         existing: Option<SessionId>,
         eap_buf: &[u8],
         user_name: Option<Vec<u8>>,
+        outer_attributes: &[u8],
     ) -> Result<Dispatch, crate::Error> {
         let Ok(pkt) = EapPacket::parse(eap_buf) else {
             return Ok(Dispatch::Drop);
@@ -356,7 +361,7 @@ where
             if let Some(id) = peer_identity.as_deref() {
                 method.notify_peer_identity(id);
             }
-            let outcome = method.start().await?;
+            let outcome = method.start(outer_attributes).await?;
             debug!(
                 event = "session_started",
                 method = preferred_typ.0,
@@ -428,7 +433,7 @@ where
             if let Some(id) = session.peer_identity.as_deref() {
                 method.notify_peer_identity(id);
             }
-            let outcome = method.start().await?;
+            let outcome = method.start(outer_attributes).await?;
             // Replace the session's method, keep peer_identity /
             // tried_types / next_eap_id.
             session.method = method;
@@ -453,7 +458,10 @@ where
                 eap_identifier: peer_id,
             });
         }
-        let outcome = session.method.step(pkt.type_data()).await?;
+        let outcome = session
+            .method
+            .step(pkt.type_data(), outer_attributes)
+            .await?;
         commit_outcome(&self.store, outcome, session, peer_id, current_typ).await
     }
 }
@@ -474,13 +482,17 @@ mod tests {
         fn typ(&self) -> EapType {
             self.typ
         }
-        fn start(&mut self) -> crate::method::MethodFuture<'_> {
+        fn start<'a>(&'a mut self, _outer: &'a [u8]) -> crate::method::MethodFuture<'a> {
             Box::pin(async move {
                 self.started = true;
                 Ok(MethodOutcome::Continue(b"hello".to_vec()))
             })
         }
-        fn step<'a>(&'a mut self, _: &'a [u8]) -> crate::method::MethodFuture<'a> {
+        fn step<'a>(
+            &'a mut self,
+            _: &'a [u8],
+            _outer: &'a [u8],
+        ) -> crate::method::MethodFuture<'a> {
             Box::pin(async move {
                 if self.succeed {
                     Ok(MethodOutcome::Success {
@@ -652,6 +664,23 @@ mod tests {
 
     fn handler_for(router: EapRouter) -> MultiEapHandler<InMemorySessionStore<BoxedEapMethod>> {
         MultiEapHandler::with_store(router, InMemorySessionStore::new())
+    }
+
+    // Thin shim so the existing tests don't have to pass an
+    // outer-request snapshot — they exercise routing logic that
+    // doesn't read the outer attributes.
+    impl<S> MultiEapHandler<S>
+    where
+        S: SessionStore<Method = BoxedEapMethod> + 'static,
+    {
+        async fn dispatch(
+            &self,
+            existing: Option<SessionId>,
+            eap_buf: &[u8],
+            user_name: Option<Vec<u8>>,
+        ) -> Result<Dispatch, crate::Error> {
+            self.dispatch_round(existing, eap_buf, user_name, &[]).await
+        }
     }
 
     fn make_packet(id: u8, typ: EapTypeRT, payload: &[u8]) -> Vec<u8> {

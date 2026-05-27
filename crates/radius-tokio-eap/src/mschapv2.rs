@@ -93,6 +93,7 @@ use radius_tokio::rand;
 use crate::inner::{InnerEap, InnerFactory, InnerOutcome};
 #[cfg(feature = "eap-mschapv2")]
 use crate::method::{EapMethod, MethodFactory, MethodOutcome};
+use crate::outer::Outer;
 use crate::Error;
 
 const OP_CHALLENGE: u8 = 1;
@@ -107,24 +108,29 @@ pub const DEFAULT_SERVER_NAME: &[u8] = b"radius-tokio";
 /// Credential lookup hook used by [`MsChapV2Server`].
 ///
 /// The server calls [`Credentials::lookup`] once it has the
-/// EAP-Identity username, then compares the recomputed NT-Response
-/// against the wire value in constant time. The store returns the
-/// cleartext password (or NT hash — both are accepted via
-/// [`MsChapSecret`]). Returning `None` triggers an inner
-/// EAP-Failure.
+/// EAP-Identity username, then compares the recomputed
+/// NT-Response against the wire value in constant time. The
+/// store returns the cleartext password (or NT hash — both are
+/// accepted via [`MsChapSecret`]). Returning `None` triggers an
+/// inner EAP-Failure.
 ///
 /// `Arc<C>` is shared across every PEAP session the listener
 /// accepts.
+///
+/// Most implementations only need `username`; `outer` exposes
+/// the outer RADIUS request for stores that key off NAS
+/// metadata or vendor attributes.
 pub trait Credentials: Send + Sync + 'static {
-    /// Resolve `username` to the credential the server will use
-    /// to compute the expected NT-Response. Returns `None` for an
-    /// unknown user.
+    /// Resolve `username` to the credential the server will
+    /// use to compute the expected NT-Response. Returns `None`
+    /// for an unknown user.
     ///
     /// The returned future is `Send` so the EAP driver can `.await`
     /// it across runtime boundaries (e.g. while talking to a
     /// database or LDAP backend).
     fn lookup<'a>(
         &'a self,
+        outer: &'a Outer<'a>,
         username: &'a [u8],
     ) -> impl std::future::Future<Output = Option<CredentialSecret>> + Send + 'a;
 }
@@ -180,7 +186,11 @@ impl StaticCredentials {
 }
 
 impl Credentials for StaticCredentials {
-    async fn lookup<'a>(&'a self, username: &'a [u8]) -> Option<CredentialSecret> {
+    async fn lookup<'a>(
+        &'a self,
+        _outer: &'a Outer<'a>,
+        username: &'a [u8],
+    ) -> Option<CredentialSecret> {
         if username == self.username.as_slice() {
             Some(match &self.secret {
                 CredentialSecret::Cleartext(s) => CredentialSecret::Cleartext(s.clone()),
@@ -252,7 +262,10 @@ impl<C: Credentials> MsChapV2Server<C> {
 #[cfg(feature = "peap")]
 #[allow(clippy::manual_async_fn)] // explicit `+ Send` bound on the RPITIT future
 impl<C: Credentials> InnerEap for MsChapV2Server<C> {
-    fn start(&mut self) -> impl std::future::Future<Output = Result<Vec<u8>, Error>> + Send + '_ {
+    fn start<'a>(
+        &'a mut self,
+        _outer_attributes: &'a [u8],
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, Error>> + Send + 'a {
         async move {
             // Inner EAP-Request/Identity. RFC 3748 §5.1 says the
             // Type-Data may carry a UTF-8 prompt; we leave it empty —
@@ -267,6 +280,7 @@ impl<C: Credentials> InnerEap for MsChapV2Server<C> {
     fn step<'a>(
         &'a mut self,
         peer_packet: &'a [u8],
+        outer_attributes: &'a [u8],
     ) -> impl std::future::Future<Output = Result<InnerOutcome, Error>> + Send + 'a {
         async move {
             let pkt = EapPacket::parse(peer_packet).map_err(Error::Eap)?;
@@ -310,7 +324,8 @@ impl<C: Credentials> InnerEap for MsChapV2Server<C> {
                     let resp = parse_response_body(body)
                         .ok_or(Error::Framing("MSCHAPv2 Response body malformed"))?;
 
-                    let Some(secret) = self.creds.lookup(username).await else {
+                    let outer = Outer::new(outer_attributes);
+                    let Some(secret) = self.creds.lookup(&outer, username).await else {
                         let ms_id = self.eap_id;
                         let eap_id = self.next_id();
                         let frame = build_failure(eap_id, ms_id);
@@ -629,7 +644,7 @@ impl<C: Credentials> EapMethod for EapMsChapV2<C> {
         }
     }
 
-    fn start(&mut self) -> crate::method::MethodFuture<'_> {
+    fn start<'a>(&'a mut self, _outer_attributes: &'a [u8]) -> crate::method::MethodFuture<'a> {
         Box::pin(async move {
             if !matches!(self.state, NativeState::Init) {
                 return Err(Error::Framing("EAP-MSCHAPv2 start called after start"));
@@ -652,7 +667,11 @@ impl<C: Credentials> EapMethod for EapMsChapV2<C> {
         })
     }
 
-    fn step<'a>(&'a mut self, peer_type_data: &'a [u8]) -> crate::method::MethodFuture<'a> {
+    fn step<'a>(
+        &'a mut self,
+        peer_type_data: &'a [u8],
+        outer_attributes: &'a [u8],
+    ) -> crate::method::MethodFuture<'a> {
         Box::pin(async move {
             let op = peer_type_data
                 .first()
@@ -675,7 +694,8 @@ impl<C: Credentials> EapMethod for EapMsChapV2<C> {
 
                     let next_ms_id = ms_id.wrapping_add(1);
                     let auth_challenge = *auth_challenge;
-                    let Some(secret) = self.creds.lookup(&self.username).await else {
+                    let outer = Outer::new(outer_attributes);
+                    let Some(secret) = self.creds.lookup(&outer, &self.username).await else {
                         let frame = build_failure_type_data(next_ms_id);
                         self.state = NativeState::AwaitingFailureAck;
                         return Ok(MethodOutcome::Continue(frame));
@@ -805,7 +825,7 @@ mod native_tests {
     async fn happy_path_succeeds_after_ack() {
         let creds = Arc::new(StaticCredentials::cleartext(b"alice".to_vec(), "hello"));
         let mut m = run_native(creds);
-        let MethodOutcome::Continue(challenge_td) = m.start().await.expect("start") else {
+        let MethodOutcome::Continue(challenge_td) = m.start(&[]).await.expect("start") else {
             panic!("start did not Continue");
         };
         let (auth_chal, ms_id) = parse_challenge(&challenge_td);
@@ -819,7 +839,7 @@ mod native_tests {
         );
         let response_td = build_response_type_data(ms_id, peer_chal, nt);
         let MethodOutcome::Continue(success_td) =
-            m.step(&response_td).await.expect("step response")
+            m.step(&response_td, &[]).await.expect("step response")
         else {
             panic!("did not produce a Success request");
         };
@@ -827,7 +847,7 @@ mod native_tests {
 
         // Peer acks the Success.
         let ack = [OP_SUCCESS];
-        let outcome = m.step(&ack).await.expect("step ack");
+        let outcome = m.step(&ack, &[]).await.expect("step ack");
         assert!(
             matches!(outcome, MethodOutcome::Success { ref msk, .. } if msk.is_empty()),
             "expected empty-MSK Success, got {outcome:?}",
@@ -841,7 +861,7 @@ mod native_tests {
             "correct-horse",
         ));
         let mut m = run_native(creds);
-        let MethodOutcome::Continue(challenge_td) = m.start().await.unwrap() else {
+        let MethodOutcome::Continue(challenge_td) = m.start(&[]).await.unwrap() else {
             unreachable!()
         };
         let (auth_chal, ms_id) = parse_challenge(&challenge_td);
@@ -853,13 +873,13 @@ mod native_tests {
             MsChapSecret::Cleartext("battery-staple"),
         );
         let resp = build_response_type_data(ms_id, peer_chal, bad_nt);
-        let MethodOutcome::Continue(fail_td) = m.step(&resp).await.expect("step") else {
+        let MethodOutcome::Continue(fail_td) = m.step(&resp, &[]).await.expect("step") else {
             panic!("expected Continue with Failure type-data");
         };
         assert_eq!(fail_td[0], OP_FAILURE);
         let ack = [OP_FAILURE];
         assert!(matches!(
-            m.step(&ack).await.unwrap(),
+            m.step(&ack, &[]).await.unwrap(),
             MethodOutcome::Failure
         ));
     }
@@ -868,12 +888,12 @@ mod native_tests {
     async fn unknown_user_emits_failure() {
         let creds = Arc::new(StaticCredentials::cleartext(b"bob".to_vec(), "x"));
         let mut m = run_native(creds);
-        let MethodOutcome::Continue(challenge_td) = m.start().await.unwrap() else {
+        let MethodOutcome::Continue(challenge_td) = m.start(&[]).await.unwrap() else {
             unreachable!()
         };
         let (_, ms_id) = parse_challenge(&challenge_td);
         let resp = build_response_type_data(ms_id, [0u8; 16], [0u8; 24]);
-        let MethodOutcome::Continue(fail_td) = m.step(&resp).await.expect("step") else {
+        let MethodOutcome::Continue(fail_td) = m.step(&resp, &[]).await.expect("step") else {
             panic!("expected Continue Failure");
         };
         assert_eq!(fail_td[0], OP_FAILURE);
@@ -884,6 +904,6 @@ mod native_tests {
         let creds = Arc::new(StaticCredentials::cleartext(b"alice".to_vec(), "x"));
         let mut m = EapMsChapV2::new(creds);
         m.notify_peer_identity(b"alice");
-        assert!(m.step(&[OP_RESPONSE, 0, 0, 4]).await.is_err());
+        assert!(m.step(&[OP_RESPONSE, 0, 0, 4], &[]).await.is_err());
     }
 }

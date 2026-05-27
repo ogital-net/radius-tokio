@@ -549,6 +549,189 @@ pub fn contains_vsa_tlv<T: WireType>(attrs: &[u8], attr: VsaTlvAttr<T>) -> bool 
 // are the right shortcut — they short-circuit and only walk as far
 // as the first match.
 
+// ---------------------------------------------------------------------
+// AttributesView — shared trait for borrowed-attribute accessors
+// ---------------------------------------------------------------------
+
+/// Borrowed view over a RADIUS attribute region.
+///
+/// Implementors expose a single `&'a [u8]` slice via
+/// [`raw_attributes`](Self::raw_attributes); every other accessor is
+/// a default method built on top of it. Implemented by
+/// [`crate::server::Request`] (the live handler view), by
+/// `radius_tokio_eap::Outer` (the snapshot handed to EAP credential
+/// traits), and by anything else that owns or borrows an attribute
+/// region.
+///
+/// The point of the trait is API consistency: write generic helpers
+/// like
+///
+/// ```ignore
+/// fn looks_like_eap<'a, A: radius_tokio::AttributesView<'a>>(view: &A) -> bool {
+///     view.contains_raw(79) // EAP-Message
+/// }
+/// ```
+///
+/// once and apply them anywhere a borrowed attribute region is in
+/// scope, without re-walking the bytes through ad-hoc free
+/// functions.
+///
+/// All methods are stop-at-first-malformed-slot: a parse error
+/// upstream of the predicate is treated the same as "not present".
+/// Callers that need to distinguish "absent" from "malformed
+/// payload" can fall back to [`first_raw`](Self::first_raw) (which
+/// surfaces [`AttributeError`]) or to [`iter`] on
+/// [`raw_attributes`](Self::raw_attributes).
+pub trait AttributesView<'a> {
+    /// Borrow the underlying attribute region as a contiguous byte
+    /// slice. The only required method — every other accessor
+    /// defaults to walking the region returned here.
+    fn raw_attributes(&self) -> &'a [u8];
+
+    /// Walk the attribute region one slot at a time.
+    #[inline]
+    fn attributes_iter(&self) -> AttributesIter<'a> {
+        iter(self.raw_attributes())
+    }
+
+    /// Find the first well-formed attribute with the given type
+    /// byte. Returns `Ok(None)` when no attribute of that type was
+    /// present and `Err` when a malformed slot was hit first.
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`AttributeError`] from [`AttributesIter`].
+    #[inline]
+    fn first_raw(&self, typ: u8) -> Result<Option<RawAttribute<'a>>, AttributeError> {
+        for slot in self.attributes_iter() {
+            let raw = slot?;
+            if raw.attribute_type() == typ {
+                return Ok(Some(raw));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Presence-only check for a raw attribute type byte. A
+    /// malformed slot before a match yields `false`.
+    #[inline]
+    #[must_use]
+    fn contains_raw(&self, typ: u8) -> bool {
+        for slot in self.attributes_iter() {
+            let Ok(raw) = slot else { return false };
+            if raw.attribute_type() == typ {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Presence-only check for a typed attribute handle.
+    #[inline]
+    #[must_use]
+    fn contains<T: WireType>(&self, attr: Attr<T>) -> bool {
+        contains(self.raw_attributes(), attr)
+    }
+
+    /// Presence-only check for a Vendor-Specific attribute handle.
+    #[inline]
+    #[must_use]
+    fn contains_vsa<T: WireType>(&self, attr: VsaAttr<T>) -> bool {
+        contains_vsa(self.raw_attributes(), attr)
+    }
+
+    /// Presence-only check for a TLV child handle.
+    #[inline]
+    #[must_use]
+    fn contains_tlv<T: WireType>(&self, attr: TlvAttr<T>) -> bool {
+        contains_tlv(self.raw_attributes(), attr)
+    }
+
+    /// Presence-only check for a vendor-specific TLV child handle.
+    #[inline]
+    #[must_use]
+    fn contains_vsa_tlv<T: WireType>(&self, attr: VsaTlvAttr<T>) -> bool {
+        contains_vsa_tlv(self.raw_attributes(), attr)
+    }
+
+    /// Borrowed value of the `User-Name` attribute (RFC 2865 §5.1,
+    /// attribute type 1) if present.
+    #[inline]
+    #[must_use]
+    fn user_name(&self) -> Option<&'a [u8]> {
+        self.first_raw(1).ok().flatten().map(|raw| raw.value())
+    }
+
+    /// Value of the `State` attribute (RFC 2865 §5.24, attribute
+    /// type 24) if present.
+    #[inline]
+    #[must_use]
+    fn state(&self) -> Option<&'a [u8]> {
+        self.first_raw(24).ok().flatten().map(|raw| raw.value())
+    }
+
+    /// Reassemble every `EAP-Message` (RFC 3579 §3.1) attribute on
+    /// this view into a fresh `Vec<u8>`. Empty when none present.
+    #[inline]
+    #[must_use]
+    fn eap_message(&self) -> Vec<u8> {
+        crate::codec::eap::reassemble(self.raw_attributes())
+    }
+
+    /// Reassemble every `EAP-Message` attribute on this view into
+    /// `out`, returning the number of bytes appended. `out` is
+    /// appended to, not cleared.
+    #[inline]
+    fn eap_message_into(&self, out: &mut Vec<u8>) -> usize {
+        crate::codec::eap::reassemble_into(self.raw_attributes(), out)
+    }
+
+    /// Decompose [`user_name`](Self::user_name) into
+    /// `(user, realm)`, recognising the three forms historical
+    /// deployments use:
+    ///
+    /// * `user@realm` — RFC 7542 NAI. Split on the **last** `@`
+    ///   (the username half MUST NOT contain an unescaped `@`,
+    ///   but the realm half by definition can't, so the last
+    ///   `@` is the unambiguous boundary).
+    /// * `DOMAIN\user` — Windows down-level logon name. Split on
+    ///   the **first** `\\`; the domain precedes the user.
+    /// * `user%realm` — legacy Cisco style. Split on the first
+    ///   `%`.
+    ///
+    /// Returns `Some((user, None))` when `User-Name` is present
+    /// but carries no delimiter, `None` when `User-Name` itself
+    /// is absent. The slices borrow straight from the inbound
+    /// attribute region — no allocation, no UTF-8 validation
+    /// (RADIUS `User-Name` is a byte string per RFC 2865 §5.1).
+    ///
+    /// Detection order matches the precedence above: `@` wins
+    /// over `\\` wins over `%`. A `User-Name` of `dom\\user@realm`
+    /// therefore parses as NAI `(b"dom\\user", b"realm")` — the
+    /// outer realm is the routing key.
+    //
+    // Implementation note: we deliberately do *not* pull in the
+    // `memchr` crate for this single 1-to-253-byte slice scan.
+    // `slice::iter().position()` lowers to the same SWAR loop on
+    // tier-1 targets and `User-Name` is too short for SIMD to
+    // pay back the dependency. Revisit if a bench shows it.
+    #[inline]
+    #[must_use]
+    fn user_name_realm(&self) -> Option<(&'a [u8], Option<&'a [u8]>)> {
+        let raw = self.user_name()?;
+        if let Some(i) = raw.iter().rposition(|&b| b == b'@') {
+            return Some((&raw[..i], Some(&raw[i + 1..])));
+        }
+        if let Some(i) = raw.iter().position(|&b| b == b'\\') {
+            return Some((&raw[i + 1..], Some(&raw[..i])));
+        }
+        if let Some(i) = raw.iter().position(|&b| b == b'%') {
+            return Some((&raw[..i], Some(&raw[i + 1..])));
+        }
+        Some((raw, None))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -946,5 +1129,91 @@ mod tests {
         assert!(vsa.matches_vsa(VsaAttr::<WText>::new(9, 1)));
         assert!(!vsa.matches_vsa(VsaAttr::<WText>::new(9, 2)));
         assert!(!vsa.matches_vsa(VsaAttr::<WText>::new(14823, 1)));
+    }
+
+    /// Tiny [`AttributesView`] impl over a borrowed slice, used to
+    /// exercise the trait defaults without spinning up a full
+    /// `Request`.
+    struct View<'a>(&'a [u8]);
+    impl<'a> AttributesView<'a> for View<'a> {
+        fn raw_attributes(&self) -> &'a [u8] {
+            self.0
+        }
+    }
+
+    #[test]
+    fn user_name_realm_absent_user_name() {
+        let bytes = region(&[]);
+        assert_eq!(View(&bytes).user_name_realm(), None);
+    }
+
+    #[test]
+    fn user_name_realm_no_delimiter() {
+        let bytes = region(&[(1, b"alice")]);
+        assert_eq!(
+            View(&bytes).user_name_realm(),
+            Some((b"alice".as_slice(), None))
+        );
+    }
+
+    #[test]
+    fn user_name_realm_nai() {
+        let bytes = region(&[(1, b"alice@example.com")]);
+        assert_eq!(
+            View(&bytes).user_name_realm(),
+            Some((b"alice".as_slice(), Some(b"example.com".as_slice())))
+        );
+    }
+
+    #[test]
+    fn user_name_realm_nai_splits_on_last_at() {
+        // Realm cannot contain '@', so the last '@' is the boundary.
+        let bytes = region(&[(1, b"weird@user@example.com")]);
+        assert_eq!(
+            View(&bytes).user_name_realm(),
+            Some((b"weird@user".as_slice(), Some(b"example.com".as_slice())))
+        );
+    }
+
+    #[test]
+    fn user_name_realm_windows_downlevel() {
+        let bytes = region(&[(1, b"CORP\\alice")]);
+        assert_eq!(
+            View(&bytes).user_name_realm(),
+            Some((b"alice".as_slice(), Some(b"CORP".as_slice())))
+        );
+    }
+
+    #[test]
+    fn user_name_realm_cisco_percent() {
+        let bytes = region(&[(1, b"alice%legacy")]);
+        assert_eq!(
+            View(&bytes).user_name_realm(),
+            Some((b"alice".as_slice(), Some(b"legacy".as_slice())))
+        );
+    }
+
+    #[test]
+    fn user_name_realm_nai_wins_over_backslash_and_percent() {
+        // Outer realm is the routing key.
+        let bytes = region(&[(1, b"CORP\\alice@example.com")]);
+        assert_eq!(
+            View(&bytes).user_name_realm(),
+            Some((b"CORP\\alice".as_slice(), Some(b"example.com".as_slice())))
+        );
+    }
+
+    #[test]
+    fn user_name_realm_preserves_empty_halves() {
+        let at_only = region(&[(1, b"@realm")]);
+        assert_eq!(
+            View(&at_only).user_name_realm(),
+            Some((b"".as_slice(), Some(b"realm".as_slice())))
+        );
+        let trailing = region(&[(1, b"user@")]);
+        assert_eq!(
+            View(&trailing).user_name_realm(),
+            Some((b"user".as_slice(), Some(b"".as_slice())))
+        );
     }
 }

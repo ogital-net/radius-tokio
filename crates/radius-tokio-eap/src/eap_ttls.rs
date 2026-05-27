@@ -65,6 +65,7 @@ use radius_tokio::eap::Type;
 use radius_tokio::tls::{TlsConnection, TlsContext};
 
 use crate::method::{EapMethod, MethodFactory, MethodOutcome};
+use crate::outer::Outer;
 use crate::tls_tunnel::{self, TlsTunnel};
 use crate::Error;
 
@@ -181,12 +182,18 @@ pub fn parse_avps(mut bytes: &[u8]) -> Result<Vec<Avp>, Error> {
 pub trait TtlsInner: Send {
     /// Process one decrypted batch of AVPs from the peer.
     ///
+    /// `outer_attributes` is the raw attribute region of the
+    /// outer Access-Request currently being processed; inner
+    /// methods that surface it to credential / verifier traits
+    /// (via [`Outer`](crate::Outer)) thread it straight through.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Framing`] on inner-method protocol errors.
     fn process<'a>(
         &'a mut self,
         avps: &'a [Avp],
+        outer_attributes: &'a [u8],
     ) -> impl std::future::Future<Output = Result<TtlsInnerOutcome, Error>> + Send + 'a;
 }
 
@@ -216,6 +223,11 @@ pub trait TtlsInnerFactory: Send + Sync + 'static {
 }
 
 /// Credential lookup for the bundled [`PapInner`].
+///
+/// Most implementations only need `username` plus `password`;
+/// `outer` exposes the outer RADIUS request for stores that
+/// want to make policy decisions based on NAS metadata or
+/// vendor attributes.
 pub trait PapCredentials: Send + Sync + 'static {
     /// Returns `true` iff `password` is the correct cleartext
     /// password for `username`.
@@ -225,6 +237,7 @@ pub trait PapCredentials: Send + Sync + 'static {
     /// to a database or LDAP backend).
     fn verify<'a>(
         &'a self,
+        outer: &'a Outer<'a>,
         username: &'a [u8],
         password: &'a [u8],
     ) -> impl std::future::Future<Output = bool> + Send + 'a;
@@ -239,8 +252,11 @@ pub struct StaticPapCredentials {
 
 impl StaticPapCredentials {
     /// Build a store that accepts exactly `(username, password)`.
+    /// PAP carries the password in cleartext over the TLS
+    /// tunnel, so no hashed variant is offered (mirrors
+    /// [`eap_md5::StaticCredentials::cleartext`](crate::eap_md5::StaticCredentials::cleartext)).
     #[must_use]
-    pub fn new(username: impl Into<Vec<u8>>, password: impl Into<Vec<u8>>) -> Self {
+    pub fn cleartext(username: impl Into<Vec<u8>>, password: impl Into<Vec<u8>>) -> Self {
         Self {
             username: username.into(),
             password: password.into(),
@@ -249,7 +265,12 @@ impl StaticPapCredentials {
 }
 
 impl PapCredentials for StaticPapCredentials {
-    async fn verify<'a>(&'a self, username: &'a [u8], password: &'a [u8]) -> bool {
+    async fn verify<'a>(
+        &'a self,
+        _outer: &'a Outer<'a>,
+        username: &'a [u8],
+        password: &'a [u8],
+    ) -> bool {
         // Constant-time compare on the password to avoid timing
         // leaks on the secret half; username equality is fine to
         // short-circuit.
@@ -283,6 +304,7 @@ impl<C: PapCredentials> TtlsInner for PapInner<C> {
     fn process<'a>(
         &'a mut self,
         avps: &'a [Avp],
+        outer_attributes: &'a [u8],
     ) -> impl std::future::Future<Output = Result<TtlsInnerOutcome, Error>> + Send + 'a {
         async move {
             let mut user = None;
@@ -305,7 +327,8 @@ impl<C: PapCredentials> TtlsInner for PapInner<C> {
                 Some(idx) => &pass[..=idx],
                 None => &[][..],
             };
-            if self.creds.verify(user, trimmed).await {
+            let outer = Outer::new(outer_attributes);
+            if self.creds.verify(&outer, user, trimmed).await {
                 Ok(TtlsInnerOutcome::Success)
             } else {
                 Ok(TtlsInnerOutcome::Failure)
@@ -400,7 +423,7 @@ impl<I: TtlsInner> EapMethod for EapTtls<I> {
         Type::TTLS
     }
 
-    fn start(&mut self) -> crate::method::MethodFuture<'_> {
+    fn start<'a>(&'a mut self, _outer_attributes: &'a [u8]) -> crate::method::MethodFuture<'a> {
         Box::pin(async move {
             // RFC 5281 §7.1: server-issued Start frame is a single
             // Flags byte with S set (and the low 3 bits as version,
@@ -410,7 +433,11 @@ impl<I: TtlsInner> EapMethod for EapTtls<I> {
         })
     }
 
-    fn step<'a>(&'a mut self, peer_type_data: &'a [u8]) -> crate::method::MethodFuture<'a> {
+    fn step<'a>(
+        &'a mut self,
+        peer_type_data: &'a [u8],
+        outer_attributes: &'a [u8],
+    ) -> crate::method::MethodFuture<'a> {
         Box::pin(async move {
             // 1. Ingest the peer's TTLS fragment and, if a full TLS
             //    message just reassembled, feed libssl + drive the
@@ -451,7 +478,7 @@ impl<I: TtlsInner> EapMethod for EapTtls<I> {
                 // re-grows it.
                 let avp_bytes = std::mem::take(&mut self.inner_rx_buf);
                 let avps = parse_avps(&avp_bytes)?;
-                match self.inner.process(&avps).await? {
+                match self.inner.process(&avps, outer_attributes).await? {
                     TtlsInnerOutcome::Continue(reply) => {
                         if !reply.is_empty() {
                             self.tunnel.write_app_data(&reply)?;
@@ -581,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn pap_inner_accepts_correct_creds() {
-        let creds = Arc::new(StaticPapCredentials::new("alice", "hello123"));
+        let creds = Arc::new(StaticPapCredentials::cleartext("alice", "hello123"));
         let mut inner = PapInner::new(creds);
         let avps = vec![
             Avp {
@@ -597,7 +624,7 @@ mod tests {
                 data: b"hello123\0\0\0\0\0\0\0\0".to_vec(),
             },
         ];
-        match inner.process(&avps).await.unwrap() {
+        match inner.process(&avps, &[]).await.unwrap() {
             TtlsInnerOutcome::Success => {}
             other => panic!("expected Success, got {other:?}"),
         }
@@ -605,7 +632,7 @@ mod tests {
 
     #[tokio::test]
     async fn pap_inner_rejects_wrong_password() {
-        let creds = Arc::new(StaticPapCredentials::new("alice", "hello123"));
+        let creds = Arc::new(StaticPapCredentials::cleartext("alice", "hello123"));
         let mut inner = PapInner::new(creds);
         let avps = vec![
             Avp {
@@ -621,7 +648,7 @@ mod tests {
                 data: b"wrong\0\0\0\0\0\0\0\0\0\0\0".to_vec(),
             },
         ];
-        match inner.process(&avps).await.unwrap() {
+        match inner.process(&avps, &[]).await.unwrap() {
             TtlsInnerOutcome::Failure => {}
             other => panic!("expected Failure, got {other:?}"),
         }

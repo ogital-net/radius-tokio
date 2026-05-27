@@ -17,10 +17,9 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::codec::attributes::{self, AttributeError, AttributesIter, RawAttribute};
+use crate::codec::attributes::AttributesView;
 use crate::codec::encode::Reply;
 use crate::codec::header::Code;
-use crate::codec::typed::{Attr, TlvAttr, VsaAttr, VsaTlvAttr, WireType};
 
 use super::client::Client;
 
@@ -191,224 +190,6 @@ impl<'a> Request<'a> {
         self.dst
     }
 
-    /// Iterate the raw attribute region.
-    ///
-    /// This is the recommended primitive for **multi-attribute
-    /// routing**. When a root handler needs to dispatch on the
-    /// combined presence of several attributes (RFC and/or
-    /// vendor-specific), walk the region once and fold the
-    /// predicates inline — one pass, zero allocation, no extra API
-    /// surface:
-    ///
-    /// ```ignore
-    /// use radius_tokio::dict::rfc::attrs;
-    /// use radius_tokio::dict::cisco::vsas;
-    ///
-    /// let (mut has_eap, mut has_pap, mut has_chap, mut has_cisco_av) =
-    ///     (false, false, false, false);
-    ///
-    /// for slot in req.attributes_iter() {
-    ///     let Ok(raw) = slot else { break }; // stop at first parse error
-    ///     has_eap      |= raw.matches(attrs::EAP_MESSAGE);
-    ///     has_pap      |= raw.matches(attrs::USER_PASSWORD);
-    ///     has_chap     |= raw.matches(attrs::CHAP_PASSWORD);
-    ///     has_cisco_av |= raw.matches_vsa(vsas::CISCO_AV_PAIR);
-    /// }
-    ///
-    /// match (has_eap, has_pap, has_chap, has_cisco_av) {
-    ///     (true, _, _, _) => handle_eap(req).await,
-    ///     (_, true, _, _) => handle_pap(req).await,
-    ///     (_, _, true, _) => handle_chap(req).await,
-    ///     (_, _, _, true) => handle_cisco(req).await,
-    ///     _               => handle_default(req).await,
-    /// }
-    /// ```
-    ///
-    /// For a *single*-attribute presence check, prefer
-    /// [`Self::contains`] / [`Self::contains_vsa`] /
-    /// [`Self::contains_tlv`] — they short-circuit on the first
-    /// match.
-    #[must_use]
-    pub fn attributes_iter(&self) -> AttributesIter<'a> {
-        attributes::iter(self.attributes)
-    }
-
-    /// Borrow the raw attribute region as a contiguous byte slice.
-    ///
-    /// Useful for handlers that need to **own** a copy of the
-    /// inbound attribute payload across an `.await` (the borrowed
-    /// [`Request`] doesn't survive a future) and re-walk it later
-    /// with [`crate::codec::attributes::iter`]. For inline single-
-    /// pass inspection prefer [`Self::attributes_iter`].
-    #[must_use]
-    pub fn raw_attributes(&self) -> &'a [u8] {
-        self.attributes
-    }
-
-    /// Find the first well-formed attribute with the given type byte.
-    /// Returns `Ok(None)` if no attribute of that type was present;
-    /// returns `Err` if a malformed attribute was hit before one
-    /// could be located.
-    ///
-    /// # Errors
-    ///
-    /// Forwards [`AttributeError`] from the underlying iterator.
-    pub fn first_raw(&self, typ: u8) -> Result<Option<RawAttribute<'a>>, AttributeError> {
-        for raw in self.attributes_iter() {
-            let raw = raw?;
-            if raw.attribute_type() == typ {
-                return Ok(Some(raw));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Return the value of the `State` attribute (RFC 2865 §5.24,
-    /// attribute type 24) the NAS is echoing on this request, if any.
-    ///
-    /// `State` is opaque to the protocol — typically a server-minted
-    /// token from a previous Access-Challenge. Use it to key into
-    /// whatever session store the handler maintains; pair with
-    /// [`Reply::add_state`](crate::codec::encode::Reply::add_state)
-    /// to mint the next round's value.
-    ///
-    /// Returns `None` when no `State` attribute is present or when a
-    /// malformed attribute slot is encountered before one could be
-    /// located. Handlers that need to distinguish "absent" from
-    /// "malformed payload upstream" can use
-    /// [`Self::first_raw`]`(24)` directly.
-    #[must_use]
-    pub fn state(&self) -> Option<&'a [u8]> {
-        // 24 = State (RFC 2865 §5.24). See `Reply::add_state` for the
-        // rationale for hard-coding the type byte here.
-        self.first_raw(24).ok().flatten().map(|raw| raw.value())
-    }
-
-    /// Borrowed value of the `User-Name` attribute (RFC 2865 §5.1,
-    /// attribute type 1) the NAS is asserting on this request, if
-    /// any.
-    ///
-    /// `User-Name` is the canonical subscriber identity in RADIUS;
-    /// Access-Accept replies commonly echo it back so the NAS can
-    /// log the authenticated identity even when it differs from the
-    /// claimed one (e.g. EAP outer vs inner identity). Pair with
-    /// [`crate::Reply::add_attribute`] to echo:
-    ///
-    /// ```ignore
-    /// if let Some(name) = request.user_name() {
-    ///     reply.add_attribute(1, name)?;
-    /// }
-    /// ```
-    ///
-    /// Returns `None` when no `User-Name` attribute is present or
-    /// when a malformed attribute slot is encountered before one
-    /// could be located. Handlers that need to distinguish "absent"
-    /// from "malformed payload upstream" can use
-    /// [`Self::first_raw`]`(1)` directly.
-    #[must_use]
-    pub fn user_name(&self) -> Option<&'a [u8]> {
-        // 1 = User-Name (RFC 2865 §5.1). Hard-coded for parity with
-        // `state()` — the typed handle for callers who want it is
-        // `dict::rfc::attrs::USER_NAME`.
-        self.first_raw(1).ok().flatten().map(|raw| raw.value())
-    }
-
-    /// Reassemble every `EAP-Message` (RFC 3579 §3.1) attribute on
-    /// this request into a fresh `Vec<u8>`.
-    ///
-    /// Returns an empty vector when no `EAP-Message` attribute is
-    /// present. Pair the result with
-    /// [`codec::eap::Packet::parse`](crate::codec::eap::Packet::parse)
-    /// to drive method dispatch. Use [`Self::eap_message_into`] when
-    /// you want to reuse a scratch buffer across requests.
-    #[must_use]
-    pub fn eap_message(&self) -> Vec<u8> {
-        crate::codec::eap::reassemble(self.attributes)
-    }
-
-    /// Reassemble every `EAP-Message` (RFC 3579 §3.1) attribute on
-    /// this request into `out`, returning the number of bytes
-    /// appended.
-    ///
-    /// `out` is *appended to*, not cleared — the caller owns the
-    /// buffer's lifecycle and can reuse it across requests.
-    pub fn eap_message_into(&self, out: &mut Vec<u8>) -> usize {
-        crate::codec::eap::reassemble_into(self.attributes, out)
-    }
-
-    /// Presence-only check for a typed attribute handle.
-    ///
-    /// Returns `true` iff the request carries a well-formed
-    /// attribute slot matching `attr`. The payload is *not* decoded
-    /// under `T`, which is exactly what a top-level dispatch needs:
-    /// ```ignore
-    /// use radius_tokio::dict::rfc::attrs;
-    ///
-    /// if req.contains(attrs::EAP_MESSAGE) {
-    ///     handle_eap(req).await
-    /// } else if req.contains(attrs::USER_PASSWORD) {
-    ///     handle_pap(req).await
-    /// } else if req.contains(attrs::CHAP_PASSWORD) {
-    ///     handle_chap(req).await
-    /// } else {
-    ///     // …
-    /// }
-    /// ```
-    ///
-    /// A malformed attribute encountered before a match yields
-    /// `false` — consistent with [`Self::first_raw`]'s find-or-fail
-    /// behaviour but collapsed to a single boolean for dispatch use.
-    #[inline]
-    #[must_use]
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn contains<T: WireType>(&self, attr: Attr<T>) -> bool {
-        attributes::contains(self.attributes, attr)
-    }
-
-    /// Presence-only check for a Vendor-Specific attribute handle.
-    /// See [`Self::contains`] for the dispatch idiom.
-    #[inline]
-    #[must_use]
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn contains_vsa<T: WireType>(&self, attr: VsaAttr<T>) -> bool {
-        attributes::contains_vsa(self.attributes, attr)
-    }
-
-    /// Presence-only check for a TLV child handle.
-    /// See [`Self::contains`] for the dispatch idiom.
-    #[inline]
-    #[must_use]
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn contains_tlv<T: WireType>(&self, attr: TlvAttr<T>) -> bool {
-        attributes::contains_tlv(self.attributes, attr)
-    }
-
-    /// Presence-only check for a vendor-specific TLV child handle.
-    /// See [`Self::contains`] for the dispatch idiom.
-    #[inline]
-    #[must_use]
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn contains_vsa_tlv<T: WireType>(&self, attr: VsaTlvAttr<T>) -> bool {
-        attributes::contains_vsa_tlv(self.attributes, attr)
-    }
-
-    /// Presence-only check for a raw attribute type byte.
-    ///
-    /// Cheaper than [`Self::first_raw`] for callers that only need
-    /// "is it there?": no `Result` to unwrap, no `RawAttribute`
-    /// returned. Equivalent to `self.first_raw(typ).ok().flatten().is_some()`.
-    #[inline]
-    #[must_use]
-    pub fn contains_raw(&self, typ: u8) -> bool {
-        for slot in self.attributes_iter() {
-            let Ok(raw) = slot else { return false };
-            if raw.attribute_type() == typ {
-                return true;
-            }
-        }
-        false
-    }
-
     /// Decode the `Acct-Status-Type` attribute (RFC 2866 §5.1) if
     /// present and well-formed.
     ///
@@ -416,7 +197,7 @@ impl<'a> Request<'a> {
     /// requests that omit the attribute, and for malformed values
     /// (wrong length, attribute list parse error). Handlers that
     /// want to distinguish "absent" from "malformed" should iterate
-    /// [`attributes_iter`](Self::attributes_iter) directly.
+    /// [`AttributesView::attributes_iter`] directly.
     #[must_use]
     pub fn acct_status_type(&self) -> Option<super::accounting::AcctStatusType> {
         // Acct-Status-Type is a 4-byte big-endian integer (attribute 40).
@@ -542,6 +323,13 @@ impl<'a> Request<'a> {
         reply
             .add_tunnel_password(tag, password, self.authenticator(), self.client().secret())
             .map(|_| ())
+    }
+}
+
+impl<'a> AttributesView<'a> for Request<'a> {
+    #[inline]
+    fn raw_attributes(&self) -> &'a [u8] {
+        self.attributes
     }
 }
 
