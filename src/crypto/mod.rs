@@ -39,6 +39,7 @@ pub mod tls;
 pub mod aes;
 pub mod hmac_sha1;
 pub mod hmac_sha256;
+pub mod pbkdf2;
 
 /// Compares two byte slices in constant time.
 ///
