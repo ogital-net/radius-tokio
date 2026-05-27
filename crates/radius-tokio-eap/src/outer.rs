@@ -13,7 +13,7 @@
 //! the outer view. Stores that want to make policy decisions
 //! based on NAS-side metadata (`NAS-IP-Address`,
 //! `Called-Station-Id`, vendor attributes, …) bring the
-//! [`AttributesView`](radius_tokio::AttributesView) trait into
+//! [`AttributesView`] trait into
 //! scope, which is implemented for both [`Outer`] and
 //! [`radius_tokio::server::Request`].
 //!

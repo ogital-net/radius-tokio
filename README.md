@@ -412,7 +412,7 @@ will not do. Roadmap items live in [`ROADMAP.md`](ROADMAP.md).
 
 ## License
 
-BSD 2-Clause — see [`LICENSE`](LICENSE).
+BSD 2-Clause — see [LICENSE](./LICENSE).
 
 The vendored FreeRADIUS dictionaries under
 `crates/radius-tokio-dict/dictionaries/` carry their own upstream

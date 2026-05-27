@@ -185,7 +185,7 @@ pub trait TtlsInner: Send {
     /// `outer_attributes` is the raw attribute region of the
     /// outer Access-Request currently being processed; inner
     /// methods that surface it to credential / verifier traits
-    /// (via [`Outer`](crate::Outer)) thread it straight through.
+    /// (via [`Outer`]) thread it straight through.
     ///
     /// # Errors
     ///
