@@ -1,13 +1,22 @@
 [package]
 name = "radius-tokio-eap"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.83"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "TLS-tunnelled EAP methods (EAP-TLS, PEAP, EAP-TTLS) for radius-tokio"
-license = "BSD-2-Clause"
-repository = "https://github.com/example/radius-tokio"
 keywords = ["radius", "eap", "peap", "eap-tls", "eap-ttls"]
 categories = ["network-programming", "authentication"]
+# Allow-list of files shipped in the published crate. Examples and
+# integration tests are kept in so downstreams can read them via
+# `docs.rs` source links and reproduce the eapol_test runs locally.
+include = [
+    "src/**/*.rs",
+    "examples/**/*.rs",
+    "tests/**/*.rs",
+    "Cargo.toml",
+]
 
 [features]
 # No default features — methods are opt-in so downstreams that only
@@ -61,14 +70,14 @@ tracing = ["dep:tracing"]
 metrics = ["dep:metrics"]
 
 [dependencies]
-radius-tokio = { path = "../..", version = "0.1.0" }
-tokio = { version = "1", default-features = false, features = ["sync"] }
-tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
-metrics = { version = "0.24", optional = true }
+radius-tokio = { workspace = true }
+tokio = { workspace = true, default-features = false, features = ["sync"] }
+tracing = { workspace = true, optional = true }
+metrics = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }
-radius-tokio = { path = "../..", version = "0.1.0", features = ["radsec"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "net"] }
+radius-tokio = { workspace = true, features = ["radsec"] }
 
 [[example]]
 name = "peap_mschapv2"
@@ -77,3 +86,7 @@ required-features = ["peap"]
 [[example]]
 name = "multi_method"
 required-features = ["peap", "eap-md5"]
+
+[lints]
+workspace = true
+

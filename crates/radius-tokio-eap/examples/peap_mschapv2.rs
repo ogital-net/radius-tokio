@@ -14,7 +14,7 @@
 //! ```
 //!
 //! On startup the example prints a ready-to-use `eapol_test`
-//! invocation plus the wpa_supplicant config block it expects.
+//! invocation plus the `wpa_supplicant` config block it expects.
 //! Drive it from another shell with hostap's `eapol_test`:
 //!
 //! ```text

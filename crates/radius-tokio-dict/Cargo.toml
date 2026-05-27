@@ -1,12 +1,21 @@
 [package]
 name = "radius-tokio-dict"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.83"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Typed FreeRADIUS dictionary tables for RADIUS attribute encoding/decoding"
-license = "BSD-2-Clause"
-repository = "https://github.com/example/radius-tokio"
 build = "build.rs"
+# Allow-list of files shipped in the published crate. The dictionary
+# corpus under `dictionaries/` is read by `build.rs` at consumer
+# build time and must travel with the crate.
+include = [
+    "src/**/*.rs",
+    "build.rs",
+    "dictionaries/**",
+    "Cargo.toml",
+]
 
 [features]
 default = ["dict-rfc"]
@@ -46,15 +55,10 @@ dict-vendor-all = [
 ]
 
 [build-dependencies]
-radius-tokio-dict-codegen = { path = "../radius-tokio-dict-codegen", version = "0.1.0" }
+radius-tokio-dict-codegen = { workspace = true }
 
 [dev-dependencies]
-radius-tokio-dict-codegen = { path = "../radius-tokio-dict-codegen", version = "0.1.0" }
+radius-tokio-dict-codegen = { workspace = true }
 
-[lints.rust]
-unsafe_op_in_unsafe_fn = "deny"
-missing_docs = "warn"
-dead_code = "allow"
-
-[lints.clippy]
-pedantic = { level = "warn", priority = -1 }
+[lints]
+workspace = true

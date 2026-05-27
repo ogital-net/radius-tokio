@@ -18,7 +18,7 @@
 //! * `eapol_test` prints
 //!   `EAP authentication completed successfully`.
 //!
-//! Bare EAP-MSCHAPv2 derives no MSK (RFC 3079 GetMasterKey is not
+//! Bare EAP-MSCHAPv2 derives no MSK (RFC 3079 `GetMasterKey` is not
 //! wired in), so the supplicant config uses
 //! `key_mgmt=IEEE8021X` and `eapol_test -n` so the test does not
 //! expect MPPE keys back.

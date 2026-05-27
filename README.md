@@ -1,14 +1,17 @@
 # radius-tokio
 
-A high-performance, async RADIUS server **library** for Rust on top of Tokio.
+An async RADIUS server library for Rust on top of Tokio. The crate
+is meant to be embedded: there is no `main`, no config file, no
+daemonisation. You construct a `Server`, plug in two traits
+(`ClientStore` and `Handler`), and drive it from your own runtime.
+The library handles the wire-level work — decoding, deduplication,
+authenticator verification, reply sealing, RadSec mTLS — and stays
+out of the policy layer.
 
-`radius-tokio` is built to be embedded in an application — it is not a
-daemon, has no `main`, and reads no config files. You construct a
-`Server`, plug in two small traits (`ClientStore` and `Handler`), and
-drive it from your own Tokio runtime. The library owns every wire- and
-protocol-level detail (decoding, deduplication, authenticator
-verification, reply sealing, RadSec mTLS); your code owns the policy
-("who is this peer?", "what should I send back?").
+EAP method termination lives in a companion crate,
+[`radius-tokio-eap`](crates/radius-tokio-eap/), which plugs into the
+same `Handler` surface and ships PEAP, EAP-TTLS, EAP-TLS, EAP-MD5
+and bare EAP-MSCHAPv2.
 
 ```text
 +------------------------------------------------------+
@@ -33,44 +36,46 @@ verification, reply sealing, RadSec mTLS); your code owns the policy
 
 ## Status
 
-Pre-0.1. Breaking API changes are explicitly allowed and will happen
-without deprecation cycles until a `1.0` release.
+`0.1`. The wire codec, dedup pipeline, UDP and RadSec listeners,
+CoA originator, Status-Server responder and the EAP method drivers
+are all in. Breaking API changes are still on the table until
+`1.0`; the wire-touching internals are settling first, the
+trait-facing surface second.
 
 ## Supported RFCs
 
-| RFC      | Title                                         | Status        |
-|----------|-----------------------------------------------|---------------|
-| RFC 2865 | RADIUS                                        | implemented   |
-| RFC 2866 | RADIUS Accounting                             | implemented   |
-| RFC 2867 | RADIUS Accounting / Tunnel Protocol Support   | dictionaries  |
-| RFC 2868 | RADIUS Attributes for Tunnel Protocol Support | dictionaries  |
-| RFC 2869 | RADIUS Extensions                             | dictionaries  |
-| RFC 3162 | RADIUS and IPv6                               | dictionaries  |
-| RFC 3579 | RADIUS Support For EAP                        | passthrough   |
-| RFC 3580 | IEEE 802.1X RADIUS Usage Guidelines           | dictionaries  |
-| RFC 5080 | Common RADIUS Implementation Issues           | dedup cache   |
-| RFC 5176 | Dynamic Authorization (CoA / Disconnect)      | implemented   |
-| RFC 5997 | Status-Server                                 | implemented   |
-| RFC 6614 | RADIUS over TLS (RadSec)                      | implemented   |
-| RFC 8044 / RFC 6158 | Data type guidance                 | dict types    |
-
-EAP method termination (PEAP, EAP-TLS, EAP-TTLS, …) is intentionally
-out of scope: the codec exposes the `EAP-Message` reassembly view so
-your handler can pass the EAP payload to whatever method engine you
-already use.
+| RFC      | Title                                         | Status                |
+|----------|-----------------------------------------------|-----------------------|
+| RFC 2865 | RADIUS                                        | implemented           |
+| RFC 2866 | RADIUS Accounting                             | implemented           |
+| RFC 2867 | Tunnel Protocol Accounting                    | dictionaries          |
+| RFC 2868 | Tunnel Protocol Attributes                    | implemented (`Tagged`)|
+| RFC 2869 | RADIUS Extensions                             | dictionaries          |
+| RFC 3162 | RADIUS and IPv6                               | dictionaries          |
+| RFC 3579 | RADIUS Support for EAP                        | reassembly + MA       |
+| RFC 3580 | IEEE 802.1X Usage Guidelines                  | dictionaries          |
+| RFC 3748 | EAP                                           | `radius-tokio-eap`    |
+| RFC 5080 | Common RADIUS Implementation Issues           | dedup cache           |
+| RFC 5176 | Dynamic Authorization (CoA / Disconnect)      | implemented           |
+| RFC 5216 | EAP-TLS                                       | `radius-tokio-eap`    |
+| RFC 5281 | EAP-TTLS v0                                   | `radius-tokio-eap`    |
+| RFC 5997 | Status-Server                                 | implemented           |
+| RFC 6614 | RADIUS over TLS (RadSec)                      | implemented           |
+| RFC 7542 | NAI (`user@realm` parsing)                    | implemented           |
+| RFC 8044 / 6158 | Data type guidance                     | dict types            |
 
 ## Quickstart
 
 A minimal Access-Request → Access-Accept loop, UDP only:
 
-```no_run
+```rust,no_run
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use radius_tokio::server::{
     Client, Handler, HandlerResult, IpCidr, Request, Server, StaticClients,
 };
-use radius_tokio::Code;
+use radius_tokio::{AttributesView, Code};
 use radius_tokio::dict::rfc::attrs;
 
 struct MyApp;
@@ -80,7 +85,10 @@ impl Handler for MyApp {
         if request.code() != Code::ACCESS_REQUEST {
             return HandlerResult::Drop;
         }
-        // Inspect attributes, run policy, build the reply ...
+        // `AttributesView` exposes zero-copy accessors that borrow
+        // straight from the inbound buffer.
+        let _user = request.user_name().unwrap_or_default();
+
         let mut reply = request.reply(Code::ACCESS_ACCEPT);
         reply.add(attrs::SESSION_TIMEOUT, 3600u32).unwrap();
         HandlerResult::Reply(reply)
@@ -105,15 +113,34 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
+### Reading attributes — `AttributesView`
+
+`Request`, the EAP crate's `Outer` (passed to credential lookups)
+and the EAP crate's `AcceptContext` (passed to authorisation
+decorators) all implement the same `AttributesView<'a>` trait.
+Bringing it into scope unlocks the same set of zero-copy accessors
+everywhere:
+
+```rust,no_run
+use radius_tokio::AttributesView;
+# fn demo(req: radius_tokio::server::Request<'_>) {
+let user_name = req.user_name();                   // Option<&[u8]>
+let state     = req.state();                       // Option<&[u8]>
+let split     = req.user_name_realm();             // (user, realm) — NAI / DOMAIN\ / %
+let eap_msg   = req.eap_message();                 // reassembled EAP-Message
+for slot in req.attributes_iter() { /* ... */ }
+# }
+```
+
 ### Tagged tunnel attributes (RFC 2868)
 
 Attributes carrying an RFC 2868 §3.1 tag — `Tunnel-Type`,
 `Tunnel-Medium-Type`, `Tunnel-Private-Group-Id`, … — are exposed
-through `Tagged<V>` so consumers never hand-roll the tag byte or the
-24-bit packing of tagged integers. The typed handle picks the right
-wire shape automatically:
+through `Tagged<V>` so consumers never hand-roll the tag byte or
+the 24-bit packing of tagged integers:
 
 ```rust,no_run
+use radius_tokio::AttributesView;
 use radius_tokio::dict::rfc::attrs;
 use radius_tokio::dict::Tagged;
 # fn demo(request: radius_tokio::server::Request<'_>) {
@@ -137,50 +164,89 @@ for attr in request.attributes_iter().flatten() {
 # }
 ```
 
-See [`examples/`](examples/) for richer scenarios:
+### Examples
 
-- `mutable_clients.rs` — a runtime-mutable in-memory `ClientStore`.
-- `sqlite_clients.rs` — a SQLite-backed `ClientStore` fronted by
-  `CachedStore<S>` for TTL + single-flight dedup.
-- `threadlocal_responder.rs` — bypassing the `Handler` trait for
-  custom thread-local reply paths.
-- `dhat_hot_path.rs` — allocation profiling of the codec hot path.
+[`examples/`](examples/):
+
+| File                          | What it shows                                       |
+|-------------------------------|-----------------------------------------------------|
+| `routing_dispatcher.rs`       | Routing on `Service-Type` / VSA via `CodeRouter`.   |
+| `mutable_clients.rs`          | Runtime-mutable in-memory `ClientStore`.            |
+| `sqlite_clients.rs`           | SQLite-backed `ClientStore` behind `CachedStore`.   |
+| `mixed_udp_radsec.rs`         | One handler, UDP + RadSec listeners side by side.   |
+| `coa_originator.rs`           | Sending CoA / Disconnect to a NAS.                  |
+| `graceful_shutdown.rs`        | `ShutdownHandle` + in-flight draining.              |
+| `threadlocal_responder.rs`    | Bypassing `Handler` for thread-local reply paths.   |
+| `eap_identity_challenge.rs`   | Identity / MD5-challenge without the EAP crate.     |
+| `dhat_hot_path.rs`            | Allocation profiling of the codec hot path.         |
+
+[`crates/radius-tokio-eap/examples/`](crates/radius-tokio-eap/examples/):
+
+| File                | What it shows                                           |
+|---------------------|---------------------------------------------------------|
+| `peap_mschapv2.rs`  | PEAPv0 + inner EAP-MSCHAPv2, end-to-end.                |
+| `multi_method.rs`   | Method negotiation across PEAP / EAP-TLS / EAP-TTLS.    |
+
+## EAP — `radius-tokio-eap`
+
+The companion crate ships server-side EAP state machines that slot
+into the same `Handler` plumbing:
+
+| Method        | Spec              | Inner method               | Cargo feature   |
+|---------------|-------------------|----------------------------|-----------------|
+| EAP-MD5       | RFC 3748 §5.4     | (none — bare)              | `eap-md5`       |
+| EAP-MSCHAPv2  | draft-kamath §3   | (none — bare, legacy wired)| `eap-mschapv2`  |
+| EAP-TLS       | RFC 5216 / 9190   | (none — TLS cert)          | `eap-tls`       |
+| PEAP v0       | draft-josefsson   | EAP (commonly MSCHAPv2)    | `peap`          |
+| EAP-TTLS      | RFC 5281          | AVP (PAP / inner EAP)      | `eap-ttls`      |
+
+Each method exposes a small `Credentials` (lookup-style) or
+`PapCredentials` (verify-style) trait that takes an `Outer<'_>` and
+a username; closures and in-memory `StaticCredentials` stores are
+provided for tests and small deployments. `EapHandler::with_accept_decorator`
+lets you stamp authorisation attributes (VLAN assignment, ACL
+profiles, session timeouts) onto each `Access-Accept` as it leaves
+the handler. End-to-end interop is exercised against `eapol_test`
+under `crates/radius-tokio-eap/tests/`.
 
 ## Cargo features
+
+### `radius-tokio`
 
 | Feature           | Default | Effect                                              |
 |-------------------|---------|-----------------------------------------------------|
 | `dict-rfc`        | yes     | RFC dictionaries (small, recommended).              |
-| `dict-cisco`      | no      | Cisco VSAs.                                         |
-| `dict-aruba`      | no      | Aruba / HPE VSAs.                                   |
-| `dict-ascend`     | no      | Ascend VSAs.                                        |
-| `dict-fortinet`   | no      | Fortinet VSAs.                                      |
-| `dict-hp`         | no      | HP VSAs.                                            |
-| `dict-juniper`    | no      | Juniper VSAs.                                       |
-| `dict-meraki`     | no      | Meraki VSAs.                                        |
-| `dict-microsoft`  | no      | Microsoft VSAs (NPS, MS-CHAP attributes).           |
-| `dict-mikrotik`   | no      | MikroTik VSAs.                                      |
-| `dict-ruckus`     | no      | Ruckus VSAs.                                        |
-| `dict-wispr`      | no      | WISPr VSAs.                                         |
-| `dict-vendor-all` | no      | Umbrella enabling every vendored vendor dictionary. |
-| `radsec`          | no      | RADIUS-over-TLS (RFC 6614) listener + `tls` and `pki` modules. |
-| `fast-md5`        | **yes** | Swap the MD5 block compressor from `aws-lc-sys` to the [`fast-md5`](https://crates.io/crates/fast-md5) crate (hand-written x86_64 + aarch64 assembly, portable Rust fallback, `#![no_std]`). Disabling falls back to `aws-lc-sys`'s MD5, which is always available. |
+| `fast-md5`        | yes     | Swap the MD5 block compressor from `aws-lc-sys` to the [`fast-md5`](https://crates.io/crates/fast-md5) crate (hand-written x86_64 + aarch64 assembly, portable Rust fallback, `#![no_std]`). |
+| `radsec`          | no      | RADIUS-over-TLS (RFC 6614) listener + `tls` / `pki` modules. |
 | `tracing`         | no      | Structured spans/events around accept and dispatch. |
-| `metrics`         | no      | Counters/histograms via the `metrics` facade.       |
+| `metrics`         | no      | Counters / histograms via the `metrics` facade.     |
+| `test-util`       | no      | `server::test_support::MockRequest` for downstream handler tests. |
+| `dict-vendor-all` | no      | Umbrella over every vendored vendor dictionary.     |
+| `dict-<vendor>`   | no      | Per-vendor VSAs: `airespace`, `aruba`, `ascend`, `cisco`, `eleven`, `fortinet`, `hp`, `juniper`, `meraki`, `microsoft`, `mikrotik`, `ruckus`, `tplink`, `wispr`. |
 
-Vendor VSA dictionaries are opt-in to keep generated code small;
-enable only the ones you need.
-
-The `radsec` feature pulls in `aws-lc-sys`'s `ssl` build, which runs
-`bindgen` and adds ~30s to a cold build (and requires `cmake` +
+Vendor VSA dictionaries are opt-in to keep generated code small.
+The `radsec` feature pulls in `aws-lc-sys`'s `ssl` build, which
+runs `bindgen` and adds ~30s to a cold build (requires `cmake` and
 `clang`/`libclang`).
 
-`fast-md5` is on by default. It is a pure-Rust crate with no native
-build dependency — it uses Rust inline assembly for x86_64 and aarch64,
-and a portable fallback for every other target.
-If you need a build that avoids all optional dependencies, disable it
-with `--no-default-features --features dict-rfc`; the public API is
-identical and you fall back to `aws-lc-sys`'s MD5.
+`fast-md5` has no native build dependency — it uses Rust inline
+assembly for x86_64 and aarch64 and a portable fallback elsewhere.
+For a build with no optional native code: `--no-default-features
+--features dict-rfc` falls back to `aws-lc-sys`'s MD5. The public
+API is unchanged.
+
+### `radius-tokio-eap`
+
+| Feature        | Default | Effect                                              |
+|----------------|---------|-----------------------------------------------------|
+| `eap-md5`      | no      | EAP-MD5-Challenge.                                  |
+| `eap-mschapv2` | no      | Native EAP-MSCHAPv2 (legacy wired 802.1X).          |
+| `eap-tls`      | no      | EAP-TLS (pulls `radius-tokio/radsec`).              |
+| `peap`         | no      | PEAP v0 + EAP-MSCHAPv2 inner.                       |
+| `eap-ttls`     | no      | EAP-TTLS with bundled PAP inner.                    |
+| `all-methods`  | no      | Umbrella over every method above.                   |
+| `tracing`      | no      | Per-session / per-method `tracing` events.          |
+| `metrics`      | no      | Counters via the `metrics` facade.                  |
 
 ## RadSec (RFC 6614)
 
@@ -244,18 +310,18 @@ let nas = ca.issue_client(
 # }
 ```
 
-The module is deliberately small — no CSRs, no CRLs, no encrypted
-keys, no custom extensions. If you already run a real PKI, ignore
-it and feed your existing PEM straight to `TlsContext::server`.
+No CSRs, no CRLs, no encrypted keys, no custom extensions. If you
+already run a real PKI, ignore this and feed your PEM straight to
+`TlsContext::server`.
 
 ## CoA / Disconnect (RFC 5176)
 
-The server can also originate `CoA-Request` / `Disconnect-Request` to
-a NAS via `CoaOriginator`. Replies (`CoA-ACK` / `CoA-NAK`,
-`Disconnect-ACK` / `Disconnect-NAK`) are correlated and surfaced as a
-typed `CoaOutcome`. The originator carries both the Authenticator
-field and a `Message-Authenticator` attribute on every request, per
-RFC 5176 §3.
+The server can originate `CoA-Request` / `Disconnect-Request` to a
+NAS via `CoaOriginator`. Replies (`CoA-ACK` / `CoA-NAK`,
+`Disconnect-ACK` / `Disconnect-NAK`) are correlated and surfaced
+as a typed `CoaOutcome`. The originator carries both the
+Authenticator field and a `Message-Authenticator` attribute on
+every request, per RFC 5176 §3.
 
 ## Cryptography
 
@@ -264,10 +330,11 @@ that wraps `aws-lc-sys` directly:
 
 - HMAC-MD5 / MD5 — Request and Response Authenticators (RFC 2865 §3),
   Message-Authenticator (RFC 3579 §3.2).
-- HMAC-SHA1 / HMAC-SHA256, AES, DES, key-wrap — used by
-  Tunnel-Password, MS-CHAP, and the RadSec `SSL` layer.
+- HMAC-SHA1 / HMAC-SHA256, AES, DES, key-wrap — Tunnel-Password,
+  MS-CHAP, and the RadSec `SSL` layer.
 - `RAND_bytes` — Request Authenticator generation.
-- `CRYPTO_memcmp` — constant-time tag comparisons.
+- `CRYPTO_memcmp` — constant-time tag comparisons; re-exported
+  to consumers as `radius_tokio::ct_eq` for handler-side use.
 
 Every `unsafe` block carries a `// SAFETY:` comment explaining the
 invariants. FFI handles (`SSL`, `EVP_MD_CTX`, `HMAC_CTX`, `X509`, …)
@@ -288,13 +355,17 @@ under the `radius_tokio` target / metric prefix:
   `radsec_revocations_applied`.
 - CoA originator: `coa_requests_sent{code=…}`, `coa_outcomes{outcome=…}`.
 
-Off-by-default macros expand to nothing — there is no runtime cost
-when the features are disabled.
+The EAP crate emits its own vocabulary under `radius_tokio_eap`
+(session create / complete, method dispatch, fragment overflow,
+TLS handshake completion) so consumers can filter independently.
+
+Off-by-default macros expand to nothing when the features are
+disabled — there is no runtime cost.
 
 ## MSRV
 
-**Rust 1.83** (required for return-position `impl Trait` in traits;
-used pervasively for `async fn` in traits without `async-trait`).
+**Rust 1.83.** Required for return-position `impl Trait` in traits;
+used pervasively for `async fn` in traits without `async-trait`.
 Pinned via `rust-version` in each `Cargo.toml`.
 
 ## Platforms & testing
@@ -312,12 +383,13 @@ exists to catch portability regressions in the codec, server, and
 `aws-lc-sys` wrappers (AWS-LC builds via `cmake` on every host,
 plus `nasm` on Windows for the perl-asm sources).
 
-End-to-end integration tests under `tests/` drive the server with
-real RADIUS tooling — `radclient`, `radsecproxy`, and `eapol_test`.
-Those binaries only ship convenient packages on Linux, so the
-suites self-skip on macOS and Windows; the Linux CI cell installs
-them and runs the full set. Local development on macOS / Windows
-still gets the unit, codec, and TLS handshake coverage.
+End-to-end integration tests under `tests/` and
+`crates/radius-tokio-eap/tests/` drive the server with real RADIUS
+tooling — `radclient`, `radsecproxy`, and `eapol_test`. Those
+binaries only ship convenient packages on Linux, so the suites
+self-skip on macOS and Windows; the Linux CI cell installs them
+and runs the full set. Local development on macOS / Windows still
+gets the unit, codec, and TLS handshake coverage.
 
 A separate AddressSanitizer job (Linux nightly, x86_64) exercises
 every `unsafe` block in `src/crypto/` against the underlying
@@ -329,15 +401,20 @@ checking.
 ## Performance
 
 End-to-end UDP throughput with a no-op handler on a containerised
-ARM host: **239 k req/s, p99 = 42 µs** (budget: > 200 k req/s,
+ARM host: **239 k req/s, p99 = 42 µs** (target: > 200 k req/s,
 p99 < 50 µs). See [`BENCHMARKS.md`](BENCHMARKS.md) for the full
 methodology, hardware, and per-component numbers.
 
+## Non-goals
+
+[`NON_GOALS.md`](NON_GOALS.md) lists what this crate deliberately
+will not do. Roadmap items live in [`ROADMAP.md`](ROADMAP.md).
+
 ## License
 
-Licensed under the BSD 2-Clause License — see the `LICENSE` file at
-the root of the repository.
+BSD 2-Clause — see [`LICENSE`](LICENSE).
 
 The vendored FreeRADIUS dictionaries under
-`crates/radius-tokio-dict/dictionaries/` carry their own upstream licenses;
-see the `LICENSE` files in those directories.
+`crates/radius-tokio-dict/dictionaries/` carry their own upstream
+licenses; see the `LICENSE` files in those directories.
+

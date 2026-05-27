@@ -40,6 +40,9 @@ const SHARED_SECRET: &str = "testing123";
 const IDENTITY: &str = "alice";
 const PASSWORD: &str = "hello123";
 
+// The `_pem` postfix on every field is intentional: it distinguishes
+// the wire-encoded PEM blobs from any future parsed/typed forms.
+#[allow(clippy::struct_field_names)]
 struct Pki {
     server_chain_pem: Vec<u8>,
     server_key_pem: Vec<u8>,
