@@ -32,3 +32,6 @@ pub(crate) const CHAP_CHALLENGE: u8 = 60;
 
 /// `Tunnel-Password` (RFC 2868 §3.5).
 pub(crate) const TUNNEL_PASSWORD: u8 = 69;
+
+/// `Error-Cause` (RFC 5176 §3.5 / RFC 3576 §5.18).
+pub(crate) const ERROR_CAUSE: u8 = 101;

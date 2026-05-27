@@ -36,6 +36,10 @@ pub(crate) mod sha1;
 #[cfg(feature = "radsec")]
 pub mod tls;
 
+pub mod aes;
+pub mod hmac_sha1;
+pub mod hmac_sha256;
+
 /// Compares two byte slices in constant time.
 ///
 /// Returns `false` immediately if the lengths differ (length is not secret).

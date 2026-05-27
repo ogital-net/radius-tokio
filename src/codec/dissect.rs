@@ -286,47 +286,118 @@ fn write_vsa(f: &mut fmt::Formatter<'_>, indent: &str, len: u8, val: &[u8]) -> f
     // RFC 2865 §5.26 framing assumed (1-byte type, 1-byte length).
     // FreeRADIUS `format=t,l` overrides are not yet honoured here;
     // they are rare in the dictionaries we vendor.
-    let inner_indent_buf;
-    let inner_indent: &str = {
-        inner_indent_buf = format!("{indent}{INDENT}");
-        &inner_indent_buf
-    };
+    let inner_indent = format!("{indent}{INDENT}");
 
-    let Some((&[v_type, v_len], data_and_rest)) = rest.split_first_chunk::<2>() else {
-        writeln!(f, "{inner_indent}<truncated vendor TLV>")?;
-        return write_raw_hex(f, inner_indent, rest);
-    };
-    let data_len = match (v_len as usize).checked_sub(2) {
-        Some(n) if n <= data_and_rest.len() => n,
-        _ => {
+    // Walk every vendor TLV packed into this VSA slot. RFC 2865
+    // §5.26 explicitly allows multiple sub-attributes to share one
+    // Vendor-Specific attribute, and Cisco AVPair stacks do so in
+    // the wild.
+    let mut cursor = rest;
+    while !cursor.is_empty() {
+        if cursor.len() < 2 {
             writeln!(
                 f,
-                "{inner_indent}<vendor length {v_len} exceeds {} remaining>",
-                data_and_rest.len() + 2
+                "{inner_indent}<trailing {} byte(s) in VSA slot>",
+                cursor.len()
             )?;
-            return write_raw_hex(f, inner_indent, data_and_rest);
+            write_raw_hex(f, &inner_indent, cursor)?;
+            break;
         }
-    };
-    let data = &data_and_rest[..data_len];
-    let entry = dict::vsa(pen, v_type);
-    let vname = entry.map_or("Unknown", |e| e.name);
-    write!(f, "{inner_indent}VSA: t={vname}({v_type}) l={v_len}")?;
-    // `parent_code` here is the vendor-type. The RFC-namespace
-    // `tlv_child` lookup will miss for vendor TLVs (Phase B
-    // territory), so a `Tlv`-kind vendor parent falls back to the
-    // hex dump in `write_value`'s container arm.
-    write_value(f, inner_indent, v_type, entry, data)?;
-
-    let trailing = &data_and_rest[data_len..];
-    if !trailing.is_empty() {
-        writeln!(
-            f,
-            "{inner_indent}<trailing {} byte(s) in VSA slot>",
-            trailing.len()
-        )?;
-        write_raw_hex(f, inner_indent, trailing)?;
+        let v_type = cursor[0];
+        let v_len = cursor[1] as usize;
+        if v_len < 2 || v_len > cursor.len() {
+            writeln!(
+                f,
+                "{inner_indent}<malformed vendor TLV: type={v_type} len={v_len}>"
+            )?;
+            write_raw_hex(f, &inner_indent, cursor)?;
+            break;
+        }
+        let data = &cursor[2..v_len];
+        let entry = dict::vsa(pen, v_type);
+        let vname = entry.map_or("Unknown", |e| e.name);
+        write!(f, "{inner_indent}VSA: t={vname}({v_type}) l={v_len}")?;
+        // `parent_code` here is the vendor-type. The RFC-namespace
+        // `tlv_child` lookup will miss for vendor TLVs (Phase B
+        // territory), so a `Tlv`-kind vendor parent falls back to the
+        // hex dump in `write_value`'s container arm.
+        write_value(f, &inner_indent, v_type, entry, data)?;
+        cursor = &cursor[v_len..];
     }
     Ok(())
+}
+
+/// Render an Extended (RFC 6929 §2.1) or Long-Extended (§2.2)
+/// attribute value.
+///
+/// `val` is the bytes following the outer 1-byte `Type` + 1-byte
+/// `Length` header — i.e. starting at the `Extended-Type` byte.
+/// For Long-Extended the second byte is the `Flags` field whose
+/// high bit (`M`) signals fragment continuation; we surface it so
+/// operators can spot mid-stream reassembly without re-reading the
+/// RFC.
+///
+/// When the Extended-Type byte is 26 the inner payload is itself
+/// an [Extended-Vendor-Specific (EVS, §2.4)][evs] tuple and we
+/// recurse into [`write_evs`] for vendor framing. Other sub-types
+/// fall through to a hex dump because the dict crate does not yet
+/// expose an Extended-child lookup.
+///
+/// [evs]: write_evs
+fn write_extended(f: &mut fmt::Formatter<'_>, indent: &str, val: &[u8], long: bool) -> fmt::Result {
+    let header_len = if long { 2 } else { 1 };
+    let cont = format!("{indent}{INDENT}");
+    if val.len() < header_len {
+        writeln!(f, " <truncated Extended header>")?;
+        return write_raw_hex(f, &cont, val);
+    }
+    let ext_type = val[0];
+    let inner: &[u8] = if long {
+        let flags = val[1];
+        let m_bit = (flags & 0x80) != 0;
+        let reserved = flags & 0x7F;
+        if reserved == 0 {
+            writeln!(
+                f,
+                " ext-type={ext_type} flags=0x{flags:02x} M={}",
+                u8::from(m_bit)
+            )?;
+        } else {
+            writeln!(
+                f,
+                " ext-type={ext_type} flags=0x{flags:02x} M={} reserved=0x{reserved:02x}",
+                u8::from(m_bit)
+            )?;
+        }
+        &val[2..]
+    } else {
+        writeln!(f, " ext-type={ext_type}")?;
+        &val[1..]
+    };
+    if ext_type == 26 {
+        return write_evs(f, &cont, inner);
+    }
+    write_raw_hex(f, &cont, inner)
+}
+
+/// Render the value of an Extended-Vendor-Specific (RFC 6929 §2.4)
+/// attribute. `val` starts at the 4-byte Vendor-Id, followed by the
+/// 1-byte Vendor-Type, followed by the vendor's value payload.
+fn write_evs(f: &mut fmt::Formatter<'_>, indent: &str, val: &[u8]) -> fmt::Result {
+    if val.len() < 5 {
+        writeln!(f, "{indent}<EVS: truncated header, need >=5 bytes>")?;
+        return write_raw_hex(f, indent, val);
+    }
+    let pen_bytes: [u8; 4] = val[..4].try_into().unwrap();
+    let pen = u32::from_be_bytes(pen_bytes);
+    let v_type = val[4];
+    let inner = &val[5..];
+    let vendor_entry = dict::vendor(pen);
+    let vendor_name = vendor_entry.map_or("Unknown", |v| v.name);
+    writeln!(f, "{indent}EVS: vnd={vendor_name}({pen}) v-type={v_type}")?;
+    // No dict-side lookup for EVS children exists today; render raw.
+    let cont = format!("{indent}{INDENT}");
+    write_raw_hex(f, &cont, inner)
 }
 
 /// Render the value portion (` val=…\n`) of an AVP line.
@@ -467,14 +538,32 @@ fn write_value(
             }
             Ok(())
         }
-        AttrKind::Vsa
-        | AttrKind::Evs
-        | AttrKind::Extended
-        | AttrKind::LongExtended
-        | AttrKind::Struct => {
-            // Container types — no first-class renderer yet. Dump
-            // raw payload for forensic value, on a continuation line
-            // so the AVP header line stays short.
+        AttrKind::Extended => {
+            // RFC 6929 §2.1 framing: 1-byte Extended-Type followed
+            // by the value payload.
+            write_extended(f, indent, val, false)
+        }
+        AttrKind::LongExtended => {
+            // RFC 6929 §2.2 framing: 1-byte Extended-Type + 1-byte
+            // Flags (M-bit = fragment continuation) + value.
+            write_extended(f, indent, val, true)
+        }
+        AttrKind::Evs => {
+            // RFC 6929 §2.4 framing: 4-byte Vendor-Id + 1-byte
+            // Vendor-Type + value. Reached when the dictionary
+            // registers an attribute directly as `evs` (rare —
+            // most EVS payloads arrive nested inside an `extended`
+            // parent and are unwrapped by `write_extended`).
+            writeln!(f)?;
+            let cont = format!("{indent}{INDENT}");
+            write_evs(f, &cont, val)
+        }
+        AttrKind::Vsa | AttrKind::Struct => {
+            // `Vsa` here only fires for nested-VSA TLV children
+            // (top-level type 26 is intercepted in
+            // `write_attribute`). `Struct` (RFC 6929 §3.13) has no
+            // first-class renderer — both fall back to a hex dump
+            // so the operator can still inspect the bytes.
             writeln!(f, " <{:?}>", entry.kind)?;
             let cont = format!("{indent}{INDENT}");
             write_raw_hex(f, &cont, val)
@@ -753,13 +842,13 @@ mod tests {
     #[test]
     fn dissect_truncated_vsa_inner_tlv() {
         let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
-        // Valid PEN, but no room for the inner type/length header.
+        // Valid PEN, but a single trailing byte that cannot start a TLV.
         let mut v = Vec::new();
         v.extend_from_slice(&9u32.to_be_bytes());
-        v.push(1); // single trailing byte – not enough for [type,len].
+        v.push(1);
         buf.add_attribute(26, &v).unwrap();
         let s = format!("{}", buf.dissect());
-        assert!(s.contains("<truncated vendor TLV>"), "{s}");
+        assert!(s.contains("<trailing 1 byte(s) in VSA slot>"), "{s}");
     }
 
     #[test]
@@ -772,21 +861,97 @@ mod tests {
         v.push(50); // claims 48 bytes payload but provides 0
         buf.add_attribute(26, &v).unwrap();
         let s = format!("{}", buf.dissect());
-        assert!(s.contains("exceeds"), "{s}");
+        assert!(s.contains("<malformed vendor TLV: type=1 len=50>"), "{s}");
     }
 
     #[test]
-    fn dissect_vsa_with_trailing_bytes() {
+    fn dissect_vsa_walks_multiple_inner_tlvs() {
         let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
-        // PEN + first inner TLV (type=1, len=3, 1 data byte) + 4 trailing
-        // bytes that are not unpacked.
+        // PEN + two back-to-back vendor TLVs in one VSA slot
+        // (RFC 2865 §5.26 permits this; Cisco AVPair stacks do it).
         let mut v = Vec::new();
         v.extend_from_slice(&9u32.to_be_bytes());
-        v.extend_from_slice(&[1u8, 3, 0xaa]); // first TLV
-        v.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]); // trailing
+        v.extend_from_slice(&[1u8, 3, 0xaa]); // first TLV: type=1 len=3
+        v.extend_from_slice(&[2u8, 4, 0xbe, 0xef]); // second TLV: type=2 len=4
         buf.add_attribute(26, &v).unwrap();
         let s = format!("{}", buf.dissect());
-        assert!(s.contains("<trailing 4 byte(s) in VSA slot>"), "{s}");
+        assert!(s.contains("t=Cisco-AVPair(1) l=3"), "{s}");
+        assert!(s.contains("(2) l=4"), "{s}");
+    }
+
+    #[test]
+    fn dissect_vsa_with_unparseable_trailing_byte() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // PEN + valid TLV + a single dangling byte that cannot be
+        // parsed as a fresh TLV header.
+        let mut v = Vec::new();
+        v.extend_from_slice(&9u32.to_be_bytes());
+        v.extend_from_slice(&[1u8, 3, 0xaa]);
+        v.push(0xde);
+        buf.add_attribute(26, &v).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("<trailing 1 byte(s) in VSA slot>"), "{s}");
+    }
+
+    #[test]
+    fn dissect_extended_attribute_renders_ext_type() {
+        // Extended-Type-1 (RFC 6929 §2.1, attribute 241).
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // ext-type=7 + 4-byte opaque payload
+        buf.add_attribute(241, &[7u8, 0xde, 0xad, 0xbe, 0xef])
+            .unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("AVP: t=Extended-Attribute-1(241)"), "{s}");
+        assert!(s.contains("ext-type=7"), "{s}");
+        assert!(s.contains("0xdeadbeef"), "{s}");
+    }
+
+    #[test]
+    fn dissect_long_extended_surfaces_flag_bits() {
+        // Long-Extended-Type-1 (RFC 6929 §2.2, attribute 245).
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // ext-type=3 + flags=0x80 (M=1) + 2 bytes
+        buf.add_attribute(245, &[3u8, 0x80, 0xaa, 0xbb]).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("AVP: t=Extended-Attribute-5(245)"), "{s}");
+        assert!(s.contains("ext-type=3"), "{s}");
+        assert!(s.contains("flags=0x80"), "{s}");
+        assert!(s.contains("M=1"), "{s}");
+    }
+
+    #[test]
+    fn dissect_extended_vendor_specific_renders_evs() {
+        // Extended-Type-1 (241) with ext-type=26 carries EVS (RFC 6929 §2.4).
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        let mut v = vec![26u8];
+        v.extend_from_slice(&9u32.to_be_bytes()); // Cisco PEN
+        v.push(42); // vendor-type
+        v.extend_from_slice(&[0xca, 0xfe]); // vendor value
+        buf.add_attribute(241, &v).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("ext-type=26"), "{s}");
+        assert!(s.contains("EVS:"), "{s}");
+        assert!(s.contains("vnd=Cisco(9)"), "{s}");
+        assert!(s.contains("v-type=42"), "{s}");
+        assert!(s.contains("0xcafe"), "{s}");
+    }
+
+    #[test]
+    fn dissect_extended_truncated_header() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // Long-Extended-Type-1 needs 2 header bytes; we provide 1.
+        buf.add_attribute(245, &[7u8]).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("<truncated Extended header>"), "{s}");
+    }
+
+    #[test]
+    fn dissect_evs_truncated_header() {
+        let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+        // Extended with ext-type=26 but EVS body shorter than 5 bytes.
+        buf.add_attribute(241, &[26u8, 0, 0, 0]).unwrap();
+        let s = format!("{}", buf.dissect());
+        assert!(s.contains("<EVS: truncated header"), "{s}");
     }
 
     #[test]

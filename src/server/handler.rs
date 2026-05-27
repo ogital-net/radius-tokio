@@ -432,6 +432,62 @@ impl<'a> Request<'a> {
         None
     }
 
+    /// Classify the request as a dynamic-authorization action
+    /// (RFC 5176).
+    ///
+    /// Returns `Some(CoaAction::Coa)` for `CoA-Request` (code 43),
+    /// `Some(CoaAction::Disconnect)` for `Disconnect-Request`
+    /// (code 40), and `None` for every other code. Lets a CoA
+    /// listener handler dispatch via a typed `match` instead of
+    /// integer-comparing [`Self::code`].
+    #[must_use]
+    pub fn coa_action(&self) -> Option<super::coa::CoaAction> {
+        super::coa::CoaAction::from_code(self.code)
+    }
+
+    /// Build a `CoA-ACK` / `Disconnect-ACK` reply for this request.
+    ///
+    /// Picks the reply code from the inbound packet code per
+    /// [`CoaAction::ack_code`](super::coa::CoaAction::ack_code).
+    /// Returns `None` if the request is not a CoA-Request or
+    /// Disconnect-Request.
+    #[must_use]
+    pub fn coa_ack(&self) -> Option<Reply> {
+        Some(self.reply(self.coa_action()?.ack_code()))
+    }
+
+    /// Build a `CoA-NAK` / `Disconnect-NAK` reply for this request,
+    /// pre-populated with an `Error-Cause` (RFC 5176 §3.5)
+    /// explaining the rejection.
+    ///
+    /// Picks the reply code from the inbound packet code per
+    /// [`CoaAction::nak_code`](super::coa::CoaAction::nak_code).
+    /// Returns `None` if the request is not a CoA-Request or
+    /// Disconnect-Request. The `Error-Cause` attribute is appended
+    /// before the caller gets the [`Reply`]; further attributes
+    /// (`Reply-Message`, vendor diagnostics, …) can be added by the
+    /// handler in the usual fashion before sealing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if appending the 6-byte `Error-Cause` attribute to a
+    /// freshly built [`Reply`] fails. The default capacity
+    /// guarantees room for it, so this branch is unreachable in
+    /// practice and indicates a corrupted buffer if it ever fires.
+    #[must_use]
+    pub fn coa_nak(&self, cause: super::coa::ErrorCause) -> Option<Reply> {
+        let action = self.coa_action()?;
+        let mut reply = self.reply(action.nak_code());
+        // Attribute 101 = Error-Cause; 4-byte big-endian integer.
+        reply
+            .add_attribute(
+                crate::codec::constants::ERROR_CAUSE,
+                &cause.to_u32().to_be_bytes(),
+            )
+            .expect("fresh Reply has room for a 6-byte Error-Cause attribute");
+        Some(reply)
+    }
+
     /// Build an unsealed [`Reply`] for the matching reply code,
     /// pre-loaded with this request's Identifier.
     ///

@@ -59,6 +59,157 @@ use crate::codec::header::{Code, Header, MAX_PACKET_LEN};
 use crate::codec::message_authenticator::Verification;
 use crate::codec::{authenticator, message_authenticator, CodecError, PacketBuffer};
 
+/// Which dynamic-authorization request the NAS sent us (RFC 5176).
+///
+/// Decoded from the packet code by
+/// [`crate::server::Request::coa_action`]; dispatch on this in your
+/// handler instead of integer-comparing
+/// [`crate::server::Request::code`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CoaAction {
+    /// `CoA-Request` (code 43, RFC 5176 §2.1). Reply with `CoA-ACK`
+    /// on success or `CoA-NAK` carrying an [`ErrorCause`].
+    Coa,
+    /// `Disconnect-Request` (code 40, RFC 5176 §2.2). Reply with
+    /// `Disconnect-ACK` on success or `Disconnect-NAK` carrying an
+    /// [`ErrorCause`].
+    Disconnect,
+}
+
+impl CoaAction {
+    /// Wire code emitted on a successful reply (`CoA-ACK` /
+    /// `Disconnect-ACK`).
+    #[must_use]
+    pub fn ack_code(self) -> Code {
+        match self {
+            Self::Coa => Code::COA_ACK,
+            Self::Disconnect => Code::DISCONNECT_ACK,
+        }
+    }
+
+    /// Wire code emitted on a rejection (`CoA-NAK` /
+    /// `Disconnect-NAK`).
+    #[must_use]
+    pub fn nak_code(self) -> Code {
+        match self {
+            Self::Coa => Code::COA_NAK,
+            Self::Disconnect => Code::DISCONNECT_NAK,
+        }
+    }
+
+    /// Decode from the inbound packet code. Returns `None` for any
+    /// code that is not a CoA-Request or Disconnect-Request.
+    #[must_use]
+    pub fn from_code(code: Code) -> Option<Self> {
+        match code {
+            Code::COA_REQUEST => Some(Self::Coa),
+            Code::DISCONNECT_REQUEST => Some(Self::Disconnect),
+            _ => None,
+        }
+    }
+}
+
+/// `Error-Cause` (attribute 101) values a NAK reply may carry to
+/// tell the originator why it was rejected (RFC 5176 §3.5 — values
+/// inherited from RFC 3576 §5.18 plus 5176-specific additions).
+///
+/// Wire encoding is a 4-byte big-endian unsigned integer; conversion
+/// is via [`ErrorCause::from_u32`] / [`ErrorCause::to_u32`]. Codes not
+/// enumerated here round-trip as [`ErrorCause::Other`] so the type
+/// stays total over the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ErrorCause {
+    /// 201 — Residual Session Context Removed.
+    ResidualSessionContextRemoved,
+    /// 202 — Invalid EAP Packet (Ignored).
+    InvalidEapPacket,
+    /// 401 — Unsupported Attribute.
+    UnsupportedAttribute,
+    /// 402 — Missing Attribute.
+    MissingAttribute,
+    /// 403 — NAS Identification Mismatch.
+    NasIdentificationMismatch,
+    /// 404 — Invalid Request.
+    InvalidRequest,
+    /// 405 — Unsupported Service.
+    UnsupportedService,
+    /// 406 — Unsupported Extension.
+    UnsupportedExtension,
+    /// 407 — Invalid Attribute Value.
+    InvalidAttributeValue,
+    /// 501 — Administratively Prohibited.
+    AdministrativelyProhibited,
+    /// 502 — Request Not Routable (Proxy).
+    RequestNotRoutable,
+    /// 503 — Session Context Not Found.
+    SessionContextNotFound,
+    /// 504 — Session Context Not Removable.
+    SessionContextNotRemovable,
+    /// 505 — Other Proxy Processing Error.
+    OtherProxyProcessingError,
+    /// 506 — Resources Unavailable.
+    ResourcesUnavailable,
+    /// 507 — Request Initiated.
+    RequestInitiated,
+    /// 508 — Multiple Session Selection Unsupported.
+    MultipleSessionSelectionUnsupported,
+    /// Any code not enumerated above; preserved for forward
+    /// compatibility with future RFC additions or vendor extensions.
+    Other(u32),
+}
+
+impl ErrorCause {
+    /// Decode from the on-wire integer.
+    #[must_use]
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            201 => Self::ResidualSessionContextRemoved,
+            202 => Self::InvalidEapPacket,
+            401 => Self::UnsupportedAttribute,
+            402 => Self::MissingAttribute,
+            403 => Self::NasIdentificationMismatch,
+            404 => Self::InvalidRequest,
+            405 => Self::UnsupportedService,
+            406 => Self::UnsupportedExtension,
+            407 => Self::InvalidAttributeValue,
+            501 => Self::AdministrativelyProhibited,
+            502 => Self::RequestNotRoutable,
+            503 => Self::SessionContextNotFound,
+            504 => Self::SessionContextNotRemovable,
+            505 => Self::OtherProxyProcessingError,
+            506 => Self::ResourcesUnavailable,
+            507 => Self::RequestInitiated,
+            508 => Self::MultipleSessionSelectionUnsupported,
+            other => Self::Other(other),
+        }
+    }
+
+    /// Encode to the on-wire integer.
+    #[must_use]
+    pub fn to_u32(self) -> u32 {
+        match self {
+            Self::ResidualSessionContextRemoved => 201,
+            Self::InvalidEapPacket => 202,
+            Self::UnsupportedAttribute => 401,
+            Self::MissingAttribute => 402,
+            Self::NasIdentificationMismatch => 403,
+            Self::InvalidRequest => 404,
+            Self::UnsupportedService => 405,
+            Self::UnsupportedExtension => 406,
+            Self::InvalidAttributeValue => 407,
+            Self::AdministrativelyProhibited => 501,
+            Self::RequestNotRoutable => 502,
+            Self::SessionContextNotFound => 503,
+            Self::SessionContextNotRemovable => 504,
+            Self::OtherProxyProcessingError => 505,
+            Self::ResourcesUnavailable => 506,
+            Self::RequestInitiated => 507,
+            Self::MultipleSessionSelectionUnsupported => 508,
+            Self::Other(v) => v,
+        }
+    }
+}
+
 /// Tunables for [`CoaOriginator`]. All fields have sensible defaults
 /// derived from RFC 5080 §2.2.1; override per deployment.
 #[derive(Debug, Clone, Copy)]
@@ -548,6 +699,58 @@ fn validate_and_classify(
 mod tests {
     use super::*;
     use std::error::Error as _;
+
+    #[test]
+    fn coa_action_round_trips_codes() {
+        assert_eq!(
+            CoaAction::from_code(Code::COA_REQUEST),
+            Some(CoaAction::Coa)
+        );
+        assert_eq!(
+            CoaAction::from_code(Code::DISCONNECT_REQUEST),
+            Some(CoaAction::Disconnect),
+        );
+        assert_eq!(CoaAction::from_code(Code::ACCESS_REQUEST), None);
+        assert_eq!(CoaAction::Coa.ack_code(), Code::COA_ACK);
+        assert_eq!(CoaAction::Coa.nak_code(), Code::COA_NAK);
+        assert_eq!(CoaAction::Disconnect.ack_code(), Code::DISCONNECT_ACK);
+        assert_eq!(CoaAction::Disconnect.nak_code(), Code::DISCONNECT_NAK);
+    }
+
+    #[test]
+    fn error_cause_round_trips_all_named_values() {
+        // Every enumerated cause must round-trip through u32; this
+        // is the safety net for a hand-maintained match table.
+        let named = [
+            ErrorCause::ResidualSessionContextRemoved,
+            ErrorCause::InvalidEapPacket,
+            ErrorCause::UnsupportedAttribute,
+            ErrorCause::MissingAttribute,
+            ErrorCause::NasIdentificationMismatch,
+            ErrorCause::InvalidRequest,
+            ErrorCause::UnsupportedService,
+            ErrorCause::UnsupportedExtension,
+            ErrorCause::InvalidAttributeValue,
+            ErrorCause::AdministrativelyProhibited,
+            ErrorCause::RequestNotRoutable,
+            ErrorCause::SessionContextNotFound,
+            ErrorCause::SessionContextNotRemovable,
+            ErrorCause::OtherProxyProcessingError,
+            ErrorCause::ResourcesUnavailable,
+            ErrorCause::RequestInitiated,
+            ErrorCause::MultipleSessionSelectionUnsupported,
+        ];
+        for cause in named {
+            assert_eq!(ErrorCause::from_u32(cause.to_u32()), cause);
+        }
+    }
+
+    #[test]
+    fn error_cause_preserves_unknown_codes() {
+        let unknown = ErrorCause::from_u32(9_999);
+        assert_eq!(unknown, ErrorCause::Other(9_999));
+        assert_eq!(unknown.to_u32(), 9_999);
+    }
 
     #[test]
     fn config_default_values() {
