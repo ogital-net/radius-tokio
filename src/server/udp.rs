@@ -68,7 +68,8 @@ use crate::obs::metrics;
 use super::dedup::DedupCache;
 use super::handler::Handler;
 use super::pipeline::{self, Dispatched, StatusServerContext, Validated};
-use super::status::{ListenerRole, StatusServerPolicy, StatusTransport};
+use super::role::ListenerRole;
+use super::status::{StatusServerPolicy, StatusTransport};
 use super::store::ClientStore;
 
 /// Default lifetime for an entry in the dedup / retransmit cache.
@@ -181,7 +182,34 @@ async fn process_packet<H>(
     // Message-Authenticator check. All transport-agnostic; the
     // shared pipeline returns a single verdict we trace + act on.
     let (header, attrs) = match pipeline::validate(datagram, &client) {
-        Validated::Ok { header, attrs } => (header, attrs),
+        Validated::Ok { header, attrs } => {
+            // Step 2.5: per-listener role admission filter. Mirrors
+            // the per-socket type filter every production RADIUS
+            // server applies (FreeRADIUS' "Invalid packet code N
+            // sent to socket type auth", `radsecproxy`'s separate
+            // `listenUDP` / `listenAccountingUDP` accept paths).
+            // Runs after authenticator validation so we don't waste
+            // a drop event on garbage from the network, but before
+            // dedup / handler dispatch so a misrouted packet can
+            // never reach application code.
+            if !role.accepts(header.code) {
+                debug!(
+                    event = "drop",
+                    reason = "code_not_allowed_on_role",
+                    %src,
+                    client = ?client.id(),
+                    code = header.code.0,
+                    id = header.identifier,
+                    role = ?role,
+                );
+                count!(
+                    metrics::PACKETS_DROPPED,
+                    "reason" => "code_not_allowed_on_role"
+                );
+                return;
+            }
+            (header, attrs)
+        }
         Validated::MalformedHeader(_e) => {
             debug!(
                 event = "drop",
@@ -349,6 +377,7 @@ async fn process_packet<H>(
                         "role" => match _role {
                             ListenerRole::Auth => "auth",
                             ListenerRole::Acct => "acct",
+                            ListenerRole::Any => "any",
                         },
                     );
                 }

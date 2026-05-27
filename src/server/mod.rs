@@ -10,6 +10,7 @@ pub mod handler;
 mod pipeline;
 #[cfg(feature = "radsec")]
 mod radsec;
+pub mod role;
 mod runtime;
 pub mod status;
 pub mod store;
@@ -22,9 +23,10 @@ pub use coa::{CoaConfig, CoaError, CoaOriginator, CoaOutcome};
 #[cfg(any(feature = "test-util", test))]
 pub use handler::test_support;
 pub use handler::{Handler, HandlerError, HandlerResult, Request};
+pub use role::ListenerRole;
 pub use runtime::{Server, ServerBuilder, ShutdownHandle};
 pub use status::{
-    ListenerRole, StatusAction, StatusContext, StatusResponder, StatusServerPolicy, StatusTransport,
+    StatusAction, StatusContext, StatusResponder, StatusServerPolicy, StatusTransport,
 };
 pub use store::{CidrError, ClientStore, IpCidr, StaticClients, StaticClientsBuilder};
 

@@ -44,7 +44,8 @@ use crate::codec::{authenticator, message_authenticator, PacketBuffer};
 use super::client::Client;
 use super::dedup::{DedupCache, Key as DedupKey};
 use super::handler::{Handler, HandlerResult, Request};
-use super::status::{self, ListenerRole, StatusServerPolicy, StatusTransport};
+use super::role::ListenerRole;
+use super::status::{self, StatusServerPolicy, StatusTransport};
 
 /// Verdict produced by [`validate`].
 ///

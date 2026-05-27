@@ -23,7 +23,8 @@ use super::dedup::DedupCache;
 use super::handler::Handler;
 #[cfg(feature = "radsec")]
 use super::radsec::{serve_radsec, ConnectionRegistry};
-use super::status::{ListenerRole, StatusServerPolicy};
+use super::role::ListenerRole;
+use super::status::StatusServerPolicy;
 use super::store::ClientStore;
 use super::udp::{serve_udp, DEFAULT_DEDUP_TTL};
 
@@ -455,7 +456,7 @@ impl<S: ClientStore, H: Handler> ServerBuilder<S, H> {
     #[cfg(feature = "radsec")]
     #[must_use]
     pub fn listen_radsec(mut self, addr: SocketAddr, tls: TlsContext) -> Self {
-        self.radsec_binds.push((addr, tls, ListenerRole::Auth));
+        self.radsec_binds.push((addr, tls, ListenerRole::Any));
         self
     }
 

@@ -82,6 +82,7 @@ use super::client::{Client, ClientId};
 use super::dedup::DedupCache;
 use super::handler::Handler;
 use super::pipeline::{self, Dispatched, Validated};
+use super::role::ListenerRole;
 use super::store::ClientStore;
 
 /// How long a connection-level read may stall before we treat it
@@ -297,7 +298,7 @@ pub(crate) async fn serve_radsec<S, H>(
     handler: Arc<H>,
     cache: Arc<DedupCache>,
     registry: Arc<ConnectionRegistry>,
-    role: super::status::ListenerRole,
+    role: ListenerRole,
     status_policy: Arc<super::status::StatusServerPolicy>,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()>
@@ -373,7 +374,7 @@ async fn handle_connection<S, H>(
     handler: Arc<H>,
     cache: Arc<DedupCache>,
     registry: Arc<ConnectionRegistry>,
-    role: super::status::ListenerRole,
+    role: ListenerRole,
     status_policy: Arc<super::status::StatusServerPolicy>,
 ) -> io::Result<()>
 where
@@ -472,7 +473,7 @@ async fn run_frame_loop<H: Handler>(
     client: &Arc<Client>,
     handler: &H,
     cache: &DedupCache,
-    role: super::status::ListenerRole,
+    role: ListenerRole,
     status_policy: &super::status::StatusServerPolicy,
     mut close_rx: oneshot::Receiver<()>,
 ) -> io::Result<()> {
@@ -584,7 +585,7 @@ async fn process_frame<H: Handler>(
     client: &Arc<Client>,
     handler: &H,
     cache: &DedupCache,
-    role: super::status::ListenerRole,
+    role: ListenerRole,
     status_policy: &super::status::StatusServerPolicy,
 ) -> io::Result<()> {
     // Steps 1–3: transport-agnostic header + authenticator
@@ -594,7 +595,34 @@ async fn process_frame<H: Handler>(
     // policy. (UDP, by contrast, legitimately drops the offending
     // datagram.)
     let (header, attrs) = match pipeline::validate(datagram, client) {
-        Validated::Ok { header, attrs } => (header, attrs),
+        Validated::Ok { header, attrs } => {
+            // Per-listener role admission filter. Inside an
+            // authenticated TLS session a mismatched code is a
+            // protocol violation by an authenticated peer, so we
+            // tear the connection down rather than silently drop
+            // (matches the policy applied to every other validation
+            // failure on RadSec).
+            if !role.accepts(header.code) {
+                debug!(
+                    event = "radsec_drop",
+                    reason = "code_not_allowed_on_role",
+                    %peer,
+                    client = ?client.id(),
+                    code = header.code.0,
+                    id = header.identifier,
+                    role = ?role,
+                );
+                count!(
+                    metrics::PACKETS_DROPPED,
+                    "reason" => "code_not_allowed_on_role"
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "code not allowed on listener role",
+                ));
+            }
+            (header, attrs)
+        }
         Validated::MalformedHeader(_e) => {
             debug!(
                 event = "radsec_drop",
@@ -773,8 +801,9 @@ async fn process_frame<H: Handler>(
                         metrics::STATUS_SERVER_REPLIES,
                         "transport" => "radsec",
                         "role" => match _role {
-                            super::status::ListenerRole::Auth => "auth",
-                            super::status::ListenerRole::Acct => "acct",
+                            ListenerRole::Auth => "auth",
+                            ListenerRole::Acct => "acct",
+                            ListenerRole::Any => "any",
                         },
                     );
                     Ok(())

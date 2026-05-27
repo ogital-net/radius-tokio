@@ -38,37 +38,9 @@ use std::sync::Arc;
 
 use crate::codec::constants::REPLY_MESSAGE as REPLY_MESSAGE_TYPE;
 use crate::codec::encode::Reply;
-use crate::codec::header::Code;
 
 use super::client::Client;
-
-/// Role the operator assigned to a listener.
-///
-/// The role determines which reply code the built-in Status-Server
-/// responder emits (RFC 5997 §6): `Access-Accept` on an auth port,
-/// `Accounting-Response` on an acct port. It is *not* inferred from
-/// the bound port number — port 1812/1813 is convention, not
-/// guarantee, and operators routinely bind to non-standard ports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ListenerRole {
-    /// Authentication listener. Status-Server probes are answered
-    /// with `Access-Accept` (code 2).
-    Auth,
-    /// Accounting listener. Status-Server probes are answered with
-    /// `Accounting-Response` (code 5).
-    Acct,
-}
-
-impl ListenerRole {
-    /// Reply code this role emits in response to a Status-Server.
-    #[must_use]
-    pub fn status_reply_code(self) -> Code {
-        match self {
-            Self::Auth => Code::ACCESS_ACCEPT,
-            Self::Acct => Code::ACCOUNTING_RESPONSE,
-        }
-    }
-}
+use super::role::ListenerRole;
 
 /// Transport the inbound Status-Server arrived on. Surfaced to a
 /// custom [`StatusResponder`] for logging or per-transport policy.
@@ -216,7 +188,7 @@ pub(crate) fn build_status_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::header::Header;
+    use crate::codec::header::{Code, Header};
     use crate::codec::message_authenticator;
     use std::net::Ipv4Addr;
 
@@ -226,15 +198,6 @@ mod tests {
 
     fn fake_src() -> SocketAddr {
         SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 12345)
-    }
-
-    #[test]
-    fn role_maps_to_reply_code() {
-        assert_eq!(ListenerRole::Auth.status_reply_code(), Code::ACCESS_ACCEPT);
-        assert_eq!(
-            ListenerRole::Acct.status_reply_code(),
-            Code::ACCOUNTING_RESPONSE,
-        );
     }
 
     #[test]

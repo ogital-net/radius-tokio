@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use radius_tokio::dict::rfc::attrs;
 use radius_tokio::server::{
-    AcctStatusType, Client, Handler, HandlerResult, IpCidr, Request, Server, StaticClients,
+    AcctStatusType, Client, Handler, HandlerResult, IpCidr, ListenerRole, Request, Server,
+    StaticClients,
 };
 use radius_tokio::{authenticator, message_authenticator, Code, PacketBuffer};
 
@@ -114,7 +115,7 @@ async fn full_accounting_lifecycle() {
         .handler(AcctHandler {
             counts: Arc::clone(&counts),
         })
-        .listen_udp(bind_addr)
+        .listen_udp_with(bind_addr, ListenerRole::Acct)
         .build()
         .expect("server builds");
     let shutdown = server.shutdown_handle();
@@ -204,7 +205,7 @@ async fn bad_secret_drops_accounting_request() {
         .handler(AcctHandler {
             counts: Arc::clone(&counts),
         })
-        .listen_udp(bind_addr)
+        .listen_udp_with(bind_addr, ListenerRole::Acct)
         .build()
         .expect("server builds");
     let shutdown = server.shutdown_handle();
