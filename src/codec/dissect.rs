@@ -864,6 +864,7 @@ mod tests {
         assert!(s.contains("<malformed vendor TLV: type=1 len=50>"), "{s}");
     }
 
+    #[cfg(feature = "dict-cisco")]
     #[test]
     fn dissect_vsa_walks_multiple_inner_tlvs() {
         let mut buf = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
@@ -919,6 +920,7 @@ mod tests {
         assert!(s.contains("M=1"), "{s}");
     }
 
+    #[cfg(feature = "dict-cisco")]
     #[test]
     fn dissect_extended_vendor_specific_renders_evs() {
         // Extended-Type-1 (241) with ext-type=26 carries EVS (RFC 6929 §2.4).

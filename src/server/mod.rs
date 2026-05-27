@@ -11,6 +11,7 @@ mod pipeline;
 #[cfg(feature = "radsec")]
 mod radsec;
 pub mod role;
+pub mod router;
 mod runtime;
 pub mod status;
 pub mod store;
@@ -24,6 +25,7 @@ pub use coa::{CoaAction, CoaConfig, CoaError, CoaOriginator, CoaOutcome, ErrorCa
 pub use handler::test_support;
 pub use handler::{Handler, HandlerError, HandlerResult, Request};
 pub use role::ListenerRole;
+pub use router::{CodeRouter, CodeRouterBuilder};
 pub use runtime::{Server, ServerBuilder, ShutdownHandle};
 pub use status::{
     StatusAction, StatusContext, StatusResponder, StatusServerPolicy, StatusTransport,
