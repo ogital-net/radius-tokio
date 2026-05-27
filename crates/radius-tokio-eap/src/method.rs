@@ -140,6 +140,28 @@ pub trait EapMethod: Send {
     /// [`step`]: EapMethod::step
     fn notify_request_id(&mut self, _eap_id: u8) {}
 
+    /// In-place patch hook called by the handler adapter after
+    /// it has allocated the EAP `Identifier` byte but before the
+    /// outbound `EAP-Request` bytes leave the handler. `type_data`
+    /// is the buffer [`start`] or [`step`] returned via
+    /// [`MethodOutcome::Continue`]; mutations here flow straight
+    /// onto the wire.
+    ///
+    /// Default: no-op. Methods that compute an integrity MAC over
+    /// the *complete* EAP packet (notably EAP-AKA' `AT_MAC` =
+    /// HMAC-SHA-256-128 over `Code|Identifier|Length|Type|...`)
+    /// override this to fill in the MAC value field now that
+    /// every header byte is known.
+    ///
+    /// Implementations MUST NOT change the length of `type_data`;
+    /// the handler has already committed to that length. Methods
+    /// that reserved a MAC slot with a known offset can simply
+    /// overwrite it in place.
+    ///
+    /// [`start`]: EapMethod::start
+    /// [`step`]: EapMethod::step
+    fn finalize_request(&mut self, _eap_id: u8, _type_data: &mut [u8]) {}
+
     /// Consume one peer `EAP-Response`'s type-data and produce the
     /// next outcome.
     ///
@@ -203,6 +225,9 @@ impl<T: EapMethod + ?Sized> EapMethod for Box<T> {
     }
     fn notify_request_id(&mut self, eap_id: u8) {
         (**self).notify_request_id(eap_id);
+    }
+    fn finalize_request(&mut self, eap_id: u8, type_data: &mut [u8]) {
+        (**self).finalize_request(eap_id, type_data);
     }
     fn step<'a>(&'a mut self, peer_type_data: &'a [u8]) -> MethodFuture<'a> {
         (**self).step(peer_type_data)

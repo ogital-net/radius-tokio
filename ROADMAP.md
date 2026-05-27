@@ -94,13 +94,30 @@ TLS family today. The roadmap, in rough priority order:
 * **EAP-GTC (RFC 3748 §5.6)** — straight token / OTP prompt, no
   crypto state machine. Lowest-effort addition; useful inside
   TTLS/PEAP tunnels.
-* **EAP-AKA' (RFC 5448)** — 3GPP authentication for ePDG / non-3GPP
-  Wi-Fi offload deployments. High-value for telecom integrators;
-  requires HMAC-SHA-256 (now exposed in `crypto::hmac_sha256`).
 * **EAP-PWD (RFC 5931)** — password-authenticated key exchange,
   avoids the cleartext-to-tunnel pattern of PEAP/TTLS. Lower
   priority because deployments are rare.
 * **EAP-FAST (RFC 4851) / EAP-TEAP (RFC 7170)** — Cisco / IETF
   successor to PEAP. Useful for sites already on FAST; design
   question is whether PAC provisioning is in or out of scope.
+
+### EAP-AKA' extensions
+
+The first-cut EAP-AKA' driver in `radius-tokio-eap` (feature
+`eap-aka-prime`) covers the basic IMSI-based full-authentication
+flow with an in-memory `StaticVectorProvider` fixture. The
+following layer cleanly on top of the existing codec and trait:
+
+* **Fast re-authentication** (`AKA-Reauthentication`,
+  `AT_NEXT_REAUTH_ID`, `AT_COUNTER`, `AT_IV` / `AT_ENCR_DATA`) —
+  avoids a fresh AV per session for repeat connections.
+* **Pseudonym identity** (`AT_NEXT_PSEUDONYM`) — IMSI-privacy
+  rotation between full authentications.
+* **Synchronisation-failure recovery** — today we forward `AUTS`
+  to `report_sync_failure` and fail the current session; the
+  next-step is restarting the challenge in-band once the HSS
+  refresh completes.
+* **Reference Milenage `f1..f5` helper crate** — most HSS-less
+  deployments want one, but it doesn't belong in the EAP state
+  machine itself.
 

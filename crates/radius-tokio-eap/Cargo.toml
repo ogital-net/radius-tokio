@@ -43,8 +43,15 @@ peap = ["radius-tokio/radsec"]
 # AVPs (PAP / CHAP / MS-CHAP / inner EAP).
 eap-ttls = ["radius-tokio/radsec"]
 
+# EAP-AKA' (RFC 5448). 3GPP AKA-based authentication for ePDG /
+# non-3GPP Wi-Fi offload and trusted WLAN access. Authentication
+# vectors (RAND/AUTN/XRES/IK/CK) are supplied by the caller via
+# the `AuthVectorProvider` trait — typical implementations talk
+# to an HSS over Diameter S6a, or run Milenage f1..f5 locally.
+eap-aka-prime = []
+
 # Umbrella enabling every EAP method this crate ships.
-all-methods = ["eap-md5", "eap-mschapv2", "eap-tls", "peap", "eap-ttls"]
+all-methods = ["eap-md5", "eap-mschapv2", "eap-tls", "peap", "eap-ttls", "eap-aka-prime"]
 
 # Emit structured `tracing` events for session lifecycle, method
 # dispatch decisions, reassembly state, and TLS-tunnel handshake

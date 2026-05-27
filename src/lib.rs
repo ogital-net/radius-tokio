@@ -42,6 +42,24 @@ pub use crypto::pki;
 /// unpredictable.
 pub use crypto::rand;
 
+/// AES-128 / AES-256 block primitives and CBC helpers. Exposed for
+/// EAP method drivers (notably EAP-AKA's `AT_ENCR_DATA` payload)
+/// and any consumer that needs a vetted block cipher.
+pub use crypto::aes;
+/// HMAC-SHA-1 primitives. Required for EAP-AKA (`AT_MAC` =
+/// HMAC-SHA1-128) and PBKDF2-HMAC-SHA1 callers that want streaming
+/// access alongside the one-shot [`pbkdf2`] helpers.
+pub use crypto::hmac_sha1;
+/// HMAC-SHA-256 primitives. Required for EAP-AKA' (`AT_MAC` =
+/// HMAC-SHA256-128, PRF' key derivation per RFC 5448 §3.3) and for
+/// generic password-verification HMAC use.
+pub use crypto::hmac_sha256;
+/// PBKDF2-HMAC-SHA1 / PBKDF2-HMAC-SHA256 helpers. Primary use
+/// case: WPA/WPA2-Personal `PMK = PBKDF2-HMAC-SHA1(passphrase,
+/// SSID, 4096, 32)` derivation that PPSK / DPSK / MPSK schemes
+/// reuse.
+pub use crypto::pbkdf2;
+
 // Re-export the consumer-visible codec surface. The receive- and
 // reply-handling types are needed by anyone implementing a `Handler`.
 pub use codec::encode::Reply;

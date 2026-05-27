@@ -247,6 +247,12 @@ where
             // response is `MD5(eap_id || password || challenge)`)
             // can remember it. Default impl is a no-op.
             session.method.notify_request_id(eap_id);
+            // Let integrity-protected methods (notably EAP-AKA')
+            // patch the type-data now that the Identifier byte —
+            // which is part of the MAC-protected canonicalisation
+            // — is finally known. Default impl is a no-op.
+            let mut payload = payload;
+            session.method.finalize_request(eap_id, &mut payload);
             let id = fresh_session_id();
             store.insert(id, session).await;
             Ok(Dispatch::Challenge {

@@ -69,6 +69,7 @@ macro_rules! info {
 }
 
 #[cfg(not(feature = "tracing"))]
+#[allow(unused_macros)]
 macro_rules! info {
     ($($tt:tt)*) => {
         ()

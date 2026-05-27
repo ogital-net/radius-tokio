@@ -14,6 +14,7 @@
 //! | EAP-TLS       | RFC 5216 / 9190   | (none — TLS cert)          | `eap-tls`       |
 //! | EAP-PEAP      | draft-josefsson   | EAP (commonly `MSCHAPv2`)  | `peap`          |
 //! | EAP-TTLS      | RFC 5281          | AVP (PAP/CHAP/MS-CHAP/EAP) | `eap-ttls`      |
+//! | EAP-AKA'      | RFC 5448          | (none — bare, AV-driven)   | `eap-aka-prime` |
 //!
 //! All three share a TLS record stream wrapped in EAP-Message
 //! fragmentation (RFC 5216 §3.1), so the [`framing`] module is
@@ -116,6 +117,13 @@ pub mod peap;
 /// inner method. Feature: `eap-ttls`.
 #[cfg(feature = "eap-ttls")]
 pub mod eap_ttls;
+
+/// EAP-AKA' (RFC 5448) server state machine. 3GPP AKA for ePDG /
+/// trusted WLAN. Bare EAP type 50; authentication vectors come
+/// from a user-supplied [`AuthVectorProvider`][`eap_aka_prime::AuthVectorProvider`]
+/// backend (HSS client, Milenage, fixture). Feature: `eap-aka-prime`.
+#[cfg(feature = "eap-aka-prime")]
+pub mod eap_aka_prime;
 
 pub use error::Error;
 pub use handler::{AcceptContext, AcceptDecorator, EapHandler};

@@ -33,6 +33,12 @@ impl HmacSha256 {
     /// `key` may be any length; the underlying implementation
     /// pre-hashes keys longer than the SHA-256 block size per
     /// RFC 2104 §2.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `HMAC_Init_ex` reports failure — only possible on
+    /// allocation failure in aws-lc, which we treat as unrecoverable
+    /// (see [`crate::crypto`] panic policy).
     #[must_use]
     pub fn new(key: &[u8]) -> Self {
         // SAFETY: HMAC_CTX is a C struct with no padding invariants;
@@ -57,6 +63,11 @@ impl HmacSha256 {
     }
 
     /// Feed `data` into the running HMAC. May be called any number of times.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `HMAC_Update` reports failure; aws-lc only returns
+    /// failure on allocation faults under absurd input sizes.
     pub fn update(&mut self, data: &[u8]) {
         // SAFETY: ctx is initialised and not yet finalised. data is a
         // valid slice for the duration of this call.
@@ -65,6 +76,10 @@ impl HmacSha256 {
     }
 
     /// Finalise the HMAC and return the 32-byte tag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `HMAC_Final` reports failure (aws-lc allocation fault).
     #[must_use]
     pub fn finalize(mut self) -> [u8; TAG_LEN] {
         let mut tag = [0u8; TAG_LEN];
