@@ -87,10 +87,10 @@ jobs:
       #   2. radius-tokio-dict           (build-dep on codegen)
       #   3. radius-tokio                (dep on dict)
       #   4. radius-tokio-eap            (dep on radius-tokio)
-      - name: Publish radius-tokio-dict-codegen
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p radius-tokio-dict-codegen --locked ${{ steps.flags.outputs.extra }}
+      # - name: Publish radius-tokio-dict-codegen
+      #  env:
+      #    CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      #  run: cargo publish -p radius-tokio-dict-codegen --locked ${{ steps.flags.outputs.extra }}
 
       - name: Publish radius-tokio-dict
         env:

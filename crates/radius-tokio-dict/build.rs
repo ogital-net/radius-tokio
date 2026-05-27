@@ -212,8 +212,18 @@ fn validate_feature_coverage(manifest_dir: &Path, vendors: &[String]) {
 
     let pkg_manifest = fs::read_to_string(&pkg_manifest_path)
         .unwrap_or_else(|e| panic!("failed to read `{}`: {e}", pkg_manifest_path.display()));
-    let root_manifest = fs::read_to_string(&root_manifest_path)
-        .unwrap_or_else(|e| panic!("failed to read `{}`: {e}", root_manifest_path.display()));
+
+    // The root-manifest drift check is an in-tree development guard:
+    // it ensures every vendor dictionary on disk has a matching
+    // `dict-<name>` forward in the workspace-root `Cargo.toml`. When
+    // the crate is built standalone (e.g. inside `target/package/…`
+    // during `cargo publish`, or after consumers fetch it from
+    // crates.io) the workspace root is not present and there's
+    // nothing to drift against — silently skip in that case rather
+    // than failing the build.
+    let Ok(root_manifest) = fs::read_to_string(&root_manifest_path) else {
+        return;
+    };
 
     let pkg_features = extract_features_section(&pkg_manifest);
     let root_features = extract_features_section(&root_manifest);
