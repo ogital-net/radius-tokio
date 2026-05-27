@@ -138,7 +138,7 @@ impl<S> CachedStore<S> {
         let before = map.len();
         map.retain(|_, slot| matches!(slot, Slot::Pending(_)));
         let evicted = before.saturating_sub(map.len());
-        info!(event = "client_cache_clear", evicted = evicted);
+        debug!(event = "client_cache_clear", evicted = evicted);
         let _ = evicted;
         #[cfg(feature = "metrics")]
         {

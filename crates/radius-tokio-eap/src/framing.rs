@@ -331,7 +331,7 @@ impl Reassembler {
                 .total_length
                 .expect("Frame::parse guarantees Some(total_length) when L bit is set");
             if total > self.max_total_length {
-                warn!(
+                debug!(
                     event = "reassembly_overflow",
                     site = "declared_total_exceeds_cap",
                     declared = total,
@@ -356,7 +356,7 @@ impl Reassembler {
         if let Some(expected) = self.expected {
             let would_be = self.buf.len().saturating_add(frame.payload.len());
             if would_be as u64 > u64::from(expected) {
-                warn!(
+                debug!(
                     event = "reassembly_overflow",
                     site = "fragments_exceed_declared",
                     expected,
@@ -377,7 +377,7 @@ impl Reassembler {
             // in sequence (we reset between messages, so this is
             // really just per-call protection).
             if frame.payload.len() as u64 > u64::from(self.max_total_length) {
-                warn!(
+                debug!(
                     event = "reassembly_overflow",
                     site = "unbounded_single_fragment_exceeds_cap",
                     cap = self.max_total_length,

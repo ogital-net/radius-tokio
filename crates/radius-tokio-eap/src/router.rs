@@ -400,7 +400,7 @@ where
                 .collect();
 
             let Some(next_typ) = desired.into_iter().next() else {
-                warn!(event = "nak_reject", current = session.method.typ().0,);
+                debug!(event = "nak_reject", current = session.method.typ().0,);
                 count!(crate::obs::metrics::NAK_REJECTS);
                 count!(
                     crate::obs::metrics::SESSIONS_COMPLETED,
@@ -413,7 +413,7 @@ where
             };
 
             let from_typ = session.method.typ();
-            info!(event = "nak_pivot", from = from_typ.0, to = next_typ.0,);
+            debug!(event = "nak_pivot", from = from_typ.0, to = next_typ.0,);
             count!(
                 crate::obs::metrics::NAK_PIVOTS,
                 "from" => from_typ.0.to_string(),
@@ -439,7 +439,7 @@ where
         let current_typ = session.method.typ();
         if pkt.typ() != Some(current_typ) {
             // Wrong type and not a Nak — terminate.
-            warn!(
+            debug!(
                 event = "session_wrong_type",
                 expected = current_typ.0,
                 got = pkt.typ().map_or(0u8, |t| t.0),

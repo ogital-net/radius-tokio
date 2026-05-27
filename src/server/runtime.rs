@@ -110,7 +110,7 @@ fn set_v4_dontfrag(sock: &socket2::Socket) {
             )
         };
         if rc != 0 {
-            warn!(
+            debug!(
                 event = "udp_bind_pmtud_failed",
                 errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
             );
@@ -147,7 +147,7 @@ fn set_v4_dontfrag(sock: &socket2::Socket) {
             )
         };
         if rc != 0 {
-            warn!(
+            debug!(
                 event = "udp_bind_pmtud_failed",
                 errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
             );
@@ -293,7 +293,7 @@ impl<S: ClientStore, H: Handler> Server<S, H> {
         let mut tasks = JoinSet::new();
         for (addr, role) in &self.udp_binds {
             let socket = bind_udp(*addr)?;
-            info!(event = "udp_bind", %addr, role = ?role);
+            debug!(event = "udp_bind", %addr, role = ?role);
             tasks.spawn(serve_udp(
                 socket,
                 Arc::clone(&self.store),
@@ -308,7 +308,7 @@ impl<S: ClientStore, H: Handler> Server<S, H> {
         #[cfg(feature = "radsec")]
         for (addr, ctx, role) in &self.radsec_binds {
             let listener = TcpListener::bind(addr).await?;
-            info!(event = "radsec_bind", %addr, role = ?role);
+            debug!(event = "radsec_bind", %addr, role = ?role);
             tasks.spawn(serve_radsec(
                 listener,
                 ctx.clone(),
@@ -351,7 +351,7 @@ impl<S: ClientStore, H: Handler> Server<S, H> {
             warn!(event = "server_exit", error = %e);
             Err(e)
         } else {
-            info!(event = "server_exit");
+            debug!(event = "server_exit");
             Ok(())
         }
     }

@@ -118,7 +118,7 @@ where
                 // are dropped here; flood traffic never reaches the
                 // scheduler.
                 let Some(client) = store.lookup_udp(src).await else {
-                    warn!(event = "drop", reason = "unknown_client", %src, len);
+                    debug!(event = "drop", reason = "unknown_client", %src, len);
                     count!(metrics::PACKETS_DROPPED, "reason" => "unknown_client");
                     continue;
                 };
@@ -183,7 +183,7 @@ async fn process_packet<H>(
     let (header, attrs) = match pipeline::validate(datagram, &client) {
         Validated::Ok { header, attrs } => (header, attrs),
         Validated::MalformedHeader(_e) => {
-            warn!(
+            debug!(
                 event = "drop",
                 reason = "malformed_header",
                 %src,
@@ -197,7 +197,7 @@ async fn process_packet<H>(
             code: _code,
             identifier: _identifier,
         } => {
-            warn!(
+            debug!(
                 event = "drop",
                 reason = "bad_request_authenticator",
                 %src,
@@ -212,7 +212,7 @@ async fn process_packet<H>(
             code: _code,
             identifier: _identifier,
         } => {
-            warn!(
+            debug!(
                 event = "drop",
                 reason = "missing_message_authenticator",
                 %src,
@@ -230,7 +230,7 @@ async fn process_packet<H>(
             code: _code,
             identifier: _identifier,
         } => {
-            warn!(
+            debug!(
                 event = "drop",
                 reason = "bad_message_authenticator",
                 %src,
@@ -308,7 +308,7 @@ async fn process_packet<H>(
                     count!(metrics::REPLIES_SENT, "code" => _reply_code.to_string());
                 }
                 Err(_e) => {
-                    warn!(
+                    debug!(
                         event = "reply_send_error",
                         code = _code.0,
                         id = _identifier,
@@ -353,7 +353,7 @@ async fn process_packet<H>(
                     );
                 }
                 Err(_e) => {
-                    warn!(
+                    debug!(
                         event = "status_server_reply_send_error",
                         %src,
                         id = _identifier,
@@ -766,7 +766,7 @@ mod tests {
 
     #[cfg(feature = "tracing")]
     #[tokio::test(flavor = "current_thread")]
-    async fn tracing_unknown_client_emits_warn_drop() {
+    async fn tracing_unknown_client_emits_debug_drop() {
         let sink = Arc::new(EventSink::default());
         let _guard = tracing::subscriber::set_default(Arc::clone(&sink));
 
@@ -791,14 +791,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Wait deterministically for the WARN drop event instead
+        // Wait deterministically for the DEBUG drop event instead
         // of sleeping a fixed duration. The 1 s ceiling is a hard
         // upper bound for an in-process loopback packet; missing
         // it indicates a real regression, not load-induced jitter.
         let saw_drop = sink
             .wait_for(Duration::from_secs(1), |evs| {
                 evs.iter()
-                    .any(|(lvl, name)| *lvl == tracing::Level::WARN && name == "drop")
+                    .any(|(lvl, name)| *lvl == tracing::Level::DEBUG && name == "drop")
             })
             .await;
 
@@ -807,7 +807,7 @@ mod tests {
 
         assert!(
             saw_drop,
-            "expected WARN drop event, got {:?}",
+            "expected DEBUG drop event, got {:?}",
             sink.snapshot(),
         );
     }

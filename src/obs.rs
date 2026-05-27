@@ -55,9 +55,13 @@ impl Level {
     pub(crate) const TRACE: Level = Level;
 }
 
-/// Emit an `INFO`-level event. Used for lifecycle (bind, shutdown,
-/// `CoA` originator construction) — anything an operator wants in
-/// the log even at default verbosity.
+/// Emit an `INFO`-level event. Reserved for conditions the
+/// operator wants in the log even at default verbosity. As a
+/// library we intentionally emit **no** events at this level on
+/// the steady-state path: the embedding application is the one
+/// best placed to decide what is notable enough to surface and
+/// should emit its own INFO records ("radius server listening on
+/// …", "shutting down", etc.).
 #[cfg(feature = "tracing")]
 #[allow(unused_macros)]
 macro_rules! info {
@@ -71,8 +75,13 @@ macro_rules! info {
     };
 }
 
-/// Emit a `DEBUG`-level event. Used per-packet on the happy path
-/// (request accepted, reply sent). Off at default verbosity.
+/// Emit a `DEBUG`-level event. The default home for everything
+/// this crate emits: per-connection / per-packet lifecycle on the
+/// happy path (bind, accept, request accepted, reply sent) **and**
+/// per-packet diagnostic drops driven by peer input (bad
+/// authenticator, malformed header, unknown client, peer
+/// disconnect, retransmit, timeout). Off at default verbosity;
+/// enable with `RUST_LOG=radius_tokio=debug`.
 #[cfg(feature = "tracing")]
 macro_rules! debug {
     ($($tt:tt)*) => { ::tracing::event!(target: $crate::obs::TARGET, ::tracing::Level::DEBUG, $($tt)*) };
@@ -85,9 +94,13 @@ macro_rules! debug {
     };
 }
 
-/// Emit a `WARN`-level event. Used for silent-drop conditions an
-/// operator probably wants to see (bad authenticator, malformed
-/// header from a known client, retransmit storm).
+/// Emit a `WARN`-level event. Reserved for unexpected conditions
+/// the library cannot route back to a caller — e.g. a listener
+/// task exiting with an error before the operator asked for
+/// shutdown. Per-packet drops driven by peer input are
+/// intentionally **not** WARN: on an open port they are routine,
+/// and emitting them at WARN trains operators to ignore the
+/// level. Use DEBUG for those.
 #[cfg(feature = "tracing")]
 macro_rules! warn {
     ($($tt:tt)*) => { ::tracing::event!(target: $crate::obs::TARGET, ::tracing::Level::WARN, $($tt)*) };

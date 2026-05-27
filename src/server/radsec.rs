@@ -154,7 +154,7 @@ fn apply_keepalive(stream: &TcpStream) {
     if let Err(_e) = SockRef::from(stream).set_tcp_keepalive(&ka) {
         #[allow(clippy::used_underscore_binding)]
         {
-            warn!(event = "radsec_keepalive_failed", error = ?_e);
+            debug!(event = "radsec_keepalive_failed", error = ?_e);
         }
     }
 }
@@ -353,7 +353,7 @@ where
                         stream, peer, tls_ctx, store, handler, cache, registry,
                         role, status_policy,
                     ).await {
-                        warn!(event = "radsec_connection_error", %peer, error = ?_e);
+                        debug!(event = "radsec_connection_error", %peer, error = ?_e);
                     }
                 });
             }
@@ -394,7 +394,7 @@ where
     let tls = TlsConnection::accept(&tls_ctx).map_err(tls_to_io)?;
     let mut conn = AsyncTls::new(stream, tls);
     if let Err(_e) = conn.handshake().await {
-        warn!(event = "radsec_handshake_failed", %peer, error = ?_e);
+        debug!(event = "radsec_handshake_failed", %peer, error = ?_e);
         count!(metrics::RADSEC_HANDSHAKE_FAILURES);
         return Ok(());
     }
@@ -408,13 +408,13 @@ where
         // mTLS is mandatory in TlsContext::server; absence here
         // would mean libssl let a no-cert client through, which
         // it shouldn't. Defensive close.
-        warn!(event = "radsec_cert_missing", %peer);
+        debug!(event = "radsec_cert_missing", %peer);
         count!(metrics::RADSEC_CERT_LOOKUP_FAILURES, "reason" => "missing");
         let _ = conn.shutdown_clean().await;
         return Ok(());
     };
     let Some(client) = store.lookup_radsec_by_cert(peer, &peer_cert).await else {
-        warn!(
+        debug!(
             event = "radsec_cert_lookup_reject",
             %peer,
             subject = %peer_cert.subject_display(),
@@ -427,7 +427,7 @@ where
         return Ok(());
     };
 
-    info!(event = "radsec_connected", %peer, client = ?client.id());
+    debug!(event = "radsec_connected", %peer, client = ?client.id());
     count!(metrics::RADSEC_CONNECTIONS);
 
     // Register with the connection registry so a revocation can
@@ -495,7 +495,7 @@ async fn run_frame_loop<H: Handler>(
                 }
                 Ok(false) => {}
                 Err(_e) => {
-                    warn!(
+                    debug!(
                         event = "radsec_key_update_failed",
                         %peer,
                         error = ?_e,
@@ -520,7 +520,7 @@ async fn run_frame_loop<H: Handler>(
                         return Ok(());
                     }
                     Err(_e) => {
-                        warn!(event = "radsec_read_error", %peer, error = ?_e);
+                        debug!(event = "radsec_read_error", %peer, error = ?_e);
                         return Ok(());
                     }
                 };
@@ -537,7 +537,7 @@ async fn run_frame_loop<H: Handler>(
                 )
                 .await
                 {
-                    warn!(event = "radsec_dispatch_error", %peer, error = ?_e);
+                    debug!(event = "radsec_dispatch_error", %peer, error = ?_e);
                     return Ok(());
                 }
             }
@@ -596,7 +596,7 @@ async fn process_frame<H: Handler>(
     let (header, attrs) = match pipeline::validate(datagram, client) {
         Validated::Ok { header, attrs } => (header, attrs),
         Validated::MalformedHeader(_e) => {
-            warn!(
+            debug!(
                 event = "radsec_drop",
                 reason = "malformed_header",
                 %peer,
@@ -613,7 +613,7 @@ async fn process_frame<H: Handler>(
             code: _code,
             identifier: _identifier,
         } => {
-            warn!(
+            debug!(
                 event = "radsec_drop",
                 reason = "bad_request_authenticator",
                 %peer,
@@ -631,7 +631,7 @@ async fn process_frame<H: Handler>(
             code: _code,
             identifier: _identifier,
         } => {
-            warn!(
+            debug!(
                 event = "radsec_drop",
                 reason = "missing_message_authenticator",
                 %peer,
@@ -652,7 +652,7 @@ async fn process_frame<H: Handler>(
             code: _code,
             identifier: _identifier,
         } => {
-            warn!(
+            debug!(
                 event = "radsec_drop",
                 reason = "bad_message_authenticator",
                 %peer,
@@ -735,7 +735,7 @@ async fn process_frame<H: Handler>(
                     Ok(())
                 }
                 Err(e) => {
-                    warn!(
+                    debug!(
                         event = "radsec_reply_send_error",
                         code = _code.0,
                         id = _identifier,
@@ -780,7 +780,7 @@ async fn process_frame<H: Handler>(
                     Ok(())
                 }
                 Err(e) => {
-                    warn!(
+                    debug!(
                         event = "radsec_status_server_reply_send_error",
                         %peer,
                         id = _identifier,

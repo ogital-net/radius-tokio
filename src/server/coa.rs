@@ -252,7 +252,7 @@ impl CoaOriginator {
     /// Forwards any I/O error from [`UdpSocket::bind`].
     pub async fn bind(local_addr: SocketAddr, config: CoaConfig) -> io::Result<Self> {
         let socket = Arc::new(UdpSocket::bind(local_addr).await?);
-        info!(event = "coa_bind", local = %socket.local_addr()?);
+        debug!(event = "coa_bind", local = %socket.local_addr()?);
         let state: Arc<Mutex<HashMap<SocketAddr, TargetState>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let reader = tokio::spawn(reader_loop(Arc::clone(&socket), Arc::clone(&state)));
@@ -415,7 +415,7 @@ impl CoaOriginator {
                 count!("radius_tokio.coa_outcomes", "outcome" => "nak");
             }
             Err(_e) => {
-                warn!(event = "coa_error", %target, code = code.0, id = identifier, error = %_e);
+                debug!(event = "coa_error", %target, code = code.0, id = identifier, error = %_e);
                 count!("radius_tokio.coa_outcomes", "outcome" => "error");
             }
         }
@@ -495,7 +495,7 @@ async fn send_and_await(
             }
         }
     }
-    warn!(event = "coa_timeout", %target, attempts);
+    debug!(event = "coa_timeout", %target, attempts);
     Err(CoaError::Timeout)
 }
 
