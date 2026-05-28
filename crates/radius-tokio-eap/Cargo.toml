@@ -70,14 +70,14 @@ tracing = ["dep:tracing"]
 metrics = ["dep:metrics"]
 
 [dependencies]
-radius-tokio = { workspace = true }
+radius-tokio = { workspace = true, features = ["server"] }
 tokio = { workspace = true, default-features = false, features = ["sync"] }
 tracing = { workspace = true, optional = true }
 metrics = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "net"] }
-radius-tokio = { workspace = true, features = ["radsec"] }
+radius-tokio = { workspace = true, features = ["radsec", "server"] }
 
 [[example]]
 name = "peap_mschapv2"

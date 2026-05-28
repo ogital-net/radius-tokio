@@ -43,9 +43,12 @@
 //! Helpers do not chain methods themselves — that policy belongs in
 //! the consumer's handler.
 
+#[cfg(feature = "server")]
 pub mod chap;
 pub mod eap_md5;
+#[cfg(feature = "server")]
 pub mod mschap;
+#[cfg(feature = "server")]
 pub mod pap;
 
 /// Outcome of a credential check.

@@ -97,7 +97,21 @@ include = [
 ]
 
 [features]
-default = ["dict-rfc", "fast-md5"]
+default = ["dict-rfc", "fast-md5", "server", "client"]
+# Compile the server-side runtime: `server::*` (UDP / RadSec
+# listener, `Server`, `Handler`, `ClientStore`, `CoaOriginator`,
+# `StatusServer`, …). On by default. Disable with
+# `default-features = false` when building a client-only consumer
+# that only needs the codec + crypto + `client` module. The
+# `radius-tokio-eap` companion crate enables this feature
+# transitively because its outer integration uses
+# `server::{Handler, Request}`.
+server = []
+# Authenticator-side originator (`client::RadiusClient`): bound
+# UDP socket + `(peer, identifier)` correlation + RFC 5080 §2.2.1
+# retry. On by default. Disable alongside `server` for embedded
+# consumers that only need the codec + crypto primitives.
+client = []
 # Emit `tracing` spans/events around accept, decode, dispatch, reply,
 # and CoA lifecycle. Off by default — pulls in the `tracing` crate.
 tracing = ["dep:tracing"]
@@ -218,31 +232,39 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 [[example]]
 name = "dhat_hot_path"
+required-features = ["server"]
 
 [[example]]
 name = "mutable_clients"
+required-features = ["server"]
 
 [[example]]
 name = "sqlite_clients"
+required-features = ["server"]
 
 [[example]]
 name = "threadlocal_responder"
+required-features = ["server"]
 
 [[example]]
 name = "coa_originator"
+required-features = ["server"]
 
 [[example]]
 name = "graceful_shutdown"
+required-features = ["server"]
 
 [[example]]
 name = "routing_dispatcher"
+required-features = ["server"]
 
 [[example]]
 name = "eap_identity_challenge"
+required-features = ["server"]
 
 [[example]]
 name = "mixed_udp_radsec"
-required-features = ["radsec"]
+required-features = ["radsec", "server"]
 
 [[bench]]
 name = "codec_decode"
@@ -259,6 +281,7 @@ harness = false
 [[bench]]
 name = "client_store"
 harness = false
+required-features = ["server"]
 
 [[bench]]
 name = "roundtrip"
@@ -267,6 +290,7 @@ harness = false
 [[bench]]
 name = "server_udp"
 harness = false
+required-features = ["server"]
 
 [[bench]]
 name = "md5_backends"

@@ -21,6 +21,10 @@ pub use crypto::ZeroizingBytes;
 pub use radius_tokio_dict as dict;
 #[macro_use]
 mod obs;
+/// Server-side runtime: UDP / RadSec listener, `Handler` trait,
+/// `ClientStore`, accounting / `CoA` originator, `Status-Server`.
+/// Available with the `server` feature (on by default).
+#[cfg(feature = "server")]
 pub mod server;
 
 // Re-export the TLS wrapper as a public submodule. Lives under
@@ -42,6 +46,19 @@ pub use crypto::pki;
 /// unpredictable.
 pub use crypto::rand;
 
+// RFC 2865 §5.2 User-Password obfuscation. Exposed at the crate
+// root so authenticator-side consumers (the `client` module here,
+// and out-of-tree Access-Request originators) can populate the
+// User-Password attribute without re-implementing the chained-MD5
+// construction. The server-side verifier in `auth::pap` uses the
+// same primitive internally.
+pub use crypto::user_password_encrypt;
+
+/// `MS-MPPE-{Send,Recv}-Key` decrypt helper for Access-Accept
+/// consumers (RFC 2548 §2.4.3). The matching encrypt path is on
+/// the server-side reply builder via [`Reply::add_mppe_keys`].
+pub use crypto::mppe;
+
 // Re-export the consumer-visible codec surface. The receive- and
 // reply-handling types are needed by anyone implementing a `Handler`.
 pub use codec::attributes::AttributesView;
@@ -52,3 +69,10 @@ pub use codec::{
     attributes, authenticator, dissect, eap, header, message_authenticator, CodecError,
     PacketBuffer, TlvWriter,
 };
+
+/// Authenticator-side UDP originator: bind a socket, send an
+/// Access-Request (or any other code), correlate the reply by
+/// `(peer, identifier)`, and retransmit per RFC 5080 §2.2.1.
+/// Available with the `client` feature (on by default).
+#[cfg(feature = "client")]
+pub mod client;

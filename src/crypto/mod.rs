@@ -28,6 +28,7 @@ pub(crate) mod des;
 pub(crate) mod hmac_md5;
 pub(crate) mod md4;
 pub(crate) mod md5;
+pub mod mppe;
 pub(crate) mod password;
 #[cfg(feature = "radsec")]
 pub mod pki;
@@ -149,6 +150,31 @@ impl PartialEq for ZeroizingBytes {
 }
 
 impl Eq for ZeroizingBytes {}
+
+/// RFC 2865 §5.2 User-Password obfuscation.
+///
+/// Encrypts `password` under `secret` and the Access-Request's
+/// Request Authenticator, producing a 16-to-128-byte ciphertext
+/// (always a non-zero multiple of 16) suitable for the
+/// `User-Password` attribute value.
+///
+/// Authenticator-side consumers (the [`crate::client`] module, and
+/// any out-of-tree Access-Request originator) call this to populate
+/// `User-Password`. The matching decrypt path is internal to
+/// [`crate::auth::pap`], which constant-time-compares an
+/// encrypted expected password against the wire ciphertext.
+///
+/// # Panics
+///
+/// Panics if `password.len() > 128` (the RFC 2865 §5.2 maximum).
+#[must_use]
+pub fn user_password_encrypt(
+    password: &[u8],
+    secret: &[u8],
+    request_authenticator: &[u8; 16],
+) -> Vec<u8> {
+    password::user_password_encrypt(password, secret, request_authenticator)
+}
 
 #[cfg(test)]
 mod tests {

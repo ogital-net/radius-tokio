@@ -69,6 +69,7 @@ macro_rules! info {
 }
 
 #[cfg(not(feature = "tracing"))]
+#[allow(unused_macros)]
 macro_rules! info {
     ($($tt:tt)*) => {
         ()
@@ -83,11 +84,13 @@ macro_rules! info {
 /// disconnect, retransmit, timeout). Off at default verbosity;
 /// enable with `RUST_LOG=radius_tokio=debug`.
 #[cfg(feature = "tracing")]
+#[allow(unused_macros)]
 macro_rules! debug {
     ($($tt:tt)*) => { ::tracing::event!(target: $crate::obs::TARGET, ::tracing::Level::DEBUG, $($tt)*) };
 }
 
 #[cfg(not(feature = "tracing"))]
+#[allow(unused_macros)]
 macro_rules! debug {
     ($($tt:tt)*) => {
         ()
@@ -102,11 +105,13 @@ macro_rules! debug {
 /// and emitting them at WARN trains operators to ignore the
 /// level. Use DEBUG for those.
 #[cfg(feature = "tracing")]
+#[allow(unused_macros)]
 macro_rules! warn {
     ($($tt:tt)*) => { ::tracing::event!(target: $crate::obs::TARGET, ::tracing::Level::WARN, $($tt)*) };
 }
 
 #[cfg(not(feature = "tracing"))]
+#[allow(unused_macros)]
 macro_rules! warn {
     ($($tt:tt)*) => {
         ()
@@ -188,6 +193,7 @@ pub(crate) struct NoopGuard;
 /// Expands to [`metrics::counter!`] when the `metrics` feature is enabled
 /// and to nothing when it is not.
 #[cfg(feature = "metrics")]
+#[allow(unused_macros)]
 macro_rules! count {
     ($name:expr $(,)?) => {
         ::metrics::counter!($name).increment(1)
