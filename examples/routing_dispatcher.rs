@@ -51,6 +51,7 @@ use radius_tokio::server::{
     Client, CodeRouter, Handler, HandlerResult, IpCidr, ListenerRole, Request, Server,
     StaticClients,
 };
+use radius_tokio::AttributesView;
 use radius_tokio::Code;
 
 // ─── inner dispatch: which credential did the NAS supply? ──────

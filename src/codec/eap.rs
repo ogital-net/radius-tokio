@@ -26,8 +26,8 @@
 //! into a method engine) should use [`fragments`]. Handlers that
 //! already hold a [`Request`](crate::server::Request) can skip this
 //! module's argument-shape entirely and call
-//! [`Request::eap_message`](crate::server::Request::eap_message) /
-//! [`Request::eap_message_into`](crate::server::Request::eap_message_into).
+//! [`AttributesView::eap_message`](crate::AttributesView::eap_message) /
+//! [`AttributesView::eap_message_into`](crate::AttributesView::eap_message_into).
 
 /// RADIUS attribute type for EAP-Message (RFC 3579 §3.1).
 pub const TYPE: u8 = 79;

@@ -7,17 +7,94 @@ members = [
 ]
 resolver = "2"
 
-[package]
-name = "radius-tokio"
+# Shared package metadata. Every member inherits these via
+# `field.workspace = true`, so a single bump here cascades to every
+# published crate. Per-crate fields (name, description, keywords,
+# categories) stay in each member's `[package]` block.
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.83"
-description = "A high-performance, async RADIUS server library (RFC 2865/2866/6614)"
 license = "BSD-2-Clause"
-repository = "https://github.com/example/radius-tokio"
+repository = "https://github.com/ogital-net/radius-tokio"
+homepage = "https://github.com/ogital-net/radius-tokio"
+
+# Centralized dependency versions. External crates pin their version
+# here; members reference them with `dep.workspace = true` and may
+# layer their own `features = […]` / `optional = true` on top.
+# Inter-crate `path + version` pairs also live here so a workspace
+# version bump only touches `workspace.package.version` plus the
+# three internal entries below.
+[workspace.dependencies]
+radius-tokio = { path = ".", version = "0.1.0" }
+radius-tokio-dict = { path = "crates/radius-tokio-dict", version = "0.1.0" }
+radius-tokio-dict-codegen = { path = "crates/radius-tokio-dict-codegen", version = "0.1.0" }
+# Tokio: `default-features = false` is set workspace-wide because
+# tokio's `default` feature set is empty in 1.x — carrying it through
+# would only force every member that wants to override (e.g. the EAP
+# crate, which uses `default-features = false`) to fight Cargo's
+# workspace-inheritance rules. Members specify the runtime/IO
+# features they actually need via `features = […]`.
+tokio = { version = "1", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+metrics = { version = "0.24" }
+
+# Shared lint config. Members opt in with `[lints] workspace = true`.
+# Pedantic is on for every crate; individual lints that fire on
+# unavoidable patterns (e.g. one-line module names, large error
+# enums) are allowed here rather than scattered as `#[allow]`
+# attributes throughout the source.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+dead_code = "allow"
+
+# Mirror the rustdoc lints CI runs with `-D warnings` on
+# `cargo doc --workspace --all-features --no-deps` so broken links
+# (typically caused by renaming/moving an item) fail at `cargo check`
+# time instead of only in CI.
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+redundant_explicit_links = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Deliberate API design: public types are named after their module
+# (`server::handler::Handler`, `codec::attributes::AttributesView`,
+# `eap::method::Method`, `server::status::StatusServer`, …). The
+# repetition aids discoverability and matches the import shape
+# downstream code is expected to use, so the lint has no actionable
+# signal at the ~50 affected sites. All other pedantic lints are
+# enforced; suppressions for one-off cast/clone/etc. patterns live
+# as local `#[allow(...)]` attributes at the call site.
+module_name_repetitions = "allow"
+
+[package]
+name = "radius-tokio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A high-performance, async RADIUS server library (RFC 2865/2866/6614)"
 keywords = ["radius", "aaa", "networking", "tokio"]
 categories = ["network-programming", "asynchronous"]
-exclude = ["dhat-heap.json"]
+# Allow-list of files shipped in the published crate. Anything not
+# listed here (target/, benches/criterion output, dhat-heap.json,
+# editor scratch, top-level workspace docs we don't want to bundle
+# with this single crate) stays out of the .crate tarball. README.md
+# and LICENSE at the package root are picked up automatically.
+include = [
+    "src/**/*.rs",
+    "examples/**/*.rs",
+    "benches/**/*.rs",
+    "tests/**/*.rs",
+    "build.rs",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+]
 
 [features]
 default = ["dict-rfc", "fast-md5"]
@@ -82,7 +159,7 @@ dict-vendor-all = [
 [dependencies]
 # Typed FreeRADIUS dictionary tables generated at build time.
 # Feature flags above forward dict-* selections to this crate.
-radius-tokio-dict = { path = "crates/radius-tokio-dict", version = "0.1.0" }
+radius-tokio-dict = { workspace = true }
 # Core crypto bindings (HMAC-MD5, AES, RNG, …). The `ssl` feature
 # is *not* enabled here; turn it on via the `radsec` cargo feature
 # when RadSec / TLS support is needed. Without `ssl`, the crypto-
@@ -98,15 +175,15 @@ aws-lc-sys = ">=0.40, <2"
 # Optimized MD5 backend (hand-written x86_64/aarch64 assembly + portable
 # Rust fallback). Gated by the `fast-md5` feature; enabled by default.
 fast-md5 = { version = "1", optional = true }
-tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["net", "rt", "sync", "time", "macros"] }
 # Optional structured logging. Gated by the `tracing` feature so the
 # default build keeps zero non-aws-lc / non-tokio dependencies. With
 # the feature off the macros in `crate::obs` expand to nothing.
-tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
+tracing = { workspace = true, features = ["attributes"], optional = true }
 # Optional metrics facade. Gated by the `metrics` feature so the default
 # build stays dependency-free. With the feature off the macros in
 # `crate::obs` expand to nothing.
-metrics = { version = "0.24", optional = true }
+metrics = { workspace = true, optional = true }
 # Socket option helpers: needed for the UDP listener defaults
 # (PMTUD-off / DF=0 on IPv4, IPV6_V6ONLY on IPv6) and for TCP
 # keepalive on accepted RadSec sockets. `socket2` is already a
@@ -121,7 +198,7 @@ socket2 = { version = "0.6.3", features = ["all"] }
 libc = "0.2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "signal", "time", "macros", "test-util"] }
+tokio = { workspace = true, features = ["net", "rt", "rt-multi-thread", "sync", "signal", "time", "macros", "test-util"] }
 # Benchmarks. Pulled in only for `cargo bench`; dependency-light and
 # offline (no html_reports → drops the `plotters`/`tinytemplate` tree).
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
@@ -195,10 +272,5 @@ harness = false
 name = "md5_backends"
 harness = false
 
-[lints.rust]
-unsafe_op_in_unsafe_fn = "deny"
-missing_docs = "warn"
-dead_code = "allow"
-
-[lints.clippy]
-pedantic = { level = "warn", priority = -1 }
+[lints]
+workspace = true

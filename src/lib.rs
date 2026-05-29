@@ -44,6 +44,7 @@ pub use crypto::rand;
 
 // Re-export the consumer-visible codec surface. The receive- and
 // reply-handling types are needed by anyone implementing a `Handler`.
+pub use codec::attributes::AttributesView;
 pub use codec::encode::Reply;
 pub use codec::header::Code;
 pub use codec::typed;

@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use radius_tokio::eap::{self, Code as EapCode, Packet as EapPacket, Type as EapType};
 use radius_tokio::server::{Handler, HandlerResult, Request};
-use radius_tokio::{attributes, Code as RadiusCode, CodecError, Reply};
+use radius_tokio::{AttributesView, Code as RadiusCode, CodecError, Reply};
 
 use crate::method::{EapMethod, MethodFactory, MethodOutcome};
 use crate::session::{InMemorySessionStore, Session, SessionId, SessionStore};
@@ -57,17 +57,24 @@ pub struct AcceptContext<'a> {
     /// methods with `anonymous_identity` set, this is the
     /// throwaway outer name (commonly `"anonymous"`).
     pub user_name: Option<&'a [u8]>,
+    /// EAP `Type` byte the session ultimately authenticated
+    /// against. For [`MultiEapHandler`](crate::MultiEapHandler)
+    /// this reflects whichever method the peer agreed on after any
+    /// `EAP-Response/Nak` negotiation, not necessarily the
+    /// preferred type the router offered first.
+    pub eap_type: radius_tokio::eap::Type,
     raw_attributes: &'a [u8],
 }
 
-impl<'a> AcceptContext<'a> {
-    /// Walk the inbound request's attribute region to pull out
+impl<'a> AttributesView<'a> for AcceptContext<'a> {
+    /// Inbound Access-Request attribute region, for pulling out
     /// NAS-side metadata such as `Called-Station-Id` (the AP MAC
     /// plus SSID for 802.1X), `NAS-IP-Address`, `NAS-Identifier`,
-    /// or any vendor-specific attributes the NAS attached.
-    #[must_use]
-    pub fn request_attributes(&self) -> attributes::AttributesIter<'a> {
-        attributes::iter(self.raw_attributes)
+    /// or any vendor-specific attributes the NAS attached. Walk
+    /// via [`AttributesView::attributes_iter`].
+    #[inline]
+    fn raw_attributes(&self) -> &'a [u8] {
+        self.raw_attributes
     }
 }
 
@@ -260,6 +267,7 @@ where
             eap_identifier: peer_eap_id,
             msk,
             peer_identity: session.peer_identity.take(),
+            eap_type: method_typ,
         }),
         MethodOutcome::Failure => Ok(Dispatch::Reject {
             eap_identifier: peer_eap_id,
@@ -293,7 +301,10 @@ where
         let raw_attributes: Vec<u8> = request.raw_attributes().to_vec();
 
         async move {
-            let outcome = match self.dispatch(state, &eap_buf, user_name.clone()).await {
+            let outcome = match self
+                .dispatch(state, &eap_buf, user_name.clone(), &raw_attributes)
+                .await
+            {
                 Ok(o) => o,
                 Err(_e) => Dispatch::Drop,
             };
@@ -324,6 +335,7 @@ where
         existing: Option<SessionId>,
         eap_buf: &[u8],
         user_name: Option<Vec<u8>>,
+        outer_attributes: &[u8],
     ) -> Result<Dispatch, crate::Error> {
         let Ok(pkt) = EapPacket::parse(eap_buf) else {
             return Ok(Dispatch::Drop);
@@ -345,7 +357,7 @@ where
             if let Some(id) = peer_identity.as_deref() {
                 method.notify_peer_identity(id);
             }
-            let outcome = method.start().await?;
+            let outcome = method.start(outer_attributes).await?;
             let method_typ = method.typ();
             let mut session = Session::new(method);
             session.peer_identity = peer_identity;
@@ -366,7 +378,10 @@ where
                 eap_identifier: peer_id,
             });
         }
-        let outcome = session.method.step(pkt.type_data()).await?;
+        let outcome = session
+            .method
+            .step(pkt.type_data(), outer_attributes)
+            .await?;
         commit_outcome(&self.store, outcome, session, peer_id, method_typ).await
     }
 }
@@ -384,6 +399,7 @@ pub(crate) enum Dispatch {
         eap_identifier: u8,
         msk: Vec<u8>,
         peer_identity: Option<Vec<u8>>,
+        eap_type: EapType,
     },
     Reject {
         eap_identifier: u8,
@@ -421,6 +437,7 @@ pub(crate) async fn render_dispatch(
             eap_identifier,
             msk,
             peer_identity,
+            eap_type,
         } => {
             let mut reply = Reply::new(RadiusCode::ACCESS_ACCEPT, radius_identifier);
             if reply.add_eap_success(eap_identifier).is_err() {
@@ -442,6 +459,7 @@ pub(crate) async fn render_dispatch(
                 let ctx = AcceptContext {
                     peer_identity: peer_identity.as_deref(),
                     user_name,
+                    eap_type,
                     raw_attributes,
                 };
                 if decorator.decorate(&ctx, &mut reply).await.is_err() {

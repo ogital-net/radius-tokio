@@ -9,7 +9,7 @@
 //! What we assert:
 //!
 //! * A server-only TLS handshake (no client cert) completes
-//!   between wpa_supplicant and our in-process `TlsConnection`,
+//!   between `wpa_supplicant` and our in-process `TlsConnection`,
 //!   carried over EAP-Message fragments inside RADIUS.
 //! * After phase-1 completes, the inner EAP-MSCHAPv2 exchange
 //!   (Identity → Challenge → Response → Success) runs inside the
@@ -42,6 +42,9 @@ const SHARED_SECRET: &str = "testing123";
 const IDENTITY: &str = "alice";
 const PASSWORD: &str = "hello123";
 
+// The `_pem` postfix on every field is intentional: it distinguishes
+// the wire-encoded PEM blobs from any future parsed/typed forms.
+#[allow(clippy::struct_field_names)]
 struct Pki {
     server_chain_pem: Vec<u8>,
     server_key_pem: Vec<u8>,

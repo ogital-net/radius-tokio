@@ -70,6 +70,7 @@ fn build_pki() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 /// Spawn `eapol_test` against `port` using `conf_path`. `expect_mppe`
 /// controls the `-n` flag (which suppresses the MPPE-key check for
 /// methods that derive none, like EAP-MD5).
+#[allow(clippy::needless_pass_by_value)] // owned PathBuf reads more naturally at the test call sites
 fn run_eapol_test(
     conf_path: std::path::PathBuf,
     port: u16,

@@ -179,17 +179,3 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses bans advisories sources
-
-  # ── Publish dry-run for the build-only codegen crate ─────────────────────
-  # Verifies the crate that's first in the publish chain still packages
-  # cleanly. The other two members can't be dry-run verified until their
-  # path-deps are actually on crates.io (chicken-and-egg with workspace
-  # publish chains).
-  publish_dryrun:
-    name: publish dry-run (radius-tokio-dict-codegen)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo publish --dry-run -p radius-tokio-dict-codegen

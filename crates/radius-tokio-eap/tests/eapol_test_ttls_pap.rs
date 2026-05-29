@@ -40,6 +40,9 @@ const SHARED_SECRET: &str = "testing123";
 const IDENTITY: &str = "alice";
 const PASSWORD: &str = "hello123";
 
+// The `_pem` postfix on every field is intentional: it distinguishes
+// the wire-encoded PEM blobs from any future parsed/typed forms.
+#[allow(clippy::struct_field_names)]
 struct Pki {
     server_chain_pem: Vec<u8>,
     server_key_pem: Vec<u8>,
@@ -94,7 +97,10 @@ async fn eapol_test_ttls_pap_succeeds() {
         TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem)
             .expect("build server tls ctx");
 
-    let creds = Arc::new(StaticPapCredentials::new(IDENTITY.as_bytes(), PASSWORD));
+    let creds = Arc::new(StaticPapCredentials::cleartext(
+        IDENTITY.as_bytes(),
+        PASSWORD,
+    ));
     let inner_factory = Arc::new(PapInnerFactory::new(creds));
     let factory = EapTtlsFactory::new(Arc::new(tls_ctx), inner_factory);
     let handler = EapHandler::new(factory);

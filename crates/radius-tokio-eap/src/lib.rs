@@ -71,6 +71,7 @@ pub mod framing;
 pub mod handler;
 pub mod identity;
 pub mod method;
+pub mod outer;
 pub mod router;
 pub mod session;
 
@@ -122,5 +123,6 @@ pub use handler::{AcceptContext, AcceptDecorator, EapHandler};
 pub use method::{
     BoxedEapMethod, DynFactory, DynMethodFactory, EapMethod, MethodFactory, MethodOutcome,
 };
+pub use outer::Outer;
 pub use router::{EapRouter, EapRouterBuilder, MultiEapHandler, RouterBuildError};
 pub use session::{InMemorySessionStore, Session, SessionId, SessionStore};

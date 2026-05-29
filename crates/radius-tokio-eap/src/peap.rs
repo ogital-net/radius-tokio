@@ -248,7 +248,7 @@ impl<I: InnerEap> EapMethod for Peap<I> {
         Type::PEAP
     }
 
-    fn start(&mut self) -> crate::method::MethodFuture<'_> {
+    fn start<'a>(&'a mut self, _outer_attributes: &'a [u8]) -> crate::method::MethodFuture<'a> {
         Box::pin(async move {
             // RFC 5216 §3.2 / PEAP §2.1: server-issued Start frame is
             // a single Flags byte with S set.
@@ -257,7 +257,11 @@ impl<I: InnerEap> EapMethod for Peap<I> {
     }
 
     #[allow(clippy::too_many_lines)] // intentionally a single-flow step()
-    fn step<'a>(&'a mut self, peer_type_data: &'a [u8]) -> crate::method::MethodFuture<'a> {
+    fn step<'a>(
+        &'a mut self,
+        peer_type_data: &'a [u8],
+        outer_attributes: &'a [u8],
+    ) -> crate::method::MethodFuture<'a> {
         Box::pin(async move {
             // 1. Ingest the peer's PEAP fragment and, if a full TLS
             //    message just reassembled, feed libssl + drive the
@@ -303,7 +307,7 @@ impl<I: InnerEap> EapMethod for Peap<I> {
             //    peer ACKs our last handshake fragment.
             if self.tunnel.is_handshake_done() && !self.inner_started {
                 self.inner_started = true;
-                let msg = self.inner.start().await?;
+                let msg = self.inner.start(outer_attributes).await?;
                 self.write_inner(&msg)?;
             }
 
@@ -331,7 +335,7 @@ impl<I: InnerEap> EapMethod for Peap<I> {
                 if self.inner_terminator.is_some() {
                     break;
                 }
-                match self.inner.step(&pkt_bytes).await? {
+                match self.inner.step(&pkt_bytes, outer_attributes).await? {
                     InnerOutcome::Continue(msg) => self.write_inner(&msg)?,
                     InnerOutcome::Success => {
                         self.inner_terminator = Some(InnerResult::Success);

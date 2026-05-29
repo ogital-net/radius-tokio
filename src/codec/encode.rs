@@ -198,7 +198,7 @@ impl Reply {
     /// value cap; an empty slice is rejected as a malformed
     /// attribute by [`PacketBuffer::add_attribute`].
     ///
-    /// Pair with [`crate::server::Request::state`] on the response
+    /// Pair with [`AttributesView::state`](crate::AttributesView::state) on the response
     /// side to read the echoed value back.
     ///
     /// # Errors
@@ -221,7 +221,7 @@ impl Reply {
     /// value cap; the spec mandates splitting the payload across
     /// consecutive `EAP-Message` slots, which the receiver
     /// concatenates back together. Pair with
-    /// [`crate::server::Request::eap_message`] on the request side to
+    /// [`AttributesView::eap_message`](crate::AttributesView::eap_message) on the request side to
     /// read the reassembled payload back. The 253-byte fragmentation
     /// is the inverse of
     /// [`crate::codec::eap::reassemble_into`].

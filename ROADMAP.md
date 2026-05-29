@@ -72,18 +72,6 @@ already emit `tracing::debug!` events — promoting the surrounding
 scopes to spans makes per-request timing and correlation IDs
 available without extra plumbing.
 
-## Auth / Identity
-
-### Realm parser
-
-Helper that decomposes the `User-Name` attribute into `(user, realm)`
-across the three forms RFC 7542 and historical deployments use:
-`user@realm` (NAI), `realm\user` (Windows-style), and `user%realm`
-(legacy Cisco). Returns owned slices so handlers can dispatch on the
-realm without hand-rolling string ops; non-goal is any opinion on
-*what* to do with the realm (that's a `ClientStore` / `Handler`
-concern).
-
 ## EAP
 
 ### Additional EAP methods in `radius-tokio-eap`

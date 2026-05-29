@@ -70,7 +70,7 @@ impl<'a> Identity<'a> {
 /// identity bytes.
 ///
 /// `eap_packet` is the *reassembled* EAP payload — typically the
-/// output of [`radius_tokio::server::Request::eap_message_into`].
+/// output of [`radius_tokio::AttributesView::eap_message_into`].
 ///
 /// # Errors
 ///

@@ -102,11 +102,17 @@ pub trait EapMethod: Send {
     /// Called once per session, immediately after the
     /// [`EapMethod`] is constructed by a [`MethodFactory`].
     ///
+    /// `outer_attributes` is the raw attribute region of the
+    /// outer Access-Request currently being processed; methods
+    /// that surface it to credential / verifier traits (via
+    /// [`Outer`](crate::Outer)) thread it
+    /// straight through. Others ignore it.
+    ///
     /// # Errors
     ///
     /// Method-specific. EAP-TLS surfaces [`Error::Tls`] on context
     /// initialization failure.
-    fn start(&mut self) -> MethodFuture<'_>;
+    fn start<'a>(&'a mut self, outer_attributes: &'a [u8]) -> MethodFuture<'a>;
 
     /// Informational hook called by the handler adapter on the
     /// initial round (after [`MethodFactory::create`], before
@@ -148,6 +154,12 @@ pub trait EapMethod: Send {
     /// [`radius_tokio::eap::Packet::type_data`] returns when the
     /// `typ()` matched.
     ///
+    /// `outer_attributes` is the raw attribute region of the
+    /// outer Access-Request currently being processed; methods
+    /// that surface it to credential / verifier traits (via
+    /// [`Outer`](crate::Outer)) thread it
+    /// straight through. Others ignore it.
+    ///
     /// # Errors
     ///
     /// - [`Error::Framing`] / [`Error::ReassemblyOverflow`] /
@@ -155,7 +167,11 @@ pub trait EapMethod: Send {
     ///   fragments.
     /// - [`Error::Tls`] for TLS record-layer or handshake errors.
     /// - [`Error::Eap`] for EAP-layer encoder failures.
-    fn step<'a>(&'a mut self, peer_type_data: &'a [u8]) -> MethodFuture<'a>;
+    fn step<'a>(
+        &'a mut self,
+        peer_type_data: &'a [u8],
+        outer_attributes: &'a [u8],
+    ) -> MethodFuture<'a>;
 }
 
 /// Per-session factory: the handler adapter calls
@@ -195,8 +211,8 @@ impl<T: EapMethod + ?Sized> EapMethod for Box<T> {
     fn typ(&self) -> radius_tokio::eap::Type {
         (**self).typ()
     }
-    fn start(&mut self) -> MethodFuture<'_> {
-        (**self).start()
+    fn start<'a>(&'a mut self, outer_attributes: &'a [u8]) -> MethodFuture<'a> {
+        (**self).start(outer_attributes)
     }
     fn notify_peer_identity(&mut self, identity: &[u8]) {
         (**self).notify_peer_identity(identity);
@@ -204,8 +220,12 @@ impl<T: EapMethod + ?Sized> EapMethod for Box<T> {
     fn notify_request_id(&mut self, eap_id: u8) {
         (**self).notify_request_id(eap_id);
     }
-    fn step<'a>(&'a mut self, peer_type_data: &'a [u8]) -> MethodFuture<'a> {
-        (**self).step(peer_type_data)
+    fn step<'a>(
+        &'a mut self,
+        peer_type_data: &'a [u8],
+        outer_attributes: &'a [u8],
+    ) -> MethodFuture<'a> {
+        (**self).step(peer_type_data, outer_attributes)
     }
 }
 
@@ -289,7 +309,7 @@ mod tests {
         fn typ(&self) -> EapType {
             EapType::MD5_CHALLENGE
         }
-        fn start(&mut self) -> MethodFuture<'_> {
+        fn start<'a>(&'a mut self, _outer_attributes: &'a [u8]) -> MethodFuture<'a> {
             Box::pin(async move { Ok(MethodOutcome::Continue(b"start".to_vec())) })
         }
         fn notify_peer_identity(&mut self, _identity: &[u8]) {
@@ -300,7 +320,11 @@ mod tests {
             self.id_notifications.set(self.id_notifications.get() + 1);
             self.last_step.set(Some(eap_id));
         }
-        fn step<'a>(&'a mut self, peer_type_data: &'a [u8]) -> MethodFuture<'a> {
+        fn step<'a>(
+            &'a mut self,
+            peer_type_data: &'a [u8],
+            _outer_attributes: &'a [u8],
+        ) -> MethodFuture<'a> {
             self.last_step.set(peer_type_data.first().copied());
             Box::pin(async move { Ok(MethodOutcome::Failure) })
         }
@@ -328,9 +352,9 @@ mod tests {
         assert_eq!(boxed.typ(), EapType::MD5_CHALLENGE);
         boxed.notify_peer_identity(b"alice");
         boxed.notify_request_id(42);
-        let out = boxed.start().await.unwrap();
+        let out = boxed.start(&[]).await.unwrap();
         assert!(matches!(out, MethodOutcome::Continue(_)));
-        let out = boxed.step(&[0xCC]).await.unwrap();
+        let out = boxed.step(&[0xCC], &[]).await.unwrap();
         assert!(matches!(out, MethodOutcome::Failure));
     }
 

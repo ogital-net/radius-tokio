@@ -119,11 +119,15 @@ impl EapMethod for EapTls {
         Type::TLS
     }
 
-    fn start(&mut self) -> crate::method::MethodFuture<'_> {
+    fn start<'a>(&'a mut self, _outer_attributes: &'a [u8]) -> crate::method::MethodFuture<'a> {
         Box::pin(async move { Ok(MethodOutcome::Continue(tls_tunnel::start_frame())) })
     }
 
-    fn step<'a>(&'a mut self, peer_type_data: &'a [u8]) -> crate::method::MethodFuture<'a> {
+    fn step<'a>(
+        &'a mut self,
+        peer_type_data: &'a [u8],
+        _outer_attributes: &'a [u8],
+    ) -> crate::method::MethodFuture<'a> {
         Box::pin(async move {
             // 1. Ingest the peer's TLS-EAP frame, if any. (The S bit
             //    on a peer response is illegal per RFC 5216 §3.2 — S

@@ -8,7 +8,7 @@
 //! either way) and avoids leaking the decrypted plaintext into a
 //! `Vec<u8>` we would have to scrub.
 
-use crate::codec::attributes::AttributeError;
+use crate::codec::attributes::{AttributeError, AttributesView};
 use crate::codec::constants::USER_PASSWORD as USER_PASSWORD_TYPE;
 use crate::crypto::{ct_eq, password};
 use crate::server::Request;

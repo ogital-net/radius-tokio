@@ -17,4 +17,6 @@ doc-valid-idents = [
     "BasicConstraints",
     "AddressSanitizer",
     "x86_64",
+    "PEAPv0",
+    "MSCHAPv2",
 ]

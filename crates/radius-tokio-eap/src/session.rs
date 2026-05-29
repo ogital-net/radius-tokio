@@ -193,10 +193,14 @@ mod tests {
         fn typ(&self) -> radius_tokio::eap::Type {
             radius_tokio::eap::Type::TLS
         }
-        fn start(&mut self) -> crate::method::MethodFuture<'_> {
+        fn start<'a>(&'a mut self, _outer: &'a [u8]) -> crate::method::MethodFuture<'a> {
             Box::pin(async move { Ok(MethodOutcome::Continue(vec![])) })
         }
-        fn step<'a>(&'a mut self, _: &'a [u8]) -> crate::method::MethodFuture<'a> {
+        fn step<'a>(
+            &'a mut self,
+            _: &'a [u8],
+            _outer: &'a [u8],
+        ) -> crate::method::MethodFuture<'a> {
             Box::pin(async move { Ok(MethodOutcome::Failure) })
         }
     }

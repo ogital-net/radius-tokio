@@ -50,15 +50,27 @@ pub trait InnerEap: Send {
     /// method-specific request (e.g. an `EAP-Request/MSCHAPv2`
     /// Challenge) when re-binding identity isn't needed.
     ///
+    /// `outer_attributes` is the raw attribute region of the
+    /// outer Access-Request currently being processed; methods
+    /// that surface it to credential / verifier traits (via
+    /// [`crate::Outer`]) thread it straight through.
+    /// Others ignore it.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Eap`] if packet construction fails or
     /// [`Error::Tls`] for unexpected lower-layer failures.
-    fn start(&mut self) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + '_;
+    fn start<'a>(
+        &'a mut self,
+        outer_attributes: &'a [u8],
+    ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a;
 
     /// Process one inner EAP-Response from the peer, returning the
     /// next outcome. `peer_packet` is a full EAP packet
     /// (Code/Id/Length/Type/Data) decrypted from the TLS tunnel.
+    ///
+    /// `outer_attributes` carries the outer Access-Request
+    /// attribute region as for [`InnerEap::start`].
     ///
     /// # Errors
     ///
@@ -67,6 +79,7 @@ pub trait InnerEap: Send {
     fn step<'a>(
         &'a mut self,
         peer_packet: &'a [u8],
+        outer_attributes: &'a [u8],
     ) -> impl Future<Output = Result<InnerOutcome, Error>> + Send + 'a;
 }
 

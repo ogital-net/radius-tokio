@@ -9,7 +9,7 @@
 //! What we assert:
 //!
 //! * A real TLS 1.2 / 1.3 handshake completes between `eapol_test`'s
-//!   wpa_supplicant frontend and our in-process `TlsConnection`,
+//!   `wpa_supplicant` frontend and our in-process `TlsConnection`,
 //!   carried over EAP-Message fragments inside RADIUS.
 //! * The server's reply chain (`Access-Challenge × N → Access-Accept`)
 //!   round-trips `State` (RFC 2865 §5.24) and `Message-Authenticator`
@@ -43,6 +43,9 @@ use radius_tokio_eap::EapHandler;
 const SHARED_SECRET: &str = "testing123";
 const IDENTITY: &str = "alice";
 
+// The `_pem` postfix on every field is intentional: it distinguishes
+// the wire-encoded PEM blobs from any future parsed/typed forms.
+#[allow(clippy::struct_field_names)]
 struct Pki {
     server_chain_pem: Vec<u8>,
     server_key_pem: Vec<u8>,
