@@ -56,6 +56,7 @@ const MS_CHAP_RESPONSE_NT_OFFSET: usize = 2 + 24;
 // MS-CHAP2-Response (RFC 2548 §2.3.2) wire layout: 50 octets total
 // = ident(1) || flags(1) || peer-challenge(16) || reserved(8) || nt-resp(24).
 const MS_CHAP2_RESPONSE_LEN: usize = 50;
+const MS_CHAP2_RESPONSE_IDENT_OFFSET: usize = 0;
 const MS_CHAP2_RESPONSE_PEER_OFFSET: usize = 2;
 const MS_CHAP2_RESPONSE_NT_OFFSET: usize = 2 + 16 + 8;
 
@@ -174,10 +175,11 @@ pub fn verify_v2(
     request: &Request<'_>,
     expected_password: MsChapSecret<'_>,
 ) -> Result<VerifyOutcome, AttributeError> {
-    let Some(parts) = decode_v2_inputs(request)? else {
+    let Some(parts) = extract_v2(request)? else {
         return Ok(VerifyOutcome::Missing);
     };
-    let V2Inputs {
+    let V2Fields {
+        ident: _,
         auth_challenge,
         peer_challenge,
         nt_response,
@@ -244,10 +246,11 @@ pub fn v2_success_response(
     request: &Request<'_>,
     expected_password: MsChapSecret<'_>,
 ) -> Result<Option<[u8; 42]>, AttributeError> {
-    let Some(parts) = decode_v2_inputs(request)? else {
+    let Some(parts) = extract_v2(request)? else {
         return Ok(None);
     };
-    let V2Inputs {
+    let V2Fields {
+        ident: _,
         auth_challenge,
         peer_challenge,
         nt_response,
@@ -310,16 +313,45 @@ pub fn v2_authenticator_response(
     out
 }
 
-/// Inputs shared between v2 verification and the `AuthenticatorResponse`
-/// computation. Borrows the username from the underlying packet buffer.
-struct V2Inputs<'a> {
-    auth_challenge: [u8; 16],
-    peer_challenge: [u8; 16],
-    nt_response: [u8; 24],
-    username: &'a [u8],
+/// Raw wire fields of an MS-CHAPv2 exchange.
+///
+/// Produced by [`extract_v2`] for callers that need to ship these
+/// bytes elsewhere (RPC to a backend identity store, EAP repackaging,
+/// …) rather than verify locally with [`verify_v2`] /
+/// [`v2_success_response`]. The struct borrows `username` from the
+/// underlying packet buffer.
+pub struct V2Fields<'a> {
+    /// `Ident` byte (offset 0 of `MS-CHAP2-Response`). The
+    /// Access-Accept reply's `MS-CHAP2-Success` VSA must echo this
+    /// byte before the `"S=<hex>"` authenticator string.
+    pub ident: u8,
+    /// 16-byte `AuthenticatorChallenge` from the `MS-CHAP-Challenge` VSA.
+    pub auth_challenge: [u8; 16],
+    /// 16-byte client-generated `PeerChallenge` from `MS-CHAP2-Response`.
+    pub peer_challenge: [u8; 16],
+    /// 24-byte NT-Response from `MS-CHAP2-Response`.
+    pub nt_response: [u8; 24],
+    /// `User-Name` with any `DOMAIN\` prefix removed, per RFC 2759 §8.2.
+    pub username: &'a [u8],
 }
 
-fn decode_v2_inputs<'a>(request: &Request<'a>) -> Result<Option<V2Inputs<'a>>, AttributeError> {
+/// Pull the raw MS-CHAPv2 wire fields out of an Access-Request.
+///
+/// Returns `Ok(None)` when any of `MS-CHAP-Challenge`,
+/// `MS-CHAP2-Response`, or `User-Name` is missing, or when one of the
+/// VSAs is present but the wrong length — i.e. this is not an
+/// MS-CHAPv2 request. Returns `Err` only on a malformed attribute
+/// list encountered before the relevant slots.
+///
+/// Use this in deployments that split extraction from verification
+/// (e.g. a RADIUS frontend forwards the fields to a backend identity
+/// service that holds the cleartext password). For all-in-one
+/// deployments prefer [`verify_v2`].
+///
+/// # Errors
+///
+/// Forwards [`AttributeError`] from the attribute list iterator.
+pub fn extract_v2<'a>(request: &Request<'a>) -> Result<Option<V2Fields<'a>>, AttributeError> {
     let Some(challenge) = first_ms_vsa(request, VT_MS_CHAP_CHALLENGE)? else {
         return Ok(None);
     };
@@ -333,6 +365,7 @@ fn decode_v2_inputs<'a>(request: &Request<'a>) -> Result<Option<V2Inputs<'a>>, A
         return Ok(None);
     };
 
+    let ident = response[MS_CHAP2_RESPONSE_IDENT_OFFSET];
     let mut auth_challenge = [0u8; 16];
     auth_challenge.copy_from_slice(challenge);
     let mut peer_challenge = [0u8; 16];
@@ -342,7 +375,8 @@ fn decode_v2_inputs<'a>(request: &Request<'a>) -> Result<Option<V2Inputs<'a>>, A
     let mut nt_response = [0u8; 24];
     nt_response.copy_from_slice(&response[MS_CHAP2_RESPONSE_NT_OFFSET..MS_CHAP2_RESPONSE_LEN]);
 
-    Ok(Some(V2Inputs {
+    Ok(Some(V2Fields {
+        ident,
         auth_challenge,
         peer_challenge,
         nt_response,
