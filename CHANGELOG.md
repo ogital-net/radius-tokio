@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `IssuedCertificate` debug output redacts private key material.
 - Access-Requests carrying EAP-Message require Message-Authenticator even
 	when the client permits legacy non-EAP requests without it.
 - Inbound packets with malformed attributes or incorrectly sized or duplicate

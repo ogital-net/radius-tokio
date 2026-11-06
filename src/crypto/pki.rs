@@ -197,7 +197,7 @@ unsafe impl Sync for Certificate {}
 ///
 /// [`issue_server`]: CertificateAuthority::issue_server
 /// [`issue_client`]: CertificateAuthority::issue_client
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IssuedCertificate {
     /// PEM-encoded chain: leaf followed by issuer CA. This is what
     /// you feed to `TlsContext::server_chain_pem` and what RFC 6614
@@ -211,6 +211,17 @@ pub struct IssuedCertificate {
     /// Byte length of the leaf within `chain_pem`. The leaf occupies
     /// `chain_pem[..leaf_len]`; the issuer CA occupies the remainder.
     leaf_len: usize,
+}
+
+impl std::fmt::Debug for IssuedCertificate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IssuedCertificate")
+            .field("chain_pem", &self.chain_pem)
+            .field("key_pem", &"[REDACTED]")
+            .field("leaf_len", &self.leaf_len)
+            .finish()
+    }
 }
 
 impl IssuedCertificate {
@@ -860,6 +871,19 @@ impl V3CtxStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issued_certificate_debug_redacts_private_key() {
+        let issued = IssuedCertificate {
+            chain_pem: Vec::new(),
+            key_pem: b"private-key-material".to_vec(),
+            leaf_len: 0,
+        };
+        let debug = format!("{issued:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("private-key-material"));
+        assert!(!debug.contains(&format!("{:?}", issued.key_pem)));
+    }
 
     #[test]
     fn generates_p256_key_and_round_trips_pem() {
