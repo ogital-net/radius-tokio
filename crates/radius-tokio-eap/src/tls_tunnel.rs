@@ -266,12 +266,14 @@ impl TlsTunnel {
     }
 
     /// Export the conventional 64-byte MSK + 64-byte EMSK pair
-    /// (RFC 5247 §1.2) under `label`, with an empty exporter
-    /// context. Every TLS-tunnelled method this crate ships uses
-    /// exactly this shape — only the label differs.
-    pub fn export_msk_emsk(&self, label: &str) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    /// (RFC 5247 §1.2) under `label` and an optional exporter context.
+    pub fn export_msk_emsk(
+        &self,
+        label: &str,
+        context: Option<&[u8]>,
+    ) -> Result<(Vec<u8>, Vec<u8>), Error> {
         let mut keymat = vec![0u8; MSK_LEN + EMSK_LEN];
-        self.export_keying_material(label, None, &mut keymat)?;
+        self.export_keying_material(label, context, &mut keymat)?;
         let emsk = keymat.split_off(MSK_LEN);
         debug!(event = "tls_tunnel_msk_derived", label = label);
         count!(crate::obs::metrics::MSK_DERIVATIONS);

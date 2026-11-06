@@ -217,7 +217,7 @@ impl<I: InnerEap> Peap<I> {
         } else {
             LABEL_TLS12
         };
-        self.tunnel.export_msk_emsk(label)
+        self.tunnel.export_msk_emsk(label, None)
     }
 
     /// Emit a `PEAPv0` `EAP-Request/TLV` carrying a Result-TLV.

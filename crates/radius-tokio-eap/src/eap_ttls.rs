@@ -435,7 +435,7 @@ impl<I: TtlsInner> EapTtls<I> {
     }
 
     fn export_msk_emsk(&self) -> Result<(Vec<u8>, Vec<u8>), Error> {
-        self.tunnel.export_msk_emsk(EXPORTER_LABEL)
+        self.tunnel.export_msk_emsk(EXPORTER_LABEL, None)
     }
 }
 

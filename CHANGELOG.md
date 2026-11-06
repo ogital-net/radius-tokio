@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- EAP-TLS 1.3 derives MSK and EMSK with the RFC 9190 EAP-Type exporter
+	context, matching conforming peers instead of deriving different session keys.
 - `ZeroizingBytes` debug output redacts decrypted passwords and key material.
 - Tunnel-Password and MPPE encryption salts are guaranteed unique within
 	each reply, retrying random collisions instead of reusing an encryption mask.

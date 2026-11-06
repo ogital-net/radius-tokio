@@ -36,9 +36,10 @@ use std::time::Duration;
 
 use radius_tokio::pki::{CertificateAuthority, SubjectAltName};
 use radius_tokio::server::{Client, IpCidr, Server, StaticClients};
-use radius_tokio::tls::TlsContext;
-use radius_tokio_eap::eap_tls::EapTlsFactory;
-use radius_tokio_eap::method::MethodFactory;
+use radius_tokio::tls::{TlsConnection, TlsContext};
+use radius_tokio_eap::eap_tls::{EapTls, EapTlsFactory};
+use radius_tokio_eap::framing::Frame;
+use radius_tokio_eap::method::{EapMethod, MethodFactory, MethodOutcome};
 use radius_tokio_eap::EapHandler;
 
 const SHARED_SECRET: &str = "testing123";
@@ -93,6 +94,62 @@ fn eapol_test_available() -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok()
+}
+
+async fn established_pair() -> (EapTls, TlsConnection) {
+    let pki = build_pki();
+    let server_ctx =
+        TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, &pki.ca_pem).unwrap();
+    let client_ctx =
+        TlsContext::client(&pki.client_chain_pem, &pki.client_key_pem, &pki.ca_pem).unwrap();
+    let mut method = EapTls::new(&server_ctx).unwrap().with_frame_mtu(usize::MAX);
+    let mut client = TlsConnection::connect(&client_ctx, "radius.test").unwrap();
+    assert!(matches!(
+        method.start(&[]).await.unwrap(),
+        MethodOutcome::Continue(_)
+    ));
+
+    for _ in 0..20 {
+        client.process().unwrap();
+        let mut ciphertext = vec![0u8; 64 * 1024];
+        let length = client.take_output(&mut ciphertext).unwrap();
+        let mut response = vec![0u8];
+        response.extend_from_slice(&ciphertext[..length]);
+        let MethodOutcome::Continue(request) = method.step(&response, &[]).await.unwrap() else {
+            panic!("EAP-TLS succeeded before the final acknowledgment");
+        };
+        let frame = Frame::parse(&request).unwrap();
+        assert!(!frame.flags.more_fragments());
+        client.feed_input(frame.payload).unwrap();
+        if !method.tls().is_handshaking() {
+            client.process().unwrap();
+            assert!(!client.is_handshaking());
+            assert!(client.is_tls13());
+            let mut commitment = [0xff];
+            assert_eq!(client.read(&mut commitment).unwrap(), 1);
+            assert_eq!(commitment, [0x00]);
+            return (method, client);
+        }
+    }
+    panic!("TLS handshake did not finish");
+}
+
+#[tokio::test]
+async fn eap_tls13_exports_rfc9190_keys() {
+    let (mut method, client) = established_pair().await;
+    let mut key_material = [0u8; 128];
+    client
+        .export_keying_material(
+            "EXPORTER_EAP_TLS_Key_Material",
+            Some(&[0x0d]),
+            &mut key_material,
+        )
+        .unwrap();
+    let MethodOutcome::Success { msk, emsk } = method.step(&[0], &[]).await.unwrap() else {
+        panic!("EAP-TLS did not succeed after the final acknowledgment");
+    };
+    assert_eq!(msk.as_slice(), &key_material[..64]);
+    assert_eq!(emsk.as_slice(), &key_material[64..]);
 }
 
 #[test]

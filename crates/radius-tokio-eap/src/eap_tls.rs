@@ -30,7 +30,8 @@
 //! Per RFC 5216 §2.3, the MSK on a TLS 1.2 connection is derived
 //! with the exporter label `"client EAP encryption"`. On TLS 1.3
 //! (RFC 9190 §2.3) the label changes to
-//! `"EXPORTER_EAP_TLS_Key_Material"`, and per RFC 9190 §2.5 the
+//! `"EXPORTER_EAP_TLS_Key_Material"` with the one-byte context `0x0D`,
+//! and per RFC 9190 §2.5 the
 //! server must additionally send a one-byte (0x00) protected
 //! "commitment" record over the established TLS session *before*
 //! the EAP-Success / MS-MPPE-Keys land in the Access-Accept. The
@@ -110,12 +111,11 @@ impl EapTls {
         // record-layer version:
         // * TLS 1.2 → RFC 5216 §2.3: "client EAP encryption".
         // * TLS 1.3 → RFC 9190 §2.3: "EXPORTER_EAP_TLS_Key_Material".
-        let label = if self.tunnel.tls().is_tls13() {
-            LABEL_TLS13
+        if self.tunnel.tls().is_tls13() {
+            self.tunnel.export_msk_emsk(LABEL_TLS13, Some(&[0x0d]))
         } else {
-            LABEL_TLS12
-        };
-        self.tunnel.export_msk_emsk(label)
+            self.tunnel.export_msk_emsk(LABEL_TLS12, None)
+        }
     }
 }
 
