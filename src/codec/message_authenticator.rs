@@ -201,14 +201,28 @@ pub fn compute(packet: &[u8], request_authenticator: &[u8; 16], secret: &[u8]) -
 /// the attribute as singular, and tolerating duplicates would let a
 /// peer pad in a valid tag plus an arbitrary second slot whose
 /// presence might confuse downstream attribute scanners.
+/// Malformed attributes, including incorrectly sized Message-Authenticator
+/// values, are also rejected rather than treated as absent.
 #[must_use]
 pub fn verify(packet: &[u8], request_authenticator: &[u8; 16], secret: &[u8]) -> Verification {
-    match count_value_offsets(packet) {
-        0 => return Verification::Absent,
-        1 => {}
-        _ => return Verification::Invalid,
+    if packet.len() < MIN_PACKET_LEN {
+        return Verification::Invalid;
     }
-    let Some(offset) = find_value_offset(packet) else {
+    let mut value_offset = None;
+    let mut offset = MIN_PACKET_LEN;
+    for attribute in super::attributes::iter(&packet[MIN_PACKET_LEN..]) {
+        let Ok(attribute) = attribute else {
+            return Verification::Invalid;
+        };
+        if attribute.attribute_type() == TYPE {
+            if attribute.wire_len() != TLV_LEN || value_offset.is_some() {
+                return Verification::Invalid;
+            }
+            value_offset = Some(offset + 2);
+        }
+        offset += usize::from(attribute.wire_len());
+    }
+    let Some(offset) = value_offset else {
         return Verification::Absent;
     };
     let computed = compute(packet, request_authenticator, secret);
@@ -363,6 +377,41 @@ mod tests {
         pkt2.extend_from_slice(&[80, 0xff]);
         let tag2 = compute(&pkt2, &[0u8; 16], b"secret");
         assert_eq!(tag2.len(), VALUE_LEN);
+    }
+
+    #[test]
+    fn verify_rejects_malformed_attributes_and_authenticator_lengths() {
+        for attributes in [
+            vec![TYPE],
+            vec![TYPE, 1],
+            vec![TYPE, 2],
+            vec![TYPE, 17, 0],
+            vec![TYPE, 19, 0],
+            vec![1],
+            vec![1, 0, TYPE, TLV_LEN],
+        ] {
+            let mut packet = vec![0; MIN_PACKET_LEN];
+            packet.extend_from_slice(&attributes);
+            assert_eq!(
+                verify(&packet, &[0; 16], b"secret"),
+                Verification::Invalid,
+                "malformed attributes: {attributes:?}"
+            );
+        }
+
+        for length in [2, 17, 19] {
+            let mut packet = PacketBuffer::new(Code::ACCESS_REQUEST, 1);
+            let offset = append_zeroed_slot(&mut packet).unwrap();
+            packet.add_attribute(TYPE, &vec![0; length - 2]).unwrap();
+            packet.patch_length();
+            let tag = compute(packet.as_bytes(), &[0; 16], b"secret");
+            patch(&mut packet, offset, &tag);
+            assert_eq!(
+                verify(packet.as_bytes(), &[0; 16], b"secret"),
+                Verification::Invalid,
+                "duplicate Message-Authenticator with length {length}"
+            );
+        }
     }
 
     #[test]

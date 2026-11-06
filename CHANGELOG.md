@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Inbound packets with malformed attributes or incorrectly sized or duplicate
+	Message-Authenticator attributes are rejected, including for legacy clients.
 - Invalid CoA replies no longer consume pending requests; they are silently
 	discarded until a valid reply arrives or the retry budget expires.
 - Cancelled exchanges reclaim identifiers, including queued RadSec writes.
