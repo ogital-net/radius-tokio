@@ -114,6 +114,8 @@ impl Client {
     /// The flag governs *only* the `Absent` case. A *present* but
     /// invalid Message-Authenticator is always rejected, regardless
     /// of this setting — RFC 3579 §3.2 leaves no room there.
+    /// Access-Request packets carrying EAP-Message always require
+    /// Message-Authenticator, even when this flag is `false`.
     ///
     /// Accounting-Request packets (RFC 2866) are not affected: they
     /// authenticate via the Request Authenticator over the packet
@@ -128,10 +130,10 @@ impl Client {
     /// Permit Access-Request packets from this client that omit
     /// Message-Authenticator.
     ///
-    /// **Insecure.** Without Message-Authenticator the packet is
-    /// authenticated only by `MD5(packet || secret)`, which is the
-    /// exact construction the `BlastRADIUS` family of attacks
-    /// (CVE-2024-3596) targets. Enable only for a specific NAS
+    /// **Insecure.** Without Message-Authenticator an Access-Request
+    /// has no packet integrity protection, and the MD5-based reply
+    /// authenticator is vulnerable to the `BlastRADIUS` family of
+    /// attacks (CVE-2024-3596). Enable only for a specific NAS
     /// whose firmware cannot be updated to emit the attribute, and
     /// keep its blast radius narrow — the flag is per-`Client`
     /// precisely so a single legacy device does not weaken the
@@ -139,6 +141,7 @@ impl Client {
     ///
     /// The verbose method name is deliberate; flipping this bit
     /// should be a conscious, audit-visible act.
+    /// This opt-out never applies to requests carrying EAP-Message.
     #[must_use]
     pub fn allow_missing_message_authenticator(mut self) -> Self {
         self.require_message_authenticator = false;

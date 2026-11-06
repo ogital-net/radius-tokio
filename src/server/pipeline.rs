@@ -99,7 +99,12 @@ pub(crate) fn validate<'a>(packet: &'a [u8], client: &Client) -> Validated<'a> {
             // installed base for no security gain.
             let strict_required = match header.code {
                 Code::STATUS_SERVER => true,
-                Code::ACCESS_REQUEST => client.require_message_authenticator(),
+                Code::ACCESS_REQUEST => {
+                    client.require_message_authenticator()
+                        || crate::codec::attributes::iter(attrs).any(|attribute| {
+                            attribute.is_ok_and(|attr| attr.attribute_type() == 79)
+                        })
+                }
                 _ => false,
             };
             if strict_required {
@@ -368,6 +373,38 @@ mod tests {
         match validate(&[1u8, 2, 3], &client) {
             Validated::MalformedHeader(_) => {}
             _ => panic!("expected MalformedHeader verdict"),
+        }
+    }
+
+    #[test]
+    fn legacy_clients_still_require_message_authenticator_for_eap() {
+        let client = Client::new(b"secret".as_slice()).allow_missing_message_authenticator();
+        let mut packet = PacketBuffer::new(Code::ACCESS_REQUEST, 7);
+        packet.add_attribute(1, b"alice").unwrap();
+        packet.patch_length();
+        assert!(matches!(
+            validate(packet.as_bytes(), &client),
+            Validated::Ok { .. }
+        ));
+
+        for eap in [b"".as_slice(), &[2, 1, 0, 5, 1]] {
+            let mut packet = PacketBuffer::new(Code::ACCESS_REQUEST, 7);
+            packet.add_attribute(1, b"alice").unwrap();
+            packet.add_attribute(79, eap).unwrap();
+            packet.patch_length();
+            assert!(matches!(
+                validate(packet.as_bytes(), &client),
+                Validated::MissingMessageAuthenticator { .. }
+            ));
+
+            let offset = message_authenticator::append_zeroed_slot(&mut packet).unwrap();
+            packet.patch_length();
+            let tag = message_authenticator::compute(packet.as_bytes(), &[0; 16], client.secret());
+            message_authenticator::patch(&mut packet, offset, &tag);
+            assert!(matches!(
+                validate(packet.as_bytes(), &client),
+                Validated::Ok { .. }
+            ));
         }
     }
 

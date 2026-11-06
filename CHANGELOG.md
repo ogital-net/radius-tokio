@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Access-Requests carrying EAP-Message require Message-Authenticator even
+	when the client permits legacy non-EAP requests without it.
 - Inbound packets with malformed attributes or incorrectly sized or duplicate
 	Message-Authenticator attributes are rejected, including for legacy clients.
 - Invalid CoA replies no longer consume pending requests; they are silently
