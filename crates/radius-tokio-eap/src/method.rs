@@ -130,6 +130,14 @@ pub trait EapMethod: Send {
     /// [`start`]: EapMethod::start
     fn notify_peer_identity(&mut self, _identity: &[u8]) {}
 
+    /// Identity authenticated by this method, read only after success.
+    ///
+    /// Returns `None` when no authenticated username is available. The
+    /// handler never substitutes the unverified outer EAP identity.
+    fn authenticated_identity(&self) -> Option<&[u8]> {
+        None
+    }
+
     /// Informational hook called by the handler adapter after it
     /// allocates the EAP `Identifier` byte for an outbound
     /// `EAP-Request` produced by [`start`] or [`step`]
@@ -216,6 +224,9 @@ impl<T: EapMethod + ?Sized> EapMethod for Box<T> {
     }
     fn notify_peer_identity(&mut self, identity: &[u8]) {
         (**self).notify_peer_identity(identity);
+    }
+    fn authenticated_identity(&self) -> Option<&[u8]> {
+        (**self).authenticated_identity()
     }
     fn notify_request_id(&mut self, eap_id: u8) {
         (**self).notify_request_id(eap_id);

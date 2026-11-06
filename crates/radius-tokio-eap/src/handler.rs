@@ -51,11 +51,12 @@ pub struct AcceptContext<'a> {
     /// this is the **inner** identity (e.g. the `MSCHAPv2` or PAP
     /// username) — not the outer `anonymous_identity` the
     /// supplicant sent in cleartext `User-Name`.
+    /// `None` for methods that do not provide a verified username,
+    /// including certificate-only EAP-TLS.
     pub peer_identity: Option<&'a [u8]>,
-    /// Outer `User-Name` attribute as the NAS sent it. For
-    /// EAP-MD5 / EAP-TLS this equals `peer_identity`; for tunnel
-    /// methods with `anonymous_identity` set, this is the
-    /// throwaway outer name (commonly `"anonymous"`).
+    /// Unverified outer `User-Name` attribute as the NAS sent it.
+    /// This may differ from `peer_identity` and must not be used
+    /// as an authenticated identity for authorization.
     pub user_name: Option<&'a [u8]>,
     /// EAP `Type` byte the session ultimately authenticated
     /// against. For [`MultiEapHandler`](crate::MultiEapHandler)
@@ -266,7 +267,7 @@ where
         MethodOutcome::Success { msk, emsk: _ } => Ok(Dispatch::Accept {
             eap_identifier: peer_eap_id,
             msk,
-            peer_identity: session.peer_identity.take(),
+            peer_identity: session.method.authenticated_identity().map(<[u8]>::to_vec),
             eap_type: method_typ,
         }),
         MethodOutcome::Failure => Ok(Dispatch::Reject {
@@ -476,5 +477,58 @@ pub(crate) async fn render_dispatch(
             HandlerResult::Reply(reply)
         }
         Dispatch::Drop => HandlerResult::Drop,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::method::MethodFuture;
+
+    struct IdentityMethod(Option<Vec<u8>>);
+
+    impl EapMethod for IdentityMethod {
+        fn typ(&self) -> EapType {
+            EapType::PEAP
+        }
+
+        fn authenticated_identity(&self) -> Option<&[u8]> {
+            self.0.as_deref()
+        }
+
+        fn start<'a>(&'a mut self, _: &'a [u8]) -> MethodFuture<'a> {
+            Box::pin(async { Ok(MethodOutcome::Failure) })
+        }
+
+        fn step<'a>(&'a mut self, _: &'a [u8], _: &'a [u8]) -> MethodFuture<'a> {
+            Box::pin(async { Ok(MethodOutcome::Failure) })
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_uses_authenticated_identity_not_outer_identity() {
+        for authenticated in [Some(b"alice".to_vec()), None] {
+            let method: crate::method::BoxedEapMethod =
+                Box::new(IdentityMethod(authenticated.clone()));
+            let mut session = Session::new(method);
+            session.peer_identity = Some(b"admin".to_vec());
+            let store = InMemorySessionStore::new();
+            let outcome = commit_outcome(
+                &store,
+                MethodOutcome::Success {
+                    msk: vec![],
+                    emsk: vec![],
+                },
+                session,
+                7,
+                EapType::PEAP,
+            )
+            .await
+            .unwrap();
+            let Dispatch::Accept { peer_identity, .. } = outcome else {
+                panic!("expected accept");
+            };
+            assert_eq!(peer_identity, authenticated);
+        }
     }
 }

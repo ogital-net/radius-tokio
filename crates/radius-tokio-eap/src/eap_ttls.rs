@@ -180,6 +180,11 @@ pub fn parse_avps(mut bytes: &[u8]) -> Result<Vec<Avp>, Error> {
 /// Multi-round inner exchanges (e.g. CHAP-challenge round-trips,
 /// tunneled EAP) are supported via [`TtlsInnerOutcome::Continue`].
 pub trait TtlsInner: Send {
+    /// Verified username to expose after the inner method succeeds.
+    fn authenticated_identity(&self) -> Option<&[u8]> {
+        None
+    }
+
     /// Process one decrypted batch of AVPs from the peer.
     ///
     /// `outer_attributes` is the raw attribute region of the
@@ -289,18 +294,26 @@ impl PapCredentials for StaticPapCredentials {
 /// §11.2.1); we strip the trailing NULs before verification.
 pub struct PapInner<C: PapCredentials> {
     creds: Arc<C>,
+    authenticated_username: Option<Vec<u8>>,
 }
 
 impl<C: PapCredentials> PapInner<C> {
     /// Wrap a credential store.
     #[must_use]
     pub fn new(creds: Arc<C>) -> Self {
-        Self { creds }
+        Self {
+            creds,
+            authenticated_username: None,
+        }
     }
 }
 
 #[allow(clippy::manual_async_fn)] // explicit `+ Send` bound on the RPITIT future
 impl<C: PapCredentials> TtlsInner for PapInner<C> {
+    fn authenticated_identity(&self) -> Option<&[u8]> {
+        self.authenticated_username.as_deref()
+    }
+
     fn process<'a>(
         &'a mut self,
         avps: &'a [Avp],
@@ -309,6 +322,7 @@ impl<C: PapCredentials> TtlsInner for PapInner<C> {
         async move {
             let mut user = None;
             let mut pass = None;
+            self.authenticated_username = None;
             for avp in avps {
                 if avp.vendor.is_some() {
                     continue;
@@ -329,6 +343,7 @@ impl<C: PapCredentials> TtlsInner for PapInner<C> {
             };
             let outer = Outer::new(outer_attributes);
             if self.creds.verify(&outer, user, trimmed).await {
+                self.authenticated_username = Some(user.to_vec());
                 Ok(TtlsInnerOutcome::Success)
             } else {
                 Ok(TtlsInnerOutcome::Failure)
@@ -419,6 +434,10 @@ impl<I: TtlsInner> EapTtls<I> {
 }
 
 impl<I: TtlsInner> EapMethod for EapTtls<I> {
+    fn authenticated_identity(&self) -> Option<&[u8]> {
+        self.inner.authenticated_identity()
+    }
+
     fn typ(&self) -> Type {
         Type::TTLS
     }
@@ -628,6 +647,7 @@ mod tests {
             TtlsInnerOutcome::Success => {}
             other => panic!("expected Success, got {other:?}"),
         }
+        assert_eq!(inner.authenticated_identity(), Some(b"alice".as_slice()));
     }
 
     #[tokio::test]
@@ -652,5 +672,6 @@ mod tests {
             TtlsInnerOutcome::Failure => {}
             other => panic!("expected Failure, got {other:?}"),
         }
+        assert_eq!(inner.authenticated_identity(), None);
     }
 }

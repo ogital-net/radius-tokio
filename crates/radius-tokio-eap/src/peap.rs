@@ -248,6 +248,10 @@ impl<I: InnerEap> EapMethod for Peap<I> {
         Type::PEAP
     }
 
+    fn authenticated_identity(&self) -> Option<&[u8]> {
+        self.inner.authenticated_identity()
+    }
+
     fn start<'a>(&'a mut self, _outer_attributes: &'a [u8]) -> crate::method::MethodFuture<'a> {
         Box::pin(async move {
             // RFC 5216 §3.2 / PEAP §2.1: server-issued Start frame is

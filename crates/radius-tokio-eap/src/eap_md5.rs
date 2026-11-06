@@ -159,6 +159,10 @@ impl<C: Credentials> EapMethod for EapMd5<C> {
         EapType::MD5_CHALLENGE
     }
 
+    fn authenticated_identity(&self) -> Option<&[u8]> {
+        Some(&self.username)
+    }
+
     fn notify_peer_identity(&mut self, identity: &[u8]) {
         // Only the first identity sticks; subsequent notifications
         // (the handler currently emits exactly one) are ignored.

@@ -230,6 +230,7 @@ pub struct MsChapV2Server<C: Credentials> {
     server_name: Vec<u8>,
     state: State,
     eap_id: u8,
+    authenticated_username: Option<Vec<u8>>,
 }
 
 #[cfg(feature = "peap")]
@@ -249,6 +250,7 @@ impl<C: Credentials> MsChapV2Server<C> {
             server_name,
             state: State::AwaitingIdentity,
             eap_id: 1,
+            authenticated_username: None,
         }
     }
 
@@ -262,6 +264,10 @@ impl<C: Credentials> MsChapV2Server<C> {
 #[cfg(feature = "peap")]
 #[allow(clippy::manual_async_fn)] // explicit `+ Send` bound on the RPITIT future
 impl<C: Credentials> InnerEap for MsChapV2Server<C> {
+    fn authenticated_identity(&self) -> Option<&[u8]> {
+        self.authenticated_username.as_deref()
+    }
+
     fn start<'a>(
         &'a mut self,
         _outer_attributes: &'a [u8],
@@ -354,6 +360,7 @@ impl<C: Credentials> InnerEap for MsChapV2Server<C> {
                         username,
                         secret.as_mschap(),
                     );
+                    self.authenticated_username = Some(username.clone());
                     let ms_id = self.eap_id;
                     let eap_id = self.next_id();
                     let frame = build_success(eap_id, ms_id, &auth_resp);
@@ -636,6 +643,10 @@ impl<C: Credentials> EapMsChapV2<C> {
 impl<C: Credentials> EapMethod for EapMsChapV2<C> {
     fn typ(&self) -> EapType {
         EapType::MSCHAPV2
+    }
+
+    fn authenticated_identity(&self) -> Option<&[u8]> {
+        Some(&self.username)
     }
 
     fn notify_peer_identity(&mut self, identity: &[u8]) {

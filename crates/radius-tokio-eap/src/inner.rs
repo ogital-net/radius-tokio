@@ -39,6 +39,11 @@ use crate::Error;
 /// session terminates. They are `Send` so that the outer handler
 /// can move them across `.await` points; they need not be `Sync`.
 pub trait InnerEap: Send {
+    /// Verified username to expose after the inner method succeeds.
+    fn authenticated_identity(&self) -> Option<&[u8]> {
+        None
+    }
+
     /// Build the first inner EAP packet the server sends right
     /// after the TLS handshake completes.
     ///
