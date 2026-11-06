@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Public MS-CHAPv2 field extraction for backend verification, including the
+	MS-CHAP identifier needed for success replies (with the `server` feature).
 - MPPE key decryption with retained request authenticators for verified client
 	responses, reusing the existing zeroizing salted-MD5 implementation.
 - Independent `server` (default) and `client` roles sharing protocol and crypto.

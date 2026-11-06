@@ -182,14 +182,15 @@ pub fn verify_v2(
     request: &Request<'_>,
     expected_password: MsChapSecret<'_>,
 ) -> Result<VerifyOutcome, AttributeError> {
-    let Some(parts) = decode_v2_inputs(request)? else {
+    let Some(parts) = extract_v2(request)? else {
         return Ok(VerifyOutcome::Missing);
     };
-    let V2Inputs {
+    let V2Fields {
         auth_challenge,
         peer_challenge,
         nt_response,
         username,
+        ..
     } = parts;
 
     let expected = v2_nt_response(
@@ -237,8 +238,8 @@ pub fn v2_nt_response(
 /// successful authentication.
 ///
 /// The returned 42-byte value is the ASCII string `"S="` followed by
-/// 40 uppercase hex characters; place it in the `MS-CHAP2-Success` VSA
-/// of the Access-Accept reply.
+/// 40 uppercase hex characters. Prefix it with [`V2Fields::ident`] from
+/// [`extract_v2`] when writing the Access-Accept's `MS-CHAP2-Success` VSA.
 ///
 /// Returns `Ok(None)` if any of the attributes the function needs are
 /// missing or malformed; the caller should normally have already
@@ -253,14 +254,15 @@ pub fn v2_success_response(
     request: &Request<'_>,
     expected_password: MsChapSecret<'_>,
 ) -> Result<Option<[u8; 42]>, AttributeError> {
-    let Some(parts) = decode_v2_inputs(request)? else {
+    let Some(parts) = extract_v2(request)? else {
         return Ok(None);
     };
-    let V2Inputs {
+    let V2Fields {
         auth_challenge,
         peer_challenge,
         nt_response,
         username,
+        ..
     } = parts;
 
     Ok(Some(v2_authenticator_response(
@@ -319,18 +321,42 @@ pub fn v2_authenticator_response(
     out
 }
 
-/// Inputs shared between v2 verification and the `AuthenticatorResponse`
-/// computation. Borrows the username from the underlying packet buffer.
+/// Parsed bare-RADIUS MS-CHAPv2 fields for local or backend verification.
+///
+/// Extraction does not authenticate these fields. The username borrows the
+/// request's attribute buffer; challenge and response arrays are owned copies.
 #[cfg(feature = "server")]
-struct V2Inputs<'a> {
-    auth_challenge: [u8; 16],
-    peer_challenge: [u8; 16],
-    nt_response: [u8; 24],
-    username: &'a [u8],
+pub struct V2Fields<'a> {
+    /// MS-CHAP identifier from `MS-CHAP2-Response`, not the RADIUS identifier.
+    /// Prefix the `MS-CHAP2-Success` authenticator string with this byte.
+    pub ident: u8,
+    /// Authenticator challenge from the `MS-CHAP-Challenge` VSA.
+    pub auth_challenge: [u8; 16],
+    /// Peer challenge from the `MS-CHAP2-Response` VSA.
+    pub peer_challenge: [u8; 16],
+    /// NT-Response from the `MS-CHAP2-Response` VSA, not yet verified.
+    pub nt_response: [u8; 24],
+    /// Username with any `DOMAIN\` prefix removed for RFC 2759 hashing.
+    /// For domain-sensitive identity lookup, obtain the original value via
+    /// [`AttributesView::user_name`] on the request instead.
+    pub username: &'a [u8],
 }
 
+/// Extract bare-RADIUS MS-CHAPv2 fields without verifying credentials.
+///
+/// Use this to forward an exchange to a backend identity service instead of
+/// parsing the Microsoft VSAs again. For local verification, use [`verify_v2`].
+/// This parses RADIUS VSAs, not an EAP-MSCHAPv2 payload.
+///
+/// Returns `Ok(None)` when a required VSA or User-Name is missing, or when
+/// the challenge or response has the wrong length. The returned username is
+/// domain-stripped; preserve the original identity separately when needed.
+///
+/// # Errors
+/// Forwards [`AttributeError`] for malformed attribute lists encountered
+/// while locating the required fields. This is not a full-packet validator.
 #[cfg(feature = "server")]
-fn decode_v2_inputs<'a>(request: &Request<'a>) -> Result<Option<V2Inputs<'a>>, AttributeError> {
+pub fn extract_v2<'a>(request: &Request<'a>) -> Result<Option<V2Fields<'a>>, AttributeError> {
     let Some(challenge) = first_ms_vsa(request, VT_MS_CHAP_CHALLENGE)? else {
         return Ok(None);
     };
@@ -353,7 +379,8 @@ fn decode_v2_inputs<'a>(request: &Request<'a>) -> Result<Option<V2Inputs<'a>>, A
     let mut nt_response = [0u8; 24];
     nt_response.copy_from_slice(&response[MS_CHAP2_RESPONSE_NT_OFFSET..MS_CHAP2_RESPONSE_LEN]);
 
-    Ok(Some(V2Inputs {
+    Ok(Some(V2Fields {
+        ident: response[0],
         auth_challenge,
         peer_challenge,
         nt_response,
@@ -558,6 +585,106 @@ mod tests {
         attrs.extend_from_slice(&ms_vsa(VT_MS_CHAP_CHALLENGE, &AUTH_CHALLENGE));
         attrs.extend_from_slice(&ms_vsa(VT_MS_CHAP2_RESPONSE, &build_v2_response_field()));
         attrs
+    }
+
+    #[test]
+    fn extract_v2_returns_fields_and_mschap_identifier() {
+        let mut response = build_v2_response_field();
+        response[0] = 0xa7;
+        let mut attrs = attr(USER_NAME_TYPE, USER_NAME);
+        attrs.extend_from_slice(&ms_vsa(VT_MS_CHAP_CHALLENGE, &AUTH_CHALLENGE));
+        attrs.extend_from_slice(&ms_vsa(VT_MS_CHAP2_RESPONSE, &response));
+        let client = Arc::new(Client::new(b"unused".as_slice()));
+        let request = make_request(&client, &attrs);
+        let fields = extract_v2(&request).unwrap().unwrap();
+        assert_eq!(fields.ident, 0xa7);
+        assert_ne!(fields.ident, request.identifier());
+        assert_eq!(fields.auth_challenge, AUTH_CHALLENGE);
+        assert_eq!(fields.peer_challenge, PEER_CHALLENGE);
+        assert_eq!(fields.nt_response, NT_RESPONSE);
+        assert_eq!(fields.username, USER_NAME);
+
+        let expected = v2_nt_response(
+            &fields.auth_challenge,
+            &fields.peer_challenge,
+            fields.username,
+            MsChapSecret::Cleartext(PASSWORD),
+        );
+        assert_eq!(expected, fields.nt_response);
+        let mut success = [0; 43];
+        success[0] = fields.ident;
+        success[1..].copy_from_slice(&v2_authenticator_response(
+            &fields.auth_challenge,
+            &fields.peer_challenge,
+            &fields.nt_response,
+            fields.username,
+            MsChapSecret::Cleartext(PASSWORD),
+        ));
+        assert_eq!(success[0], 0xa7);
+        assert_eq!(&success[1..], AUTH_RESPONSE);
+    }
+
+    #[test]
+    fn extract_v2_strips_domain_but_preserves_original_request_identity() {
+        let mut attrs = attr(USER_NAME_TYPE, b"CORP\\User");
+        attrs.extend_from_slice(&ms_vsa(VT_MS_CHAP_CHALLENGE, &AUTH_CHALLENGE));
+        attrs.extend_from_slice(&ms_vsa(VT_MS_CHAP2_RESPONSE, &build_v2_response_field()));
+        let client = Arc::new(Client::new(b"unused".as_slice()));
+        let request = make_request(&client, &attrs);
+        let fields = extract_v2(&request).unwrap().unwrap();
+        assert_eq!(fields.username, USER_NAME);
+        assert_eq!(request.user_name(), Some(b"CORP\\User".as_slice()));
+    }
+
+    #[test]
+    fn extract_v2_returns_none_for_missing_fields() {
+        let username = attr(USER_NAME_TYPE, USER_NAME);
+        let challenge = ms_vsa(VT_MS_CHAP_CHALLENGE, &AUTH_CHALLENGE);
+        let response = ms_vsa(VT_MS_CHAP2_RESPONSE, &build_v2_response_field());
+        let client = Arc::new(Client::new(b"unused".as_slice()));
+        for attrs in [
+            Vec::new(),
+            username.clone(),
+            challenge.clone(),
+            response.clone(),
+            [challenge.clone(), response.clone()].concat(),
+            [username.clone(), challenge].concat(),
+            [username, response].concat(),
+        ] {
+            let request = make_request(&client, &attrs);
+            assert!(extract_v2(&request).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn extract_v2_returns_none_for_wrong_vsa_lengths() {
+        let client = Arc::new(Client::new(b"unused".as_slice()));
+        for (challenge_length, response_length) in [
+            (0, 50),
+            (8, 50),
+            (15, 50),
+            (17, 50),
+            (16, 0),
+            (16, 49),
+            (16, 51),
+        ] {
+            let mut attrs = attr(USER_NAME_TYPE, USER_NAME);
+            attrs.extend_from_slice(&ms_vsa(VT_MS_CHAP_CHALLENGE, &vec![0; challenge_length]));
+            attrs.extend_from_slice(&ms_vsa(VT_MS_CHAP2_RESPONSE, &vec![0; response_length]));
+            let request = make_request(&client, &attrs);
+            assert!(extract_v2(&request).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn extract_v2_propagates_malformed_attribute_errors() {
+        let attrs = [vec![VSA_TYPE, 1], build_v2_attrs()].concat();
+        let client = Arc::new(Client::new(b"unused".as_slice()));
+        let request = make_request(&client, &attrs);
+        assert!(matches!(
+            extract_v2(&request),
+            Err(AttributeError::LengthUnderflow { length: 1 })
+        ));
     }
 
     #[test]
