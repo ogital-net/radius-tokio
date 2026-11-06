@@ -47,11 +47,16 @@ impl Response {
         secret: &[u8],
     ) -> Option<Self> {
         let (header, attrs) = Header::parse(packet).ok()?;
-        if header.identifier != identifier
-            || !matches_reply(request_code, header.code)
-            || attributes::iter(attrs).any(|attribute| attribute.is_err())
-        {
+        if header.identifier != identifier || !matches_reply(request_code, header.code) {
             return None;
+        }
+        for attribute in attributes::iter(attrs) {
+            let attribute = attribute.ok()?;
+            if attribute.attribute_type() == message_authenticator::TYPE
+                && attribute.value().len() != message_authenticator::VALUE_LEN
+            {
+                return None;
+            }
         }
         let packet = &packet[..usize::from(header.length)];
         if !authenticator::verify_response(packet, request_authenticator, secret) {
@@ -158,5 +163,26 @@ mod tests {
             b"secret"
         )
         .is_some());
+    }
+
+    #[test]
+    fn rejects_accounting_with_malformed_message_authenticator() {
+        for length in [0, 15, 16, 17] {
+            let mut reply =
+                Reply::new(Code::ACCOUNTING_RESPONSE, 7).without_message_authenticator();
+            reply.add_attribute(80, &vec![0; length]).unwrap();
+            let packet = reply.seal_for(&[3; 16], b"secret");
+            assert!(
+                Response::verify(
+                    packet.as_bytes(),
+                    Code::ACCOUNTING_REQUEST,
+                    7,
+                    &[3; 16],
+                    b"secret"
+                )
+                .is_none(),
+                "accepted a {length}-byte Message-Authenticator"
+            );
+        }
     }
 }
