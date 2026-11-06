@@ -17,15 +17,13 @@
 //!
 //! # Sweep
 //!
-//! Expired entries are evicted lazily during `insert` (we sweep the
-//! shard we're already locking). Lookups never sweep — under sustained
-//! traffic with few duplicates, every packet is a miss followed by an
-//! insert, so sweeping on both halves would do the O(n) walk twice per
-//! packet for no benefit. The cache is bounded by lifetime, not
+//! Expired entries are indexed by deadline and evicted lazily during
+//! `insert`, with a fixed cleanup budget per insertion. Unexpired
+//! entries are never scanned. The cache is bounded by lifetime, not
 //! cardinality. Operators that need a hard cap should layer a rate
 //! limiter on top.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, Weak};
@@ -35,7 +33,7 @@ use std::time::{Duration, Instant};
 use crate::obs::metrics;
 
 /// The four-tuple a RADIUS dedup cache keys on (RFC 5080 §2.2.2).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Key {
     pub src: SocketAddr,
     pub code: u8,
@@ -49,6 +47,28 @@ struct Entry {
     expires_at: Instant,
 }
 
+#[derive(Debug, Default)]
+struct ReplyShard {
+    entries: HashMap<Key, Entry>,
+    expirations: BTreeSet<(Instant, Key)>,
+}
+
+impl ReplyShard {
+    fn evict_expired(&mut self, now: Instant) {
+        for _ in 0..64 {
+            let Some((deadline, _)) = self.expirations.first() else {
+                break;
+            };
+            if *deadline > now {
+                break;
+            }
+            if let Some((_, key)) = self.expirations.pop_first() {
+                self.entries.remove(&key);
+            }
+        }
+    }
+}
+
 /// Number of shards. 16 is plenty for the throughput levels this
 /// crate targets and keeps the per-shard map small.
 const SHARD_COUNT: usize = 16;
@@ -57,7 +77,7 @@ const SHARD_MASK: usize = SHARD_COUNT - 1;
 /// Bounded-lifetime, sharded dedup + retransmit cache.
 #[derive(Debug)]
 pub(crate) struct DedupCache {
-    shards: [Mutex<HashMap<Key, Entry>>; SHARD_COUNT],
+    shards: [Mutex<ReplyShard>; SHARD_COUNT],
     in_flight: [Mutex<HashMap<Key, Weak<tokio::sync::Mutex<()>>>>; SHARD_COUNT],
     ttl: Duration,
 }
@@ -66,7 +86,7 @@ impl DedupCache {
     /// Construct a new cache with the given entry TTL.
     pub(crate) fn new(ttl: Duration) -> Self {
         Self {
-            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            shards: std::array::from_fn(|_| Mutex::new(ReplyShard::default())),
             in_flight: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             ttl,
         }
@@ -114,11 +134,13 @@ impl DedupCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
-        if let Some(entry) = shard.get(key) {
+        if let Some(entry) = shard.entries.get(key) {
             if entry.expires_at > now {
                 return Some(Arc::clone(&entry.reply));
             }
-            shard.remove(key);
+            let expires_at = entry.expires_at;
+            shard.entries.remove(key);
+            shard.expirations.remove(&(expires_at, key.clone()));
         }
         None
     }
@@ -130,16 +152,20 @@ impl DedupCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
-        // Sweep before insert so an active source doesn't grow the
-        // shard unboundedly between misses.
-        shard.retain(|_, e| e.expires_at > now);
-        shard.insert(
-            key,
+        shard.evict_expired(now);
+        let expires_at = now + self.ttl;
+        if let Some(previous) = shard.entries.insert(
+            key.clone(),
             Entry {
                 reply: Arc::from(reply),
-                expires_at: now + self.ttl,
+                expires_at,
             },
-        );
+        ) {
+            shard
+                .expirations
+                .remove(&(previous.expires_at, key.clone()));
+        }
+        shard.expirations.insert((expires_at, key));
         // Gauge the just-locked shard's size as a cheap proxy for
         // load. Summing all shards on every insert would defeat the
         // point of sharding; this gives a per-shard signal that scales
@@ -147,7 +173,7 @@ impl DedupCache {
         #[cfg(feature = "metrics")]
         {
             #[allow(clippy::cast_precision_loss)]
-            let len = shard.len() as f64;
+            let len = shard.entries.len() as f64;
             gauge!(metrics::DEDUP_CACHE_SIZE, len, "shard" => idx.to_string());
         }
     }
@@ -155,7 +181,10 @@ impl DedupCache {
     /// Test-only: total live entries across every shard.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.shards.iter().map(|s| s.lock().unwrap().len()).sum()
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().unwrap().entries.len())
+            .sum()
     }
 }
 
@@ -198,6 +227,48 @@ mod tests {
         cache.insert(key(2), b"b");
         assert_eq!(&*cache.lookup(&key(1)).unwrap(), b"a");
         assert_eq!(&*cache.lookup(&key(2)).unwrap(), b"b");
+    }
+
+    #[test]
+    fn refresh_keeps_one_expiration_per_reply() {
+        let cache = DedupCache::new(Duration::from_secs(30));
+        for _ in 0..100 {
+            cache.insert(key(1), b"latest reply");
+        }
+        let shard = cache.shards[DedupCache::shard_for(&key(1))].lock().unwrap();
+        assert_eq!(shard.entries.len(), 1);
+        assert_eq!(shard.expirations.len(), 1);
+        assert!(shard
+            .expirations
+            .contains(&(shard.entries[&key(1)].expires_at, key(1))));
+    }
+
+    #[test]
+    fn expiration_cleanup_is_bounded_and_preserves_live_replies() {
+        let mut shard = ReplyShard::default();
+        let now = Instant::now();
+        for identifier in 0..129 {
+            let expires_at = if identifier == 128 {
+                now + Duration::from_secs(30)
+            } else {
+                now
+            };
+            shard.entries.insert(
+                key(identifier),
+                Entry {
+                    reply: Arc::from(b"reply".as_slice()),
+                    expires_at,
+                },
+            );
+            shard.expirations.insert((expires_at, key(identifier)));
+        }
+        shard.evict_expired(now);
+        assert_eq!(shard.entries.len(), 65);
+        assert_eq!(shard.expirations.len(), 65);
+        shard.evict_expired(now);
+        assert_eq!(shard.entries.len(), 1);
+        assert!(shard.entries.contains_key(&key(128)));
+        assert_eq!(shard.expirations.len(), 1);
     }
 
     #[tokio::test]
