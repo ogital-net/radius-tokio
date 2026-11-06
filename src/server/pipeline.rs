@@ -250,6 +250,7 @@ pub(crate) async fn dispatch_validated<H: Handler>(
         identifier: header.identifier,
         request_authenticator: header.authenticator,
     };
+    let _reservation = cache.lock_request(&dedup_key).await;
     if let Some(cached) = cache.lookup(&dedup_key) {
         return Dispatched::Replay {
             bytes: cached,
@@ -416,5 +417,62 @@ mod tests {
             &[0u8; 32],
             b"secret",
         ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_retransmit_replays_one_handler_result() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Semaphore;
+
+        struct SlowHandler {
+            calls: AtomicUsize,
+            entered: Semaphore,
+            release: Semaphore,
+        }
+
+        impl Handler for SlowHandler {
+            async fn handle(&self, request: Request<'_>) -> HandlerResult {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.entered.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+                HandlerResult::Reply(request.reply(Code::ACCESS_ACCEPT))
+            }
+        }
+
+        let handler = SlowHandler {
+            calls: AtomicUsize::new(0),
+            entered: Semaphore::new(0),
+            release: Semaphore::new(0),
+        };
+        let cache = DedupCache::new(std::time::Duration::from_secs(30));
+        let client = Arc::new(Client::new(b"secret".as_slice()));
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let local = "127.0.0.1:1812".parse().unwrap();
+        let header = Header {
+            code: Code::ACCESS_REQUEST,
+            identifier: 7,
+            authenticator: [0x42; 16],
+            length: 20,
+        };
+        let first = dispatch_validated(
+            header.clone(),
+            &[],
+            peer,
+            local,
+            &client,
+            &handler,
+            &cache,
+            None,
+        );
+        let second = dispatch_validated(header, &[], peer, local, &client, &handler, &cache, None);
+        let release = async {
+            handler.entered.acquire().await.unwrap().forget();
+            handler.release.add_permits(2);
+        };
+        let (first, second, ()) = tokio::join!(biased; first, second, release);
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.bytes(), second.bytes());
+        assert!(matches!(first, Dispatched::Reply { .. }));
+        assert!(matches!(second, Dispatched::Replay { .. }));
     }
 }

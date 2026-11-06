@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 #[allow(unused_imports)] // unused when the `metrics` feature is off
@@ -58,6 +58,7 @@ const SHARD_MASK: usize = SHARD_COUNT - 1;
 #[derive(Debug)]
 pub(crate) struct DedupCache {
     shards: [Mutex<HashMap<Key, Entry>>; SHARD_COUNT],
+    in_flight: [Mutex<HashMap<Key, Weak<tokio::sync::Mutex<()>>>>; SHARD_COUNT],
     ttl: Duration,
 }
 
@@ -66,6 +67,7 @@ impl DedupCache {
     pub(crate) fn new(ttl: Duration) -> Self {
         Self {
             shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            in_flight: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             ttl,
         }
     }
@@ -79,6 +81,24 @@ impl DedupCache {
         #[allow(clippy::cast_possible_truncation)]
         let bucket = h.finish() as usize;
         bucket & SHARD_MASK
+    }
+
+    /// Serialize processing of one request key, releasing on cancellation.
+    pub(crate) async fn lock_request(&self, key: &Key) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = {
+            let mut shard = self.in_flight[Self::shard_for(key)]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            shard.retain(|_, gate| gate.strong_count() > 0);
+            if let Some(gate) = shard.get(key).and_then(Weak::upgrade) {
+                gate
+            } else {
+                let gate = Arc::new(tokio::sync::Mutex::new(()));
+                shard.insert(key.clone(), Arc::downgrade(&gate));
+                gate
+            }
+        };
+        gate.lock_owned().await
     }
 
     /// Look up a cached reply. Returns `None` on miss or expiry.
@@ -178,5 +198,33 @@ mod tests {
         cache.insert(key(2), b"b");
         assert_eq!(&*cache.lookup(&key(1)).unwrap(), b"a");
         assert_eq!(&*cache.lookup(&key(2)).unwrap(), b"b");
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_request_reservation() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let cache = DedupCache::new(Duration::from_secs(30));
+        let request_key = key(1);
+        let owner = cache.lock_request(&request_key).await;
+        let mut waiter = Box::pin(cache.lock_request(&request_key));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        drop(owner);
+        let next = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("reservation must release on cancellation");
+        drop(next);
+        let _other = cache.lock_request(&key(2)).await;
+        let retained: usize = cache
+            .in_flight
+            .iter()
+            .map(|shard| shard.lock().unwrap().len())
+            .sum();
+        assert!(retained <= 2);
     }
 }
