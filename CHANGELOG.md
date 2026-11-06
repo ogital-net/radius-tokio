@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `MsChapSecret` debug output redacts cleartext passwords and NT hashes;
+	temporary Tunnel-Password and MPPE encryption plaintext is scrubbed on drop.
 - EAP-TLS rejects TLS contexts that do not require and validate client
 	certificates, preventing authentication without a client certificate.
 - TTLS-PAP rejects duplicate credential AVPs and unsupported mandatory AVPs

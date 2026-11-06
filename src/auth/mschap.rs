@@ -79,13 +79,22 @@ const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 /// Identity stores that keep the NT hash directly should prefer
 /// [`Self::NtHash`]; stores that keep cleartext can pass
 /// [`Self::Cleartext`] and let the helper derive the hash.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub enum MsChapSecret<'a> {
     /// Cleartext password, interpreted as UTF-8. Re-encoded as
     /// UTF-16LE and MD4-hashed to derive the NT password hash.
     Cleartext(&'a str),
     /// Pre-computed NT password hash (MD4 of UTF-16LE password).
     NtHash(&'a [u8; 16]),
+}
+
+impl std::fmt::Debug for MsChapSecret<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Cleartext(_) => "Cleartext([REDACTED])",
+            Self::NtHash(_) => "NtHash([REDACTED])",
+        })
+    }
 }
 
 impl MsChapSecret<'_> {
@@ -477,6 +486,18 @@ fn first_ms_vsa<'a>(
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_debug_redacts_password_and_nt_hash() {
+        assert_eq!(
+            format!("{:?}", MsChapSecret::Cleartext("private-password")),
+            "Cleartext([REDACTED])"
+        );
+        assert_eq!(
+            format!("{:?}", MsChapSecret::NtHash(&[0x55; 16])),
+            "NtHash([REDACTED])"
+        );
+    }
     use crate::codec::header::Code;
     use crate::server::Client;
     use std::sync::Arc;

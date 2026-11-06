@@ -193,12 +193,12 @@ fn tunnel_password_encrypt_with_salt(
     // Plaintext = [1-byte password length] || password || zero padding,
     // rounded up to a multiple of 16 bytes.
     let plaintext_len = (1 + password.len()).div_ceil(16) * 16;
-    let mut plaintext = vec![0u8; plaintext_len];
+    let mut plaintext = super::ZeroizingBytes::new(vec![0u8; plaintext_len]);
     // SAFETY: assert above ensures password.len() < TUNNEL_CIPHERTEXT_MAX (240), which fits in u8.
     #[allow(clippy::cast_possible_truncation)]
     let len_byte = password.len() as u8;
-    plaintext[0] = len_byte;
-    plaintext[1..=password.len()].copy_from_slice(password);
+    plaintext.as_mut_bytes()[0] = len_byte;
+    plaintext.as_mut_bytes()[1..=password.len()].copy_from_slice(password);
 
     let mut out = vec![0u8; plaintext_len];
 
