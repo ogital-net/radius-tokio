@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- EAP-TLS requires fragment and final acknowledgments in the correct states,
+	rejects peer TLS records or closure at completion, and cannot succeed after failure.
 - EAP-TLS 1.3 derives MSK and EMSK with the RFC 9190 EAP-Type exporter
 	context, matching conforming peers instead of deriving different session keys.
 - `ZeroizingBytes` debug output redacts decrypted passwords and key material.

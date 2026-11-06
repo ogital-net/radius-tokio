@@ -38,7 +38,7 @@ use radius_tokio::pki::{CertificateAuthority, SubjectAltName};
 use radius_tokio::server::{Client, IpCidr, Server, StaticClients};
 use radius_tokio::tls::{TlsConnection, TlsContext};
 use radius_tokio_eap::eap_tls::{EapTls, EapTlsFactory};
-use radius_tokio_eap::framing::Frame;
+use radius_tokio_eap::framing::{Frame, Reassembler};
 use radius_tokio_eap::method::{EapMethod, MethodFactory, MethodOutcome};
 use radius_tokio_eap::EapHandler;
 
@@ -96,13 +96,32 @@ fn eapol_test_available() -> bool {
         .is_ok()
 }
 
-async fn established_pair() -> (EapTls, TlsConnection) {
+async fn server_tls_flight(method: &mut EapTls, response: &[u8]) -> Vec<u8> {
+    let mut reassembler = Reassembler::new();
+    let mut next_response = response;
+    for _ in 0..1024 {
+        let MethodOutcome::Continue(request) = method.step(next_response, &[]).await.unwrap()
+        else {
+            panic!("EAP-TLS succeeded before the final acknowledgment");
+        };
+        let frame = Frame::parse(&request).unwrap();
+        if reassembler.push(&frame).unwrap() {
+            assert!(!frame.flags.more_fragments());
+            return reassembler.take();
+        }
+        assert!(frame.flags.more_fragments());
+        next_response = &[0];
+    }
+    panic!("TLS flight did not finish");
+}
+
+async fn client_finished_pair(frame_mtu: usize) -> (EapTls, TlsConnection, Vec<u8>) {
     let pki = build_pki();
     let server_ctx =
         TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, &pki.ca_pem).unwrap();
     let client_ctx =
         TlsContext::client(&pki.client_chain_pem, &pki.client_key_pem, &pki.ca_pem).unwrap();
-    let mut method = EapTls::new(&server_ctx).unwrap().with_frame_mtu(usize::MAX);
+    let mut method = EapTls::new(&server_ctx).unwrap().with_frame_mtu(frame_mtu);
     let mut client = TlsConnection::connect(&client_ctx, "radius.test").unwrap();
     assert!(matches!(
         method.start(&[]).await.unwrap(),
@@ -111,27 +130,30 @@ async fn established_pair() -> (EapTls, TlsConnection) {
 
     for _ in 0..20 {
         client.process().unwrap();
-        let mut ciphertext = vec![0u8; 64 * 1024];
-        let length = client.take_output(&mut ciphertext).unwrap();
-        let mut response = vec![0u8];
-        response.extend_from_slice(&ciphertext[..length]);
-        let MethodOutcome::Continue(request) = method.step(&response, &[]).await.unwrap() else {
-            panic!("EAP-TLS succeeded before the final acknowledgment");
-        };
-        let frame = Frame::parse(&request).unwrap();
-        assert!(!frame.flags.more_fragments());
-        client.feed_input(frame.payload).unwrap();
-        if !method.tls().is_handshaking() {
-            client.process().unwrap();
-            assert!(!client.is_handshaking());
+        let response = peer_tls_response(&mut client);
+        if !client.is_handshaking() {
             assert!(client.is_tls13());
-            let mut commitment = [0xff];
-            assert_eq!(client.read(&mut commitment).unwrap(), 1);
-            assert_eq!(commitment, [0x00]);
-            return (method, client);
+            return (method, client, response);
         }
+        let ciphertext = server_tls_flight(&mut method, &response).await;
+        client.feed_input(&ciphertext).unwrap();
     }
     panic!("TLS handshake did not finish");
+}
+
+async fn established_pair_with_mtu(frame_mtu: usize) -> (EapTls, TlsConnection) {
+    let (mut method, mut client, response) = client_finished_pair(frame_mtu).await;
+    let ciphertext = server_tls_flight(&mut method, &response).await;
+    assert!(!method.tls().is_handshaking());
+    client.feed_input(&ciphertext).unwrap();
+    let mut commitment = [0xff];
+    assert_eq!(client.read(&mut commitment).unwrap(), 1);
+    assert_eq!(commitment, [0x00]);
+    (method, client)
+}
+
+async fn established_pair() -> (EapTls, TlsConnection) {
+    established_pair_with_mtu(usize::MAX).await
 }
 
 #[tokio::test]
@@ -150,6 +172,152 @@ async fn eap_tls13_exports_rfc9190_keys() {
     };
     assert_eq!(msk.as_slice(), &key_material[..64]);
     assert_eq!(emsk.as_slice(), &key_material[64..]);
+    assert!(matches!(
+        method.step(&[0], &[]).await.unwrap(),
+        MethodOutcome::Failure
+    ));
+}
+
+#[tokio::test]
+async fn eap_tls13_fragmented_handshake_and_commitment_succeed_after_ack() {
+    let (mut method, _) = established_pair_with_mtu(7).await;
+    assert!(matches!(
+        method.step(&[0], &[]).await.unwrap(),
+        MethodOutcome::Success { .. }
+    ));
+}
+
+#[tokio::test]
+async fn eap_tls13_rejects_data_instead_of_fragment_ack() {
+    let (mut method, _, response) = client_finished_pair(7).await;
+    let MethodOutcome::Continue(request) = method.step(&response, &[]).await.unwrap() else {
+        panic!("expected a fragment of the protected success indication");
+    };
+    assert!(Frame::parse(&request).unwrap().flags.more_fragments());
+    assert!(matches!(
+        method.step(&[0, 23], &[]).await.unwrap(),
+        MethodOutcome::Failure
+    ));
+    assert!(matches!(
+        method.step(&[0], &[]).await.unwrap(),
+        MethodOutcome::Failure
+    ));
+}
+
+#[tokio::test]
+async fn eap_tls13_ignores_reserved_ack_bits() {
+    let (mut method, _) = established_pair().await;
+    assert!(matches!(
+        method.step(&[0x1f], &[]).await.unwrap(),
+        MethodOutcome::Success { .. }
+    ));
+}
+
+#[tokio::test]
+async fn eap_tls13_requires_a_final_ack() {
+    let invalid_responses: &[&[u8]] = &[&[], &[0x20], &[0x80, 0, 0, 0, 0], &[0xc0, 0, 0, 0, 2, 0]];
+    for response in invalid_responses {
+        let (mut method, _) = established_pair().await;
+        assert!(matches!(
+            method.step(response, &[]).await,
+            Ok(MethodOutcome::Failure) | Err(_)
+        ));
+        assert!(matches!(
+            method.step(&[0], &[]).await.unwrap(),
+            MethodOutcome::Failure
+        ));
+    }
+}
+
+fn peer_tls_response(client: &mut TlsConnection) -> Vec<u8> {
+    let mut ciphertext = vec![0u8; 64 * 1024];
+    let length = client.take_output(&mut ciphertext).unwrap();
+    assert!(length > 0);
+    let mut response = vec![0u8];
+    response.extend_from_slice(&ciphertext[..length]);
+    response
+}
+
+#[tokio::test]
+async fn eap_tls13_rejects_application_data_instead_of_final_ack() {
+    let (mut method, mut client) = established_pair().await;
+    assert_eq!(client.write(b"unexpected application data").unwrap(), 27);
+    let response = peer_tls_response(&mut client);
+    assert!(matches!(
+        method.step(&response, &[]).await,
+        Ok(MethodOutcome::Failure) | Err(_)
+    ));
+    assert!(matches!(
+        method.step(&[0], &[]).await.unwrap(),
+        MethodOutcome::Failure
+    ));
+}
+
+#[tokio::test]
+async fn eap_tls13_rejects_encrypted_fatal_alert_instead_of_final_ack() {
+    let (mut method, mut client) = established_pair().await;
+    let mut invalid_record = vec![23, 3, 3, 0, 17];
+    invalid_record.extend_from_slice(&[0u8; 17]);
+    client.feed_input(&invalid_record).unwrap();
+    assert!(client.read(&mut [0u8; 1]).is_err());
+    let response = peer_tls_response(&mut client);
+    assert_eq!(response[1], 23);
+    assert!(matches!(
+        method.step(&response, &[]).await,
+        Ok(MethodOutcome::Failure) | Err(_)
+    ));
+    assert!(matches!(
+        method.step(&[0], &[]).await.unwrap(),
+        MethodOutcome::Failure
+    ));
+}
+
+#[tokio::test]
+async fn eap_tls13_rejects_application_data_coalesced_with_finished() {
+    let (mut method, mut client, mut response) = client_finished_pair(usize::MAX).await;
+    assert_eq!(client.write(b"unexpected application data").unwrap(), 27);
+    response.extend_from_slice(&peer_tls_response(&mut client)[1..]);
+    assert!(matches!(
+        method.step(&response, &[]).await,
+        Ok(MethodOutcome::Failure) | Err(_)
+    ));
+    assert!(matches!(
+        method.step(&[0], &[]).await.unwrap(),
+        MethodOutcome::Failure
+    ));
+}
+
+#[tokio::test]
+async fn eap_tls13_rejects_close_notify_coalesced_with_finished() {
+    let (mut method, mut client, mut response) = client_finished_pair(usize::MAX).await;
+    assert!(client.shutdown());
+    response.extend_from_slice(&peer_tls_response(&mut client)[1..]);
+    assert!(matches!(
+        method.step(&response, &[]).await,
+        Ok(MethodOutcome::Failure) | Err(_)
+    ));
+    assert!(matches!(
+        method.step(&[0], &[]).await.unwrap(),
+        MethodOutcome::Failure
+    ));
+}
+
+#[tokio::test]
+async fn eap_tls13_rejects_fatal_alert_coalesced_with_finished() {
+    let (mut method, mut client, mut response) = client_finished_pair(usize::MAX).await;
+    let mut invalid_record = vec![23, 3, 3, 0, 17];
+    invalid_record.extend_from_slice(&[0u8; 17]);
+    client.feed_input(&invalid_record).unwrap();
+    assert!(client.read(&mut [0u8; 1]).is_err());
+    response.extend_from_slice(&peer_tls_response(&mut client)[1..]);
+    assert!(matches!(
+        method.step(&response, &[]).await,
+        Ok(MethodOutcome::Failure) | Err(_)
+    ));
+    assert!(matches!(
+        method.step(&[0], &[]).await.unwrap(),
+        MethodOutcome::Failure
+    ));
 }
 
 #[test]

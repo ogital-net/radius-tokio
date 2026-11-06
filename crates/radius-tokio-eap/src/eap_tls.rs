@@ -49,6 +49,7 @@ use std::sync::Arc;
 use radius_tokio::eap::Type;
 use radius_tokio::tls::{TlsConnection, TlsContext};
 
+use crate::framing::Frame;
 use crate::method::{EapMethod, MethodFactory, MethodOutcome};
 use crate::tls_tunnel::{self, TlsTunnel};
 use crate::Error;
@@ -66,6 +67,14 @@ pub const LABEL_TLS13: &str = "EXPORTER_EAP_TLS_Key_Material";
 /// the handler adapter consumes); rarely constructed directly.
 pub struct EapTls {
     tunnel: TlsTunnel,
+    state: State,
+}
+
+enum State {
+    Handshaking,
+    AwaitingFragmentAck,
+    AwaitingFinalAck,
+    Finished,
 }
 
 impl EapTls {
@@ -85,6 +94,7 @@ impl EapTls {
         }
         Ok(Self {
             tunnel: TlsTunnel::new(ctx, DEFAULT_FRAME_MTU)?,
+            state: State::Handshaking,
         })
     }
 
@@ -117,6 +127,64 @@ impl EapTls {
             self.tunnel.export_msk_emsk(LABEL_TLS12, None)
         }
     }
+
+    fn check_peer_records(&mut self) -> Result<(), Error> {
+        let mut plaintext = Vec::new();
+        self.tunnel.drain_decrypted(&mut plaintext)?;
+        if !plaintext.is_empty() || self.tunnel.tls().received_close_notify() {
+            return Err(Error::Tls(
+                "EAP-TLS peer sent application data or closed before completion".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn process_response(&mut self, peer_type_data: &[u8]) -> Result<MethodOutcome, Error> {
+        match self.state {
+            State::Finished => return Ok(MethodOutcome::Failure),
+            State::AwaitingFragmentAck | State::AwaitingFinalAck => {
+                let frame = Frame::parse(peer_type_data)?;
+                if frame.flags.length_included()
+                    || frame.flags.more_fragments()
+                    || frame.flags.start()
+                    || !frame.payload.is_empty()
+                {
+                    return Ok(MethodOutcome::Failure);
+                }
+                if matches!(self.state, State::AwaitingFinalAck) {
+                    self.check_peer_records()?;
+                    let (msk, emsk) = self.export_msk_emsk()?;
+                    return Ok(MethodOutcome::Success { msk, emsk });
+                }
+            }
+            State::Handshaking => {
+                if let Some(tls_bytes) = self.tunnel.ingest_peer_frame(peer_type_data)? {
+                    self.tunnel.feed_tls(&tls_bytes)?;
+                    if self.tunnel.drive_handshake()? {
+                        self.check_peer_records()?;
+                        if self.tunnel.tls().is_tls13() {
+                            self.tunnel.write_tls13_commitment()?;
+                        }
+                    }
+                    self.tunnel.refill_pending_tx()?;
+                }
+            }
+        }
+
+        if self.tunnel.has_pending_tx() {
+            let fragment = self.tunnel.emit_next_outbound_fragment();
+            self.state = if self.tunnel.has_pending_tx() {
+                State::AwaitingFragmentAck
+            } else if self.tunnel.is_handshake_done() {
+                State::AwaitingFinalAck
+            } else {
+                State::Handshaking
+            };
+            return Ok(MethodOutcome::Continue(fragment));
+        }
+
+        Ok(MethodOutcome::Continue(tls_tunnel::ack_frame()))
+    }
 }
 
 impl EapMethod for EapTls {
@@ -134,43 +202,11 @@ impl EapMethod for EapTls {
         _outer_attributes: &'a [u8],
     ) -> crate::method::MethodFuture<'a> {
         Box::pin(async move {
-            // 1. Ingest the peer's TLS-EAP frame, if any. (The S bit
-            //    on a peer response is illegal per RFC 5216 §3.2 — S
-            //    is server-issued — but the reassembler is tolerant.)
-            if let Some(tls_bytes) = self.tunnel.ingest_peer_frame(peer_type_data)? {
-                // 2. Feed the reassembled TLS message to libssl and
-                //    drive the handshake state machine.
-                self.tunnel.feed_tls(&tls_bytes)?;
-                let just_completed = self.tunnel.drive_handshake()?;
-                if just_completed && self.tunnel.tls().is_tls13() {
-                    // RFC 9190 §2.5: on TLS 1.3 the server must send
-                    // a protected success indication — a TLS
-                    // application-data record carrying a single 0x00
-                    // byte — before the EAP-Success / MSK lands on
-                    // the wire. libssl buffers the ciphertext in the
-                    // wbio; refill_pending_tx picks it up alongside
-                    // any NewSessionTicket records the handshake
-                    // left queued.
-                    self.tunnel.write_tls13_commitment()?;
-                }
-                self.tunnel.refill_pending_tx()?;
+            let result = self.process_response(peer_type_data);
+            if !matches!(&result, Ok(MethodOutcome::Continue(_))) {
+                self.state = State::Finished;
             }
-
-            // 3. Anything queued to send? Emit the next outbound fragment.
-            if self.tunnel.has_pending_tx() {
-                return Ok(MethodOutcome::Continue(
-                    self.tunnel.emit_next_outbound_fragment(),
-                ));
-            }
-
-            // 4. Handshake complete and no more bytes to ship → success.
-            if self.tunnel.is_handshake_done() {
-                let (msk, emsk) = self.export_msk_emsk()?;
-                return Ok(MethodOutcome::Success { msk, emsk });
-            }
-
-            // 5. Nothing to send, peer mid-fragmentation: emit ACK.
-            Ok(MethodOutcome::Continue(tls_tunnel::ack_frame()))
+            result
         })
     }
 }

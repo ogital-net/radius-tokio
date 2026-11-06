@@ -1639,7 +1639,12 @@ pub struct TlsConnection {
 unsafe impl Send for TlsConnection {}
 
 impl TlsConnection {
-    pub(crate) fn received_close_notify(&self) -> bool {
+    /// Whether the peer has closed its TLS sending direction with `close_notify`.
+    ///
+    /// Distinguishes a clean TLS close from `read` returning zero because more
+    /// ciphertext is needed.
+    #[must_use]
+    pub fn received_close_notify(&self) -> bool {
         // SAFETY: ssl is valid; SSL_get_shutdown only inspects connection state.
         unsafe {
             aws_lc_sys::SSL_get_shutdown(self.ssl.0.as_ptr()) & aws_lc_sys::SSL_RECEIVED_SHUTDOWN
