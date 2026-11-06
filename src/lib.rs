@@ -21,6 +21,7 @@ pub use crypto::ZeroizingBytes;
 pub use radius_tokio_dict as dict;
 #[macro_use]
 mod obs;
+#[cfg(feature = "server")]
 pub mod server;
 
 // Re-export the TLS wrapper as a public submodule. Lives under
@@ -28,12 +29,12 @@ pub mod server;
 // is consumer-visible because RadSec listeners need to configure it.
 // Only available with the `radsec` feature, which turns on the
 // `ssl` feature of `aws-lc-sys`.
-#[cfg(feature = "radsec")]
+#[cfg(feature = "tls")]
 pub use crypto::tls;
 
 /// Sensible-defaults PKI helpers (CA + leaf issuance) for RadSec
 /// onboarding. Only available with the `radsec` feature.
-#[cfg(feature = "radsec")]
+#[cfg(feature = "tls")]
 pub use crypto::pki;
 
 /// Cryptographically secure random byte source backed by aws-lc's

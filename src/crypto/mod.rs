@@ -29,11 +29,11 @@ pub(crate) mod hmac_md5;
 pub(crate) mod md4;
 pub(crate) mod md5;
 pub(crate) mod password;
-#[cfg(feature = "radsec")]
+#[cfg(feature = "tls")]
 pub mod pki;
 pub mod rand;
 pub(crate) mod sha1;
-#[cfg(feature = "radsec")]
+#[cfg(feature = "tls")]
 pub mod tls;
 
 pub mod aes;

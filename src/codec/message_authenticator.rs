@@ -36,9 +36,9 @@
 //! present, regardless of whether the request also carries an
 //! EAP-Message. The server's request pipeline rejects
 //! Access-Request packets that *omit* the attribute by default,
-//! per [`crate::server::Client::require_message_authenticator`];
+//! per `server::Client::require_message_authenticator`;
 //! a per-client opt-out
-//! ([`crate::server::Client::allow_missing_message_authenticator`])
+//! (`server::Client::allow_missing_message_authenticator`)
 //! covers legacy NAS firmware that cannot emit it.
 
 use crate::crypto::ct_eq;

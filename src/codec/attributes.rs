@@ -558,7 +558,7 @@ pub fn contains_vsa_tlv<T: WireType>(attrs: &[u8], attr: VsaTlvAttr<T>) -> bool 
 /// Implementors expose a single `&'a [u8]` slice via
 /// [`raw_attributes`](Self::raw_attributes); every other accessor is
 /// a default method built on top of it. Implemented by
-/// [`crate::server::Request`] (the live handler view), by
+/// `server::Request` (the live handler view), by
 /// `radius_tokio_eap::Outer` (the snapshot handed to EAP credential
 /// traits), and by anything else that owns or borrows an attribute
 /// region.

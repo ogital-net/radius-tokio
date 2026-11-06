@@ -97,7 +97,10 @@ include = [
 ]
 
 [features]
-default = ["dict-rfc", "fast-md5"]
+default = ["server", "dict-rfc", "fast-md5"]
+server = []
+client = []
+tls = ["aws-lc-sys/ssl"]
 # Emit `tracing` spans/events around accept, decode, dispatch, reply,
 # and CoA lifecycle. Off by default — pulls in the `tracing` crate.
 tracing = ["dep:tracing"]
@@ -108,7 +111,7 @@ metrics = ["dep:metrics"]
 # and turns on the `ssl` feature of `aws-lc-sys`, which triggers
 # bindgen at build time and adds ~30s to a cold build. Build deps
 # (cmake + clang + libclang) become required. Off by default.
-radsec = ["aws-lc-sys/ssl", "tokio/io-util"]
+radsec = ["tls", "tokio/io-util"]
 # Swap the MD5 block compressor from aws-lc-sys to the published
 # `fast-md5` crate (hand-written x86_64 / aarch64 assembly cores,
 # portable Rust fallback, pure-Rust no_std). On by default.
@@ -218,31 +221,63 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 [[example]]
 name = "dhat_hot_path"
+required-features = ["server"]
 
 [[example]]
 name = "mutable_clients"
+required-features = ["server"]
 
 [[example]]
 name = "sqlite_clients"
+required-features = ["server"]
 
 [[example]]
 name = "threadlocal_responder"
+required-features = ["server"]
 
 [[example]]
 name = "coa_originator"
+required-features = ["server"]
 
 [[example]]
 name = "graceful_shutdown"
+required-features = ["server"]
 
 [[example]]
 name = "routing_dispatcher"
+required-features = ["server"]
 
 [[example]]
 name = "eap_identity_challenge"
+required-features = ["server"]
 
 [[example]]
 name = "mixed_udp_radsec"
-required-features = ["radsec"]
+required-features = ["server", "radsec"]
+
+[[test]]
+name = "accounting"
+required-features = ["server"]
+
+[[test]]
+name = "coa_originator"
+required-features = ["server"]
+
+[[test]]
+name = "listener_role_filter"
+required-features = ["server"]
+
+[[test]]
+name = "radclient_e2e"
+required-features = ["server"]
+
+[[test]]
+name = "radsec_e2e"
+required-features = ["server", "radsec"]
+
+[[test]]
+name = "status_server"
+required-features = ["server"]
 
 [[bench]]
 name = "codec_decode"
@@ -259,6 +294,7 @@ harness = false
 [[bench]]
 name = "client_store"
 harness = false
+required-features = ["server"]
 
 [[bench]]
 name = "roundtrip"
@@ -267,6 +303,7 @@ harness = false
 [[bench]]
 name = "server_udp"
 harness = false
+required-features = ["server"]
 
 [[bench]]
 name = "md5_backends"

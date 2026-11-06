@@ -69,6 +69,8 @@ trait-facing surface second.
 A minimal Access-Request → Access-Accept loop, UDP only:
 
 ```rust,no_run
+# #[cfg(all(feature = "server", feature = "dict-rfc"))]
+# mod example {
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
@@ -111,6 +113,8 @@ async fn main() -> std::io::Result<()> {
 
     server.run().await
 }
+# }
+# fn main() {}
 ```
 
 ### Reading attributes — `AttributesView`
@@ -123,6 +127,7 @@ everywhere:
 
 ```rust,no_run
 use radius_tokio::AttributesView;
+# #[cfg(feature = "server")]
 # fn demo(req: radius_tokio::server::Request<'_>) {
 let user_name = req.user_name();                   // Option<&[u8]>
 let state     = req.state();                       // Option<&[u8]>
@@ -140,6 +145,8 @@ through `Tagged<V>` so consumers never hand-roll the tag byte or
 the 24-bit packing of tagged integers:
 
 ```rust,no_run
+# #[cfg(all(feature = "server", feature = "dict-rfc"))]
+# mod example {
 use radius_tokio::AttributesView;
 use radius_tokio::dict::rfc::attrs;
 use radius_tokio::dict::Tagged;
@@ -161,6 +168,7 @@ for attr in request.attributes_iter().flatten() {
         let _ = (t.tag, t.value); // Option<u8>, u32
     }
 }
+# }
 # }
 ```
 

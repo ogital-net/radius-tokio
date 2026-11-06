@@ -33,11 +33,17 @@
 //! Microsoft has deprecated LM for over a decade and supporting it
 //! would require an OEM codepage dependency.
 
+#[cfg(feature = "server")]
 use super::VerifyOutcome;
+#[cfg(feature = "server")]
 use crate::codec::attributes::{AttributeError, AttributesView};
-use crate::crypto::{cleanse, ct_eq, des::DesKey, md4, sha1::Sha1};
+#[cfg(feature = "server")]
+use crate::crypto::ct_eq;
+use crate::crypto::{cleanse, des::DesKey, md4, sha1::Sha1};
+#[cfg(feature = "server")]
 use crate::server::Request;
 
+#[cfg(feature = "server")]
 use crate::codec::constants::{USER_NAME as USER_NAME_TYPE, VENDOR_SPECIFIC as VSA_TYPE};
 
 /// Microsoft Private Enterprise Number (RFC 2548).
@@ -124,6 +130,7 @@ pub fn nt_password_hash(password: &str) -> [u8; 16] {
 /// # Errors
 ///
 /// Forwards [`AttributeError`] from the attribute list iterator.
+#[cfg(feature = "server")]
 pub fn verify_v1(
     request: &Request<'_>,
     expected_password: MsChapSecret<'_>,
@@ -170,6 +177,7 @@ pub fn verify_v1(
 /// # Errors
 ///
 /// Forwards [`AttributeError`] from the attribute list iterator.
+#[cfg(feature = "server")]
 pub fn verify_v2(
     request: &Request<'_>,
     expected_password: MsChapSecret<'_>,
@@ -210,7 +218,7 @@ pub fn verify_v2(
 /// expected 24-byte NT-Response, then compare in constant time.
 ///
 /// `username` is fed through the same `DOMAIN\` stripping as
-/// [`verify_v2`]; pass the raw User-Name value (or the EAP identity).
+/// `verify_v2`; pass the raw User-Name value (or the EAP identity).
 #[must_use]
 pub fn v2_nt_response(
     auth_challenge: &[u8; 16],
@@ -240,6 +248,7 @@ pub fn v2_nt_response(
 /// # Errors
 ///
 /// Forwards [`AttributeError`] from the attribute list iterator.
+#[cfg(feature = "server")]
 pub fn v2_success_response(
     request: &Request<'_>,
     expected_password: MsChapSecret<'_>,
@@ -273,7 +282,7 @@ pub fn v2_success_response(
 /// `MSCHAPv2` Success message.
 ///
 /// `username` follows the same `DOMAIN\` stripping rule as
-/// [`verify_v2`].
+/// `verify_v2` (available with the `server` feature).
 #[must_use]
 pub fn v2_authenticator_response(
     auth_challenge: &[u8; 16],
@@ -312,6 +321,7 @@ pub fn v2_authenticator_response(
 
 /// Inputs shared between v2 verification and the `AuthenticatorResponse`
 /// computation. Borrows the username from the underlying packet buffer.
+#[cfg(feature = "server")]
 struct V2Inputs<'a> {
     auth_challenge: [u8; 16],
     peer_challenge: [u8; 16],
@@ -319,6 +329,7 @@ struct V2Inputs<'a> {
     username: &'a [u8],
 }
 
+#[cfg(feature = "server")]
 fn decode_v2_inputs<'a>(request: &Request<'a>) -> Result<Option<V2Inputs<'a>>, AttributeError> {
     let Some(challenge) = first_ms_vsa(request, VT_MS_CHAP_CHALLENGE)? else {
         return Ok(None);
@@ -401,6 +412,7 @@ fn strip_domain(name: &[u8]) -> &[u8] {
 /// given per-vendor type. Returns `Ok(None)` if no such VSA is present;
 /// returns `Err` if the attribute list is malformed before one could be
 /// located.
+#[cfg(feature = "server")]
 fn first_ms_vsa<'a>(
     request: &Request<'a>,
     vendor_type: u8,
@@ -435,7 +447,7 @@ fn first_ms_vsa<'a>(
     Ok(None)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
     use crate::codec::header::Code;

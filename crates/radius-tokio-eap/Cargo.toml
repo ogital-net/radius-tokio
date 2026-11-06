@@ -41,16 +41,16 @@ eap-mschapv2 = []
 # EAP-TLS (RFC 5216 / RFC 9190). Server-authenticated or mutually
 # authenticated TLS session whose exporter output (RFC 5705 §4)
 # becomes the MSK.
-eap-tls = ["radius-tokio/radsec"]
+eap-tls = ["radius-tokio/tls"]
 
 # PEAP v0 / v1 (`draft-josefsson-pppext-eap-tls-eap`, IETF de-facto
 # standard). Outer TLS session protects an inner EAP method
 # (typically EAP-MSCHAPv2) negotiated over the TLS record stream.
-peap = ["radius-tokio/radsec"]
+peap = ["radius-tokio/tls"]
 
 # EAP-TTLS (RFC 5281). Outer TLS session carries inner attribute
 # AVPs (PAP / CHAP / MS-CHAP / inner EAP).
-eap-ttls = ["radius-tokio/radsec"]
+eap-ttls = ["radius-tokio/tls"]
 
 # Umbrella enabling every EAP method this crate ships.
 all-methods = ["eap-md5", "eap-mschapv2", "eap-tls", "peap", "eap-ttls"]
@@ -70,7 +70,7 @@ tracing = ["dep:tracing"]
 metrics = ["dep:metrics"]
 
 [dependencies]
-radius-tokio = { workspace = true }
+radius-tokio = { workspace = true, features = ["server"] }
 tokio = { workspace = true, default-features = false, features = ["sync"] }
 tracing = { workspace = true, optional = true }
 metrics = { workspace = true, optional = true }

@@ -13,7 +13,7 @@
 //! `EapMethod` / `EapHandler` surface.
 //!
 //! No shared-secret obfuscation: the password is hashed directly. The
-//! [`Client`](crate::server::Client) shared secret is therefore
+//! RADIUS shared secret is therefore
 //! unused by these helpers.
 //!
 //! # Example

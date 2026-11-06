@@ -26,6 +26,8 @@
 //! filter the crate's noise independently from their own
 //! (`RUST_LOG=radius_tokio=debug`).
 
+#![allow(unused_macros)]
+
 /// `tracing` target string applied to every event and span this
 /// crate emits. Exposed as a `pub(crate)` constant so the value is
 /// defined in one place; downstream filter strings (`RUST_LOG=...`)

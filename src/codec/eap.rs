@@ -24,7 +24,7 @@
 //! No allocation happens unless the caller asks for a contiguous
 //! payload; consumers that can stream EAP fragments (e.g. straight
 //! into a method engine) should use [`fragments`]. Handlers that
-//! already hold a [`Request`](crate::server::Request) can skip this
+//! already hold a `server::Request` can skip this
 //! module's argument-shape entirely and call
 //! [`AttributesView::eap_message`](crate::AttributesView::eap_message) /
 //! [`AttributesView::eap_message_into`](crate::AttributesView::eap_message_into).

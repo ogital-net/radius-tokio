@@ -1,10 +1,10 @@
 //! Authentication helpers for common RADIUS credential schemes.
 //!
 //! Each submodule exposes a small inspector that takes a borrowed
-//! [`Request`](crate::server::Request) plus the *expected* password
+//! `server::Request` plus the *expected* password
 //! (looked up by the consumer in whatever identity store it uses) and
 //! returns a [`VerifyOutcome`]. The helpers never touch sockets,
-//! never look at the [`Client`](crate::server::Client) record beyond
+//! never look at the `server::Client` record beyond
 //! its shared secret, and never allocate beyond what the underlying
 //! crypto step already requires.
 //!
@@ -12,8 +12,8 @@
 //!
 //! | Scheme | Module | RFC | Status |
 //! |--------|--------|-----|--------|
-//! | PAP (`User-Password`)        | [`pap`]    | RFC 2865 §5.2 | implemented |
-//! | CHAP (`CHAP-Password`)       | [`chap`]   | RFC 2865 §5.3 + RFC 1994 | implemented |
+//! | PAP (`User-Password`)        | `pap`    | RFC 2865 §5.2 | requires `server` |
+//! | CHAP (`CHAP-Password`)       | `chap`   | RFC 2865 §5.3 + RFC 1994 | requires `server` |
 //! | MS-CHAPv1                    | [`mschap`] | RFC 2433 / RFC 2548 | implemented |
 //! | MS-CHAPv2                    | [`mschap`] | RFC 2759 / RFC 2548 | implemented |
 //! | EAP-MD5-Challenge            | [`eap_md5`] | RFC 3748 §5.4 | response computation |
@@ -43,9 +43,11 @@
 //! Helpers do not chain methods themselves — that policy belongs in
 //! the consumer's handler.
 
+#[cfg(feature = "server")]
 pub mod chap;
 pub mod eap_md5;
 pub mod mschap;
+#[cfg(feature = "server")]
 pub mod pap;
 
 /// Outcome of a credential check.
