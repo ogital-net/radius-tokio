@@ -16,7 +16,7 @@
 //!   the transport hands us:
 //!   * for UDP, the source [`SocketAddr`];
 //!   * for `RadSec`, the source [`SocketAddr`] **and** the
-//!     validated leaf [`PeerCertificate`](crate::tls::PeerCertificate).
+//!     validated leaf `tls::PeerCertificate` (with the `radsec` feature).
 //! * **Client** — the resolved record (shared secret, policy
 //!   flags, …) the store maps a peer to. Every value of [`Client`]
 //!   in this crate refers to an authorised configuration entry —

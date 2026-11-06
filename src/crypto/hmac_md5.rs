@@ -52,7 +52,7 @@ impl HmacMd5 {
         // NULL (use the default engine).
         let ret = unsafe {
             HMAC_Init_ex(
-                &mut ctx,
+                &raw mut ctx,
                 key.as_ptr().cast(),
                 key.len(),
                 aws_lc_sys::EVP_md5(),
@@ -67,7 +67,7 @@ impl HmacMd5 {
     pub(crate) fn update(&mut self, data: &[u8]) {
         // SAFETY: ctx is initialized and not yet finalized. data is a
         // valid slice for the duration of this call.
-        let ret = unsafe { HMAC_Update(&mut self.ctx, data.as_ptr(), data.len()) };
+        let ret = unsafe { HMAC_Update(&raw mut self.ctx, data.as_ptr(), data.len()) };
         assert_eq!(ret, 1, "HMAC_Update failed");
     }
 
@@ -77,7 +77,7 @@ impl HmacMd5 {
         let mut out_len: std::os::raw::c_uint = 0;
         // SAFETY: ctx is initialized and not previously finalized. tag
         // is 16 bytes — exactly the MD5 digest size.
-        let ret = unsafe { HMAC_Final(&mut self.ctx, tag.as_mut_ptr(), &mut out_len) };
+        let ret = unsafe { HMAC_Final(&raw mut self.ctx, tag.as_mut_ptr(), &raw mut out_len) };
         assert_eq!(ret, 1, "HMAC_Final failed");
         debug_assert_eq!(out_len as usize, TAG_LEN);
         tag
@@ -89,7 +89,7 @@ impl Drop for HmacMd5 {
     fn drop(&mut self) {
         // SAFETY: ctx is initialized. HMAC_CTX_cleanup is idempotent and
         // safe to call even after HMAC_Final has run.
-        unsafe { HMAC_CTX_cleanup(&mut self.ctx) };
+        unsafe { HMAC_CTX_cleanup(&raw mut self.ctx) };
     }
 }
 

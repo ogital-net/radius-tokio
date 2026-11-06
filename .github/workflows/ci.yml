@@ -143,6 +143,28 @@ jobs:
       - name: Test (all features)
         run: cargo ${{ steps.channel.outputs.flag }} test --workspace --all-features --locked
 
+  features:
+    name: features / ${{ matrix.features }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "server", "client", "tls", "server,radsec", "client,radsec", "client,radsec,tracing,metrics", "client,radsec,dict-rfc,fast-md5"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install TLS build dependencies
+        if: contains(matrix.features, 'tls') || contains(matrix.features, 'radsec')
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p radius-tokio --no-default-features --features "${{ matrix.features }}" --locked
+      - run: cargo clippy -p radius-tokio --no-default-features --features "${{ matrix.features }}" --all-targets --locked -- -D warnings
+      - run: cargo doc -p radius-tokio --no-default-features --features "${{ matrix.features }}" --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   # ── Miri ─────────────────────────────────────────────────────────────────
   # Intentionally not run. The only `unsafe` in the workspace lives in
   # `src/crypto/`, which is a thin shim over `aws-lc-sys` (FFI) — miri

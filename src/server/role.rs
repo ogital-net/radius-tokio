@@ -39,7 +39,7 @@ pub enum ListenerRole {
     Acct,
     /// Multiplexed listener: accepts every request code the library
     /// knows how to dispatch. Default for
-    /// [`ServerBuilder::listen_radsec`](super::ServerBuilder::listen_radsec),
+    /// `ServerBuilder::listen_radsec` (with the `radsec` feature),
     /// which runs a single TLS connection on port 2083 carrying
     /// auth, accounting, and CoA traffic interleaved — matches the
     /// `radsecproxy` and FreeRADIUS `proto_radius_tcp` posture.
