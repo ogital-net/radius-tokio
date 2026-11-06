@@ -160,7 +160,7 @@ pub(crate) fn tunnel_password_encrypt(
 /// Generate a fresh 2-byte Tunnel-Password salt with the MSB of the
 /// first byte set, as required by RFC 2868 §3.5. The remaining 15
 /// bits come from the system CSPRNG.
-fn generate_salt() -> [u8; 2] {
+pub(crate) fn generate_salt() -> [u8; 2] {
     use std::mem::MaybeUninit;
     let mut buf = [MaybeUninit::<u8>::uninit(); 2];
     super::rand::fill(&mut buf);
@@ -171,11 +171,10 @@ fn generate_salt() -> [u8; 2] {
 }
 
 /// Deterministic Tunnel-Password encrypt — `salt` is supplied by the
-/// caller. Private to this module so the high-bit-MSB precondition
-/// stays an internal invariant; production code goes through
-/// [`tunnel_password_encrypt`], which generates salts itself.
-/// Tests use this entry point so they can pin known-answer vectors.
-fn tunnel_password_encrypt_with_salt(
+/// caller. Crate-internal callers must set the salt's high bit and ensure
+/// salts are unique within each packet. Tests also use this entry point
+/// to pin known-answer vectors.
+pub(crate) fn tunnel_password_encrypt_with_salt(
     password: &[u8],
     secret: &[u8],
     authenticator: &[u8; 16],

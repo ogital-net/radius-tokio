@@ -387,11 +387,35 @@ impl Reply {
         Ok(self)
     }
 
+    fn unique_salt(&self, mut candidate: [u8; 2]) -> [u8; 2] {
+        loop {
+            let used = super::attributes::iter(self.buf.attributes())
+                .filter_map(Result::ok)
+                .any(|attribute| {
+                    let value = attribute.value();
+                    match attribute.attribute_type() {
+                        TUNNEL_PASSWORD_TYPE => value.get(1..3) == Some(candidate.as_slice()),
+                        VENDOR_SPECIFIC_TYPE if value.len() >= 8 => {
+                            value[..4] == MS_VENDOR_ID.to_be_bytes()
+                                && matches!(value[4], MS_MPPE_SEND_KEY_TYPE | MS_MPPE_RECV_KEY_TYPE)
+                                && value[6..8] == candidate
+                        }
+                        _ => false,
+                    }
+                });
+            if !used {
+                return candidate;
+            }
+            candidate = crate::crypto::password::generate_salt();
+        }
+    }
+
     /// Append a `Tunnel-Password` attribute (RFC 2868 §3.5) with automatic
     /// encryption.
     ///
     /// The library generates a fresh random 2-byte salt (with the MSB of the
-    /// first byte set, as required by RFC 2868 §3.5) and encrypts `password`
+    /// first byte set, as required by RFC 2868 §3.5), unique among the
+    /// packet's Tunnel-Password and MPPE attributes, and encrypts `password`
     /// using the Tunnel-Password scheme before appending the result as
     /// attribute type 69. Callers supply the plaintext password and the
     /// encryption material from the corresponding request; no manual cipher
@@ -431,10 +455,12 @@ impl Reply {
                 len: password.len(),
             });
         }
-        let (salt, ciphertext) = crate::crypto::password::tunnel_password_encrypt(
+        let salt = self.unique_salt(crate::crypto::password::generate_salt());
+        let ciphertext = crate::crypto::password::tunnel_password_encrypt_with_salt(
             password,
             secret,
             request_authenticator,
+            salt,
         );
         // Wire value: tag(1) || salt(2) || ciphertext(n × 16)
         let mut value = Vec::with_capacity(3 + ciphertext.len());
@@ -528,8 +554,13 @@ impl Reply {
         // reuse that helper rather than maintain a second copy.
         // Both encodings prepend a 1-byte length to the plaintext,
         // pad to a 16-byte multiple, and set the salt's MSB.
-        let (salt, ciphertext) =
-            crate::crypto::password::tunnel_password_encrypt(key, secret, request_authenticator);
+        let salt = self.unique_salt(crate::crypto::password::generate_salt());
+        let ciphertext = crate::crypto::password::tunnel_password_encrypt_with_salt(
+            key,
+            secret,
+            request_authenticator,
+            salt,
+        );
         // VSA inner length: Vendor-Type (1) + Vendor-Length (1)
         // + Salt (2) + Encrypted-Key bytes.
         // SAFETY (no_panic): MS_MPPE_KEY_MAX_LEN caps `key.len()`
@@ -768,6 +799,31 @@ mod tests {
             .expect("decrypt");
             assert_eq!(plaintext.as_bytes(), expected_key);
         }
+    }
+
+    #[test]
+    fn salt_collisions_are_retried_across_tunnel_password_and_mppe_attributes() {
+        let mut reply = Reply::new(Code::ACCESS_ACCEPT, 9);
+        let tunnel_salt = [0x80, 1];
+        reply
+            .add_attribute(TUNNEL_PASSWORD_TYPE, &[0, tunnel_salt[0], tunnel_salt[1]])
+            .unwrap();
+        let send_salt = [0x80, 2];
+        let recv_salt = [0x80, 3];
+        for (typ, salt) in [
+            (MS_MPPE_SEND_KEY_TYPE, send_salt),
+            (MS_MPPE_RECV_KEY_TYPE, recv_salt),
+        ] {
+            let mut value = MS_VENDOR_ID.to_be_bytes().to_vec();
+            value.extend_from_slice(&[typ, 4, salt[0], salt[1]]);
+            reply.add_attribute(VENDOR_SPECIFIC_TYPE, &value).unwrap();
+        }
+        for collision in [tunnel_salt, send_salt, recv_salt] {
+            let replacement = reply.unique_salt(collision);
+            assert!(![tunnel_salt, send_salt, recv_salt].contains(&replacement));
+            assert_ne!(replacement[0] & 0x80, 0);
+        }
+        assert_eq!(reply.unique_salt([0x80, 4]), [0x80, 4]);
     }
 
     #[test]
