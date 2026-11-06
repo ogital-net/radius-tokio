@@ -69,14 +69,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(test)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, watch};
 
-use crate::codec::header::{MAX_PACKET_LEN, MIN_PACKET_LEN};
 #[cfg(feature = "metrics")]
 use crate::obs::metrics;
-use crate::tls::{HandshakeState, TlsConnection, TlsContext, TlsError};
+#[cfg(test)]
+use crate::tls::HandshakeState;
+use crate::tls::{TlsConnection, TlsContext};
+use crate::transport::tls::{tls_to_io, AsyncTls, FrameReader};
 
 use super::client::{Client, ClientId};
 use super::dedup::DedupCache;
@@ -84,21 +87,6 @@ use super::handler::Handler;
 use super::pipeline::{self, Dispatched, Validated};
 use super::role::ListenerRole;
 use super::store::ClientStore;
-
-/// How long a connection-level read may stall before we treat it
-/// as dead and tear the TLS session down.
-///
-/// RadSec connections are expected to be long-lived (a NAS may keep
-/// one open for the life of the device); but if no application data
-/// arrives for this long we close the connection so the server
-/// doesn't accumulate idle TLS state. Tunable later via the
-/// builder.
-const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
-
-/// Max ciphertext we'll buffer per `read` syscall. One TLS record
-/// is at most ~16 KiB, so this comfortably handles a single record
-/// per call without round-tripping.
-const TLS_READ_CHUNK: usize = 16 * 1024;
 
 /// How often the connection driver requests a TLS 1.3 traffic-key
 /// update on a long-running session (RFC 8446 §4.6.3). Matches
@@ -477,7 +465,7 @@ async fn run_frame_loop<H: Handler>(
     status_policy: &super::status::StatusServerPolicy,
     mut close_rx: oneshot::Receiver<()>,
 ) -> io::Result<()> {
-    let mut frame = vec![0u8; MAX_PACKET_LEN];
+    let mut frames = FrameReader::new();
     let mut last_key_update = std::time::Instant::now();
     loop {
         // Long-running TLS 1.3 sessions get a periodic traffic-key
@@ -513,9 +501,9 @@ async fn run_frame_loop<H: Handler>(
                 count!(metrics::RADSEC_REVOCATIONS_APPLIED);
                 return Ok(());
             }
-            res = read_frame(conn, &mut frame) => {
-                let len = match res {
-                    Ok(Some(n)) => n,
+            res = frames.read(conn) => {
+                let frame = match res {
+                    Ok(Some(frame)) => frame,
                     Ok(None) => {
                         debug!(event = "radsec_closed", %peer);
                         return Ok(());
@@ -527,7 +515,7 @@ async fn run_frame_loop<H: Handler>(
                 };
                 if let Err(_e) = process_frame(
                     conn,
-                    &frame[..len],
+                    frame,
                     peer,
                     local,
                     client,
@@ -543,34 +531,6 @@ async fn run_frame_loop<H: Handler>(
                 }
             }
         }
-    }
-}
-
-/// Read exactly one RADIUS frame off the TLS stream into `out`,
-/// returning its length. `Ok(None)` means the peer closed cleanly
-/// before any new frame began.
-async fn read_frame(conn: &mut AsyncTls, out: &mut [u8]) -> io::Result<Option<usize>> {
-    debug_assert!(out.len() >= MAX_PACKET_LEN);
-
-    // First read the 4-byte header prefix to learn the total length.
-    match conn.read_exact_or_eof(&mut out[..4]).await? {
-        ReadOutcome::Eof => return Ok(None),
-        ReadOutcome::Filled => {}
-    }
-    let length = u16::from_be_bytes([out[2], out[3]]) as usize;
-    if !(MIN_PACKET_LEN..=MAX_PACKET_LEN).contains(&length) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("radsec: invalid frame length {length}"),
-        ));
-    }
-    // Read the rest.
-    match conn.read_exact_or_eof(&mut out[4..length]).await? {
-        ReadOutcome::Eof => Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "radsec: peer closed mid-frame",
-        )),
-        ReadOutcome::Filled => Ok(Some(length)),
     }
 }
 
@@ -852,201 +812,6 @@ async fn process_frame<H: Handler>(
             );
             Ok(())
         }
-    }
-}
-
-fn tls_to_io(e: TlsError) -> io::Error {
-    io::Error::other(e)
-}
-
-// ============================================================================
-// AsyncTls — async adapter over `TcpStream` + `TlsConnection`.
-//
-// Pumps ciphertext between the two using the memory-BIO interface
-// of `TlsConnection`. Sequential by design: only one of read /
-// write may be in flight at a time per connection.
-// ============================================================================
-
-struct AsyncTls {
-    stream: TcpStream,
-    tls: TlsConnection,
-    /// Scratch buffer for ciphertext read off the TCP socket before
-    /// being fed into `feed_input`. Outbound ciphertext is written
-    /// directly from libssl's mem-BIO buffer via
-    /// [`TlsConnection::pending_output`] — no staging buffer needed.
-    in_buf: Vec<u8>,
-    /// Once the peer's `read_exact` returns 0 we know no more
-    /// ciphertext will arrive; subsequent attempts must surface as
-    /// EOF instead of looping forever asking for more bytes.
-    eof: bool,
-}
-
-enum ReadOutcome {
-    Filled,
-    Eof,
-}
-
-impl AsyncTls {
-    fn new(stream: TcpStream, tls: TlsConnection) -> Self {
-        Self {
-            stream,
-            tls,
-            in_buf: vec![0u8; TLS_READ_CHUNK],
-            eof: false,
-        }
-    }
-
-    /// Borrow the peer's leaf certificate, if the handshake has
-    /// completed. Used by cert-keyed authorization.
-    fn peer_certificate(&self) -> Option<crate::tls::PeerCertificate> {
-        self.tls.peer_certificate()
-    }
-
-    /// Drive the handshake to completion (or failure).
-    async fn handshake(&mut self) -> io::Result<()> {
-        let timeout = tokio::time::sleep(Duration::from_secs(30));
-        tokio::pin!(timeout);
-        loop {
-            // 1. Advance the state machine.
-            let state = self.tls.process().map_err(tls_to_io)?;
-            // 2. Drain any ciphertext libssl produced.
-            self.flush_tls_output().await?;
-            // 3. If the handshake completed, we're done.
-            if matches!(state, HandshakeState::Established) {
-                return Ok(());
-            }
-            // 4. Otherwise we need more bytes from the peer.
-            tokio::select! {
-                () = &mut timeout => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "radsec handshake timed out",
-                    ));
-                }
-                res = self.stream.read(&mut self.in_buf) => {
-                    let n = res?;
-                    if n == 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "peer closed during handshake",
-                        ));
-                    }
-                    self.tls.feed_input(&self.in_buf[..n]).map_err(tls_to_io)?;
-                }
-            }
-        }
-    }
-
-    /// Read exactly `out.len()` plaintext bytes, returning
-    /// [`ReadOutcome::Eof`] if the peer closed cleanly *before any
-    /// bytes were read into this buffer*. A close mid-buffer is an
-    /// `UnexpectedEof` error.
-    async fn read_exact_or_eof(&mut self, out: &mut [u8]) -> io::Result<ReadOutcome> {
-        let total = out.len();
-        let mut filled = 0;
-        let timeout = tokio::time::sleep(DEFAULT_IDLE_TIMEOUT);
-        tokio::pin!(timeout);
-        while filled < total {
-            // First try to satisfy from already-buffered plaintext.
-            let n = self.tls.read(&mut out[filled..]).map_err(tls_to_io)?;
-            if n > 0 {
-                filled += n;
-                continue;
-            }
-            if self.eof && !self.tls.has_plaintext_pending() {
-                return if filled == 0 {
-                    Ok(ReadOutcome::Eof)
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "peer closed mid-frame",
-                    ))
-                };
-            }
-            // Pull more ciphertext from the TCP socket.
-            tokio::select! {
-                () = &mut timeout => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "radsec read idle timeout",
-                    ));
-                }
-                res = self.stream.read(&mut self.in_buf) => {
-                    let nb = res?;
-                    if nb == 0 {
-                        self.eof = true;
-                        // Loop back: SSL_read may still return
-                        // buffered data even after socket EOF.
-                        continue;
-                    }
-                    self.tls.feed_input(&self.in_buf[..nb]).map_err(tls_to_io)?;
-                }
-            }
-        }
-        Ok(ReadOutcome::Filled)
-    }
-
-    /// Encrypt `bytes` and push every produced ciphertext byte out
-    /// the TCP socket before returning.
-    async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let mut written = 0;
-        while written < bytes.len() {
-            let n = self.tls.write(&bytes[written..]).map_err(tls_to_io)?;
-            if n == 0 {
-                // SSL_ERROR_WANT_READ during a write means we need
-                // to drain the peer's flight first (TLS 1.3
-                // re-handshake / key update). Pump the socket once
-                // and retry.
-                self.flush_tls_output().await?;
-                let nb = self.stream.read(&mut self.in_buf).await?;
-                if nb == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "peer closed during write",
-                    ));
-                }
-                self.tls.feed_input(&self.in_buf[..nb]).map_err(tls_to_io)?;
-                continue;
-            }
-            written += n;
-            self.flush_tls_output().await?;
-        }
-        Ok(())
-    }
-
-    /// Drain everything libssl has queued in the output BIO down
-    /// the TCP socket.
-    ///
-    /// Borrows the BIO's internal buffer in place
-    /// ([`TlsConnection::pending_output`]) and writes it straight
-    /// to the socket — no intermediate copy. After the write
-    /// completes the BIO is reset so the next `process` /
-    /// `SSL_write` starts from an empty buffer.
-    async fn flush_tls_output(&mut self) -> io::Result<()> {
-        // Split the borrow so `pending_output(&mut tls)` and
-        // `stream.write_all(...)` can coexist on disjoint fields.
-        let Self { stream, tls, .. } = self;
-        let pending = tls.pending_output();
-        if pending.is_empty() {
-            return Ok(());
-        }
-        stream.write_all(pending).await?;
-        tls.consume_output().map_err(tls_to_io)?;
-        Ok(())
-    }
-
-    /// Best-effort graceful shutdown: send TLS `close_notify`,
-    /// flush the resulting ciphertext, then drop. Does not wait
-    /// for the peer's reciprocal close_notify — the upper layer
-    /// is already done and a misbehaving peer must not be allowed
-    /// to delay teardown.
-    async fn shutdown_clean(&mut self) -> io::Result<()> {
-        let _ = self.tls.shutdown();
-        // Use a short, bounded timer so the shutdown path can't
-        // hang on a wedged socket. RadSec replies are small; the
-        // close_notify alert is one record.
-        let _ = tokio::time::timeout(Duration::from_secs(1), self.flush_tls_output()).await;
-        Ok(())
     }
 }
 

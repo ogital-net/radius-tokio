@@ -1627,6 +1627,14 @@ pub struct TlsConnection {
 unsafe impl Send for TlsConnection {}
 
 impl TlsConnection {
+    pub(crate) fn received_close_notify(&self) -> bool {
+        // SAFETY: ssl is valid; SSL_get_shutdown only inspects connection state.
+        unsafe {
+            aws_lc_sys::SSL_get_shutdown(self.ssl.0.as_ptr()) & aws_lc_sys::SSL_RECEIVED_SHUTDOWN
+                != 0
+        }
+    }
+
     /// Build a fresh server-side connection from `ctx`.
     ///
     /// # Errors
