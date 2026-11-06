@@ -6,3 +6,8 @@ pub use crate::codec::request::Request;
 pub use crate::codec::response::Response;
 pub use crate::exchange::{ClientConfig, ClientError};
 pub use crate::transport::udp::UdpClient;
+
+#[cfg(feature = "radsec")]
+mod radsec;
+#[cfg(feature = "radsec")]
+pub use radsec::RadsecClient;

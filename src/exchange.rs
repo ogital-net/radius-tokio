@@ -117,11 +117,15 @@ struct State {
 pub(crate) struct Registry(Mutex<State>);
 
 pub(crate) struct Registration {
+    pub(crate) lease: Arc<Lease>,
+    pub(crate) receiver: oneshot::Receiver<Result<Response, ClientError>>,
+    pub(crate) packet: PacketBuffer,
+}
+
+pub(crate) struct Lease {
     registry: Arc<Registry>,
     peer: SocketAddr,
     identifier: u8,
-    pub(crate) receiver: oneshot::Receiver<Result<Response, ClientError>>,
-    pub(crate) packet: PacketBuffer,
 }
 
 impl Registry {
@@ -161,9 +165,11 @@ impl Registry {
             },
         );
         Ok(Registration {
-            registry: Arc::clone(self),
-            peer,
-            identifier,
+            lease: Arc::new(Lease {
+                registry: Arc::clone(self),
+                peer,
+                identifier,
+            }),
             receiver,
             packet,
         })
@@ -212,7 +218,19 @@ impl Registry {
     }
 }
 
-impl Drop for Registration {
+impl Lease {
+    pub(crate) fn is_active(&self) -> bool {
+        let state = self.registry.0.lock().expect("exchange registry poisoned");
+        state
+            .peers
+            .get(&self.peer)
+            .and_then(|peer| peer.pending.get(&self.identifier))
+            .and_then(|pending| pending.sender.as_ref())
+            .is_some_and(|sender| !sender.is_closed())
+    }
+}
+
+impl Drop for Lease {
     fn drop(&mut self) {
         let mut state = self.registry.0.lock().expect("exchange registry poisoned");
         if let Some(peer) = state.peers.get_mut(&self.peer) {
@@ -225,6 +243,30 @@ impl Drop for Registration {
 mod tests {
     use super::*;
     use crate::codec::request::Request;
+
+    #[test]
+    fn queued_write_retains_identifier_after_caller_cancels() {
+        let registry = Arc::new(Registry::default());
+        let peer = "127.0.0.1:2083".parse().unwrap();
+        let pending = registry
+            .register(peer, b"secret", 1, |identifier| {
+                Request::access().seal(identifier, b"secret")
+            })
+            .unwrap();
+        let queued = Arc::clone(&pending.lease);
+        drop(pending);
+        assert!(!queued.is_active());
+        assert!(matches!(
+            registry.register(peer, b"secret", 1, |identifier| Request::access()
+                .seal(identifier, b"secret")),
+            Err(ClientError::InFlightLimit)
+        ));
+        drop(queued);
+        assert!(registry
+            .register(peer, b"secret", 1, |identifier| Request::access()
+                .seal(identifier, b"secret"))
+            .is_ok());
+    }
 
     #[test]
     fn identifier_exhaustion_cancellation_and_close() {
