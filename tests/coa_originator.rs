@@ -33,6 +33,10 @@ enum Behaviour {
     Silent,
     /// ACK but with a deliberately corrupted Message-Authenticator.
     CorruptMa,
+    /// Send a corrupt reply immediately followed by a valid ACK.
+    CorruptThenAck,
+    /// ACK with UDP padding beyond the declared packet length.
+    PaddedAck,
 }
 
 /// Spin up a mock NAS on `127.0.0.1:0` and run it until `shutdown`
@@ -118,6 +122,14 @@ async fn spawn_mock_nas(
                     let reply = Reply::new(reply_code, identifier);
                     let sealed = reply.seal_for(&request_authenticator, &secret);
                     let mut bytes = sealed.as_bytes().to_vec();
+                    if matches!(behaviour, Behaviour::CorruptThenAck) {
+                        let mut corrupt = bytes.clone();
+                        corrupt[22] ^= 0xff;
+                        sock.send_to(&corrupt, src).await.unwrap();
+                    }
+                    if matches!(behaviour, Behaviour::PaddedAck) {
+                        bytes.extend_from_slice(&[0xaa; 12]);
+                    }
                     if matches!(behaviour, Behaviour::CorruptMa) {
                         // The Reply builder reserves the M-A as the
                         // first attribute, so its 16-byte value lives
@@ -277,16 +289,57 @@ async fn corrupt_reply_message_authenticator_is_rejected() {
         .await
         .expect_err("M-A mismatch must surface");
 
-    // Corrupting the M-A bytes also breaks the Response Authenticator
-    // (which hashes over them), so the originator may surface either
-    // error first; both represent a correct silent-drop decision.
-    assert!(
-        matches!(
-            err,
-            CoaError::MessageAuthenticatorInvalid | CoaError::AuthenticatorMismatch,
-        ),
-        "got {err:?}",
-    );
+    assert!(matches!(err, CoaError::Timeout), "got {err:?}");
+}
+
+#[tokio::test]
+async fn invalid_reply_does_not_consume_pending_request() {
+    let (nas_addr, _, _join, _shutdown) =
+        spawn_mock_nas(b"shared".to_vec(), Behaviour::CorruptThenAck).await;
+    let originator = CoaOriginator::bind("127.0.0.1:0".parse().unwrap(), quick_config())
+        .await
+        .unwrap();
+    let outcome = originator.send_coa(nas_addr, b"shared", |_| Ok(())).await;
+    assert!(matches!(outcome, Ok(CoaOutcome::Ack { .. })), "{outcome:?}");
+}
+
+#[tokio::test]
+async fn reply_padding_is_ignored() {
+    let (nas_addr, _, _join, _shutdown) =
+        spawn_mock_nas(b"shared".to_vec(), Behaviour::PaddedAck).await;
+    let originator = CoaOriginator::bind("127.0.0.1:0".parse().unwrap(), quick_config())
+        .await
+        .unwrap();
+    let outcome = originator.send_coa(nas_addr, b"shared", |_| Ok(())).await;
+    assert!(matches!(outcome, Ok(CoaOutcome::Ack { .. })), "{outcome:?}");
+}
+
+#[tokio::test]
+async fn cancelled_requests_release_identifiers() {
+    let nas = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target = nas.local_addr().unwrap();
+    let config = CoaConfig {
+        initial_timeout: Duration::from_secs(60),
+        max_retries: 0,
+        max_in_flight_per_target: 1,
+        ..CoaConfig::default()
+    };
+    let originator = CoaOriginator::bind("127.0.0.1:0".parse().unwrap(), config)
+        .await
+        .unwrap();
+    let mut packet = [0; 4096];
+    for _ in 0..=256u16 {
+        let request = originator.send_coa(target, b"shared", |_| Ok(()));
+        tokio::pin!(request);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                result = &mut request => panic!("request ended before cancellation: {result:?}"),
+                received = nas.recv_from(&mut packet) => { received.unwrap(); }
+            }
+        })
+        .await
+        .unwrap();
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

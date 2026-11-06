@@ -48,11 +48,11 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
-use tokio::sync::{oneshot, Mutex, Semaphore};
+use tokio::sync::{oneshot, Semaphore};
 use tokio::time::timeout;
 
 use crate::codec::header::{Code, Header, MAX_PACKET_LEN};
@@ -282,8 +282,8 @@ pub enum CoaError {
     /// The Response Authenticator on the reply did not verify.
     AuthenticatorMismatch,
     /// The reply omitted `Message-Authenticator` or it failed to
-    /// verify. RFC 5176 §3.2 / §3.5 require silent discard; we
-    /// surface it so the caller can log.
+    /// verify. Retained for compatibility; the originator silently
+    /// discards invalid replies and continues waiting until timeout.
     MessageAuthenticatorInvalid,
     /// The originator was dropped while a request was in flight.
     Cancelled,
@@ -334,17 +334,32 @@ impl From<CodecError> for CoaError {
     }
 }
 
-/// Reply payload as delivered by the reader task to a waiter. Carries
-/// the full datagram so the validator can run the Response
-/// Authenticator + M-A checks against the bytes the NAS actually sent.
-struct RawReply {
-    datagram: Vec<u8>,
-}
-
 /// One in-flight slot. Dropping the `Sender` (originator shutdown)
 /// gives the waiter `CoaError::Cancelled`.
 struct Inflight {
-    reply_tx: oneshot::Sender<RawReply>,
+    reply_tx: Option<oneshot::Sender<CoaOutcome>>,
+    code: Code,
+    authenticator: [u8; 16],
+    secret: super::client::SecretBytes,
+}
+
+struct Registration {
+    state: Arc<Mutex<HashMap<SocketAddr, TargetState>>>,
+    target: SocketAddr,
+    identifier: u8,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        if let Some(target) = self
+            .state
+            .lock()
+            .expect("registry poisoned")
+            .get_mut(&self.target)
+        {
+            target.inflight.remove(&self.identifier);
+        }
+    }
 }
 
 /// Per-target state. Identifier allocation and the in-flight registry
@@ -484,7 +499,7 @@ impl CoaOriginator {
         F: FnOnce(&mut PacketBuffer) -> Result<(), CodecError>,
     {
         // ---- per-target rate limit ---------------------------------
-        let sem = self.semaphore_for(target).await;
+        let sem = self.semaphore_for(target);
         let _permit = sem
             .try_acquire_owned()
             .map_err(|_| CoaError::InFlightLimit)?;
@@ -495,8 +510,8 @@ impl CoaOriginator {
         build(&mut buf)?;
 
         // ---- allocate Identifier + register in-flight slot --------
-        let (identifier, reply_rx, request_authenticator) = {
-            let mut all = self.state.lock().await;
+        let (identifier, reply_rx) = {
+            let mut all = self.state.lock().expect("registry poisoned");
             let slot = all.entry(target).or_default();
             let identifier = slot
                 .find_free_identifier()
@@ -521,8 +536,21 @@ impl CoaOriginator {
             buf.set_authenticator(auth);
 
             let (reply_tx, reply_rx) = oneshot::channel();
-            slot.inflight.insert(identifier, Inflight { reply_tx });
-            (identifier, reply_rx, auth)
+            slot.inflight.insert(
+                identifier,
+                Inflight {
+                    reply_tx: Some(reply_tx),
+                    code,
+                    authenticator: auth,
+                    secret: secret.into(),
+                },
+            );
+            (identifier, reply_rx)
+        };
+        let _registration = Registration {
+            state: Arc::clone(&self.state),
+            target,
+            identifier,
         };
 
         // ---- send + retry loop ------------------------------------
@@ -537,14 +565,6 @@ impl CoaOriginator {
         count!("radius_tokio.coa_requests_sent", "code" => code.0.to_string());
         let outcome = send_and_await(&self.socket, target, &bytes, reply_rx, &self.config).await;
 
-        // ---- always reclaim the slot ------------------------------
-        {
-            let mut all = self.state.lock().await;
-            if let Some(slot) = all.get_mut(&target) {
-                slot.inflight.remove(&identifier);
-            }
-        }
-
         #[cfg(feature = "metrics")]
         if let Err(e) = &outcome {
             count!(
@@ -552,8 +572,7 @@ impl CoaOriginator {
                 "outcome" => if matches!(e, CoaError::Timeout) { "timeout" } else { "error" }
             );
         }
-        let raw = outcome?;
-        let result = validate_and_classify(code, &raw.datagram, &request_authenticator, secret);
+        let result = outcome;
         #[allow(clippy::match_same_arms)]
         // arms differ in obs calls; identical only when both features are off
         match &result {
@@ -573,8 +592,8 @@ impl CoaOriginator {
         result
     }
 
-    async fn semaphore_for(&self, target: SocketAddr) -> Arc<Semaphore> {
-        let mut map = self.semaphores.lock().await;
+    fn semaphore_for(&self, target: SocketAddr) -> Arc<Semaphore> {
+        let mut map = self.semaphores.lock().expect("semaphore map poisoned");
         Arc::clone(
             map.entry(target)
                 .or_insert_with(|| Arc::new(Semaphore::new(self.config.max_in_flight_per_target))),
@@ -592,7 +611,7 @@ impl Drop for CoaOriginator {
 
 /// Background task: read every datagram off `socket`, decode the
 /// header, look up the matching in-flight slot by `(src, identifier)`,
-/// and hand the *full datagram bytes* to the waiter via its `oneshot`.
+/// and deliver authenticated replies to the waiter via its `oneshot`.
 ///
 /// Anything we cannot match (unknown identifier, malformed header,
 /// reply for a slot whose waiter has already given up) is silently
@@ -608,15 +627,27 @@ async fn reader_loop(socket: Arc<UdpSocket>, state: Arc<Mutex<HashMap<SocketAddr
         let Ok((header, _)) = Header::parse(datagram) else {
             continue;
         };
-        let inflight = {
-            let mut all = state.lock().await;
-            all.get_mut(&src)
-                .and_then(|t| t.inflight.remove(&header.identifier))
+        let mut all = state.lock().expect("registry poisoned");
+        let Some(slot) = all
+            .get_mut(&src)
+            .and_then(|target| target.inflight.get_mut(&header.identifier))
+        else {
+            continue;
         };
-        let Some(slot) = inflight else { continue };
-        let _ = slot.reply_tx.send(RawReply {
-            datagram: datagram.to_vec(),
-        });
+        if slot.reply_tx.is_none() {
+            continue;
+        }
+        let Ok(outcome) = validate_and_classify(
+            slot.code,
+            datagram,
+            &slot.authenticator,
+            slot.secret.as_bytes(),
+        ) else {
+            continue;
+        };
+        if let Some(reply_tx) = slot.reply_tx.take() {
+            let _ = reply_tx.send(outcome);
+        }
     }
 }
 
@@ -626,11 +657,11 @@ async fn send_and_await(
     socket: &UdpSocket,
     target: SocketAddr,
     bytes: &[u8],
-    mut reply_rx: oneshot::Receiver<RawReply>,
+    mut reply_rx: oneshot::Receiver<CoaOutcome>,
     config: &CoaConfig,
-) -> Result<RawReply, CoaError> {
+) -> Result<CoaOutcome, CoaError> {
     let mut wait = config.initial_timeout;
-    let attempts = config.max_retries.saturating_add(1);
+    let attempts = u16::from(config.max_retries) + 1;
     for attempt in 0..attempts {
         socket.send_to(bytes, target).await?;
         if attempt > 0 {
@@ -666,6 +697,7 @@ fn validate_and_classify(
     };
 
     let (header, attrs) = Header::parse(datagram).map_err(|_| CoaError::AuthenticatorMismatch)?;
+    let datagram = &datagram[..usize::from(header.length)];
 
     if header.code != ack_code && header.code != nak_code {
         return Err(CoaError::UnexpectedReplyCode(header.code));
