@@ -73,6 +73,7 @@ pub(crate) fn validate<'a>(packet: &'a [u8], client: &Client) -> Validated<'a> {
         Ok(parsed) => parsed,
         Err(e) => return Validated::MalformedHeader(e),
     };
+    let packet = &packet[..usize::from(header.length)];
 
     if !verify_request_authenticator(header.code, packet, client.secret()) {
         return Validated::BadRequestAuthenticator {
@@ -360,6 +361,48 @@ mod tests {
         match validate(&[1u8, 2, 3], &client) {
             Validated::MalformedHeader(_) => {}
             _ => panic!("expected MalformedHeader verdict"),
+        }
+    }
+
+    #[test]
+    fn validate_ignores_padding_for_all_request_authenticators() {
+        let secret = b"shared";
+        let client = Client::new(secret.as_slice());
+        for code in [
+            Code::ACCESS_REQUEST,
+            Code::STATUS_SERVER,
+            Code::ACCOUNTING_REQUEST,
+            Code::COA_REQUEST,
+            Code::DISCONNECT_REQUEST,
+        ] {
+            let request_auth = [0x42; 16];
+            let substitute = ma_substitute(code, &request_auth);
+            let mut buffer = PacketBuffer::new(code, 7);
+            let offset = message_authenticator::append_zeroed_slot(&mut buffer).unwrap();
+            buffer.patch_length();
+            let tag = message_authenticator::compute(buffer.as_bytes(), &substitute, secret);
+            message_authenticator::patch(&mut buffer, offset, &tag);
+            let mut packet = buffer.as_bytes().to_vec();
+            let auth = if substitute == [0; 16] {
+                authenticator::compute_zeroed_request(&packet, secret)
+            } else {
+                request_auth
+            };
+            packet[4..20].copy_from_slice(&auth);
+            assert!(matches!(validate(&packet, &client), Validated::Ok { .. }));
+            let mut padded = packet.clone();
+            padded.extend_from_slice(&[80, 18]);
+            padded.extend_from_slice(&[0; 16]);
+            let Validated::Ok { header, attrs } = validate(&padded, &client) else {
+                panic!("legal padding must not invalidate {code}");
+            };
+            assert_eq!(usize::from(header.length), packet.len());
+            assert_eq!(attrs.len(), 18);
+            padded[22] ^= 1;
+            assert!(
+                !matches!(validate(&padded, &client), Validated::Ok { .. }),
+                "tampering inside the declared packet must still be rejected"
+            );
         }
     }
 
