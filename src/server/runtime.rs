@@ -289,11 +289,10 @@ impl<S: ClientStore, H: Handler> Server<S, H> {
             ));
         }
 
-        let cache = Arc::new(DedupCache::new(self.dedup_ttl));
-
         let mut tasks = JoinSet::new();
         for (addr, role) in &self.udp_binds {
             let socket = bind_udp(*addr)?;
+            let cache = Arc::new(DedupCache::new(self.dedup_ttl));
             debug!(event = "udp_bind", %addr, role = ?role);
             tasks.spawn(serve_udp(
                 socket,
@@ -309,6 +308,7 @@ impl<S: ClientStore, H: Handler> Server<S, H> {
         #[cfg(feature = "radsec")]
         for (addr, ctx, role) in &self.radsec_binds {
             let listener = TcpListener::bind(addr).await?;
+            let cache = Arc::new(DedupCache::new(self.dedup_ttl));
             debug!(event = "radsec_bind", %addr, role = ?role);
             tasks.spawn(serve_radsec(
                 listener,

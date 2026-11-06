@@ -112,6 +112,51 @@ fn make_store(secret: &[u8], status_enabled: bool) -> StaticClients {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn status_replies_are_isolated_between_listeners() {
+    let secret = b"shared";
+    let auth = pick_port().await;
+    let acct = pick_port().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server = Server::builder()
+        .clients(make_store(secret, true))
+        .handler(CountHandler {
+            calls: calls.clone(),
+        })
+        .listen_udp_with(auth, ListenerRole::Auth)
+        .listen_udp_with(acct, ListenerRole::Acct)
+        .build()
+        .unwrap();
+    let shutdown = server.shutdown_handle();
+    let task = tokio::spawn(server.run());
+    tokio::task::yield_now().await;
+    let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (req_auth, datagram) = build_status_server(7, secret);
+    probe.send_to(&datagram, auth).await.unwrap();
+    let auth_reply = recv_one(&probe).await;
+    probe.send_to(&datagram, acct).await.unwrap();
+    let acct_reply = recv_one(&probe).await;
+    probe.send_to(&datagram, auth).await.unwrap();
+    let retransmit = recv_one(&probe).await;
+    shutdown.shutdown();
+    task.await.unwrap().unwrap();
+
+    assert_eq!(auth_reply[0], Code::ACCESS_ACCEPT.0);
+    assert_eq!(acct_reply[0], Code::ACCOUNTING_RESPONSE.0);
+    assert_eq!(retransmit, auth_reply);
+    assert!(authenticator::verify_response(
+        &auth_reply,
+        &req_auth,
+        secret
+    ));
+    assert!(authenticator::verify_response(
+        &acct_reply,
+        &req_auth,
+        secret
+    ));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn auth_listener_replies_access_accept() {
     let secret = b"shh".to_vec();
     let bind = pick_port().await;
