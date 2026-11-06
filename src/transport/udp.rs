@@ -69,20 +69,25 @@ impl UdpClient {
         secret: &[u8],
         request: Request,
     ) -> Result<Response, ClientError> {
-        self.send_with(target, secret, |identifier| {
-            request.seal(identifier, secret)
-        })
+        self.send_with(
+            target,
+            secret,
+            |identifier| request.seal(identifier, secret),
+            |_, _| {},
+        )
         .await
     }
 
-    pub(crate) async fn send_with<F>(
+    pub(crate) async fn send_with<F, S>(
         &self,
         target: SocketAddr,
         secret: &[u8],
         build: F,
+        mut on_send: S,
     ) -> Result<Response, ClientError>
     where
         F: FnOnce(u8) -> Result<PacketBuffer, CodecError>,
+        S: FnMut(u16, &PacketBuffer),
     {
         let mut pending =
             self.registry
@@ -92,6 +97,7 @@ impl UdpClient {
             self.socket
                 .send_to(pending.packet.as_bytes(), target)
                 .await?;
+            on_send(attempt, &pending.packet);
             match tokio::time::timeout(wait, &mut pending.receiver).await {
                 Ok(Ok(response)) => return response,
                 Ok(Err(_)) => return Err(ClientError::Closed),
@@ -120,6 +126,43 @@ async fn read_replies(socket: Arc<UdpSocket>, registry: Arc<Registry>) {
         } else {
             registry.close();
             return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn observer_reports_initial_send_and_identical_retries() {
+        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpClient::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            ClientConfig {
+                initial_timeout: Duration::from_millis(5),
+                max_retries: 2,
+                backoff_multiplier: 1,
+                ..ClientConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut sends = Vec::new();
+        let result = client
+            .send_with(
+                target.local_addr().unwrap(),
+                b"secret",
+                |identifier| Request::coa().seal(identifier, b"secret"),
+                |attempt, packet| sends.push((attempt, packet.as_bytes().to_vec())),
+            )
+            .await;
+        assert!(matches!(result, Err(ClientError::Timeout)));
+        assert_eq!(sends.len(), 3);
+        for (index, (attempt, packet)) in sends.iter().enumerate() {
+            assert_eq!(usize::from(*attempt), index);
+            assert_eq!(packet, &sends[0].1);
         }
     }
 }

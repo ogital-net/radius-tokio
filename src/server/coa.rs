@@ -19,10 +19,8 @@
 //!   `MD5(packet-with-zeroed-auth || secret)` (RFC 5176 §2.3, same
 //!   formula as Accounting-Request);
 //! * a `Message-Authenticator` attribute (RFC 3579 §3.2) keyed on
-//!   the shared secret, computed over the final packet bytes with
-//!   the M-A slot zeroed and the Authenticator field set to the
-//!   value above. RFC 5176 §3.1 / §3.2 require it on both request
-//!   and reply.
+//!   the shared secret, computed with both the M-A slot and the
+//!   Authenticator field zeroed before computing the request MD5.
 //!
 //! Inbound replies are validated the same way: Response Authenticator
 //! (`MD5(reply-with-request-auth || secret)`) plus a present and
@@ -443,11 +441,25 @@ impl CoaOriginator {
         let mut buf = PacketBuffer::new(code, 0);
         message_authenticator::append_zeroed_slot(&mut buf)?;
         build(&mut buf)?;
-        debug!(event = "coa_send", %target, code = code.0);
-        count!("radius_tokio.coa_requests_sent", "code" => code.0.to_string());
+        let request = Request::from_buffer(buf);
+        let mut _identifier = 0;
         let response = self
             .transport
-            .send(target, secret, Request::from_buffer(buf))
+            .send_with(
+                target,
+                secret,
+                |identifier| request.seal(identifier, secret),
+                |_attempt, _packet| {
+                    _identifier = _packet.header().identifier;
+                    if _attempt == 0 {
+                        debug!(event = "coa_send", %target, code = code.0, id = _identifier, len = _packet.as_bytes().len());
+                        count!("radius_tokio.coa_requests_sent", "code" => code.0.to_string());
+                    } else {
+                        debug!(event = "coa_retransmit", %target, attempt = _attempt, len = _packet.as_bytes().len());
+                        count!("radius_tokio.coa_retransmits");
+                    }
+                },
+            )
             .await
             .map_err(|error| match error {
                 ClientError::Io(error) => CoaError::Io(error),
@@ -469,15 +481,19 @@ impl CoaOriginator {
         // arms differ in obs calls; identical only when both features are off
         match &result {
             Ok(CoaOutcome::Ack { .. }) => {
-                debug!(event = "coa_ack", %target, code = code.0);
+                debug!(event = "coa_ack", %target, code = code.0, id = _identifier);
                 count!("radius_tokio.coa_outcomes", "outcome" => "ack");
             }
             Ok(CoaOutcome::Nak { .. }) => {
-                debug!(event = "coa_nak", %target, code = code.0);
+                debug!(event = "coa_nak", %target, code = code.0, id = _identifier);
                 count!("radius_tokio.coa_outcomes", "outcome" => "nak");
             }
+            Err(CoaError::Timeout) => {
+                debug!(event = "coa_error", %target, code = code.0, id = _identifier, error = %CoaError::Timeout);
+                count!("radius_tokio.coa_outcomes", "outcome" => "timeout");
+            }
             Err(_e) => {
-                debug!(event = "coa_error", %target, code = code.0, error = %_e);
+                debug!(event = "coa_error", %target, code = code.0, id = _identifier, error = %_e);
                 count!("radius_tokio.coa_outcomes", "outcome" => "error");
             }
         }
