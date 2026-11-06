@@ -35,7 +35,7 @@ radius-tokio-dict-codegen = { path = "crates/radius-tokio-dict-codegen", version
 # crate, which uses `default-features = false`) to fight Cargo's
 # workspace-inheritance rules. Members specify the runtime/IO
 # features they actually need via `features = […]`.
-tokio = { version = "1", default-features = false }
+tokio = { version = "1.53.3", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 metrics = { version = "0.24" }
 

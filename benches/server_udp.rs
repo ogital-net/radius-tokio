@@ -66,8 +66,11 @@ const SECRET: &[u8] = b"benchmark-shared-secret";
 struct NoopHandler;
 
 impl Handler for NoopHandler {
-    async fn handle(&self, request: Request<'_>) -> HandlerResult {
-        HandlerResult::Reply(request.reply(Code::ACCESS_ACCEPT))
+    fn handle(
+        &self,
+        request: Request<'_>,
+    ) -> impl std::future::Future<Output = HandlerResult> + Send {
+        std::future::ready(HandlerResult::Reply(request.reply(Code::ACCESS_ACCEPT)))
     }
 }
 

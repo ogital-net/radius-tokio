@@ -427,7 +427,7 @@ mod tests {
         assert_eq!(fragments(&bytes).count(), 0);
         let mut out = Vec::new();
         assert_eq!(reassemble_into(&bytes, &mut out), 0);
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [u8; 0]);
     }
 
     #[test]

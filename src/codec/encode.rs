@@ -878,14 +878,14 @@ mod tests {
         let mut buf = PacketBuffer::with_capacity(Code::ACCESS_ACCEPT, 1, 512);
         buf.add_attribute(1, b"alice").unwrap();
         buf.add_attribute(2, b"bob").unwrap();
-        assert!(!buf.attributes().is_empty());
+        assert_ne!(buf.attributes(), []);
 
         buf.reset(Code::ACCESS_REJECT, 9);
         let h = buf.header();
         assert_eq!(h.code, Code::ACCESS_REJECT);
         assert_eq!(h.identifier, 9);
         assert_eq!(h.authenticator, [0u8; 16]);
-        assert!(buf.attributes().is_empty());
+        assert_eq!(buf.attributes(), []);
     }
 
     #[test]

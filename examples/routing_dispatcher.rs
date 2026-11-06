@@ -130,7 +130,10 @@ struct AccessHandler {
 }
 
 impl Handler for AccessHandler {
-    async fn handle(&self, request: Request<'_>) -> HandlerResult {
+    fn handle(
+        &self,
+        request: Request<'_>,
+    ) -> impl std::future::Future<Output = HandlerResult> + Send {
         self.stats.access.fetch_add(1, Ordering::Relaxed);
 
         let flavour = classify(&request);
@@ -151,7 +154,7 @@ impl Handler for AccessHandler {
         if matches!(reply_code, Code::ACCESS_ACCEPT) {
             reply.add(attrs::SESSION_TIMEOUT, 3600u32).unwrap();
         }
-        HandlerResult::Reply(reply)
+        std::future::ready(HandlerResult::Reply(reply))
     }
 }
 
@@ -162,7 +165,10 @@ struct AccountingHandler {
 }
 
 impl Handler for AccountingHandler {
-    async fn handle(&self, request: Request<'_>) -> HandlerResult {
+    fn handle(
+        &self,
+        request: Request<'_>,
+    ) -> impl std::future::Future<Output = HandlerResult> + Send {
         self.stats.accounting.fetch_add(1, Ordering::Relaxed);
         println!(
             "acct:      id={} src={} status={:?}",
@@ -170,7 +176,9 @@ impl Handler for AccountingHandler {
             request.src(),
             request.acct_status_type(),
         );
-        HandlerResult::Reply(request.reply(Code::ACCOUNTING_RESPONSE))
+        std::future::ready(HandlerResult::Reply(
+            request.reply(Code::ACCOUNTING_RESPONSE),
+        ))
     }
 }
 
@@ -181,7 +189,10 @@ struct CoaHandler {
 }
 
 impl Handler for CoaHandler {
-    async fn handle(&self, request: Request<'_>) -> HandlerResult {
+    fn handle(
+        &self,
+        request: Request<'_>,
+    ) -> impl std::future::Future<Output = HandlerResult> + Send {
         self.stats.coa.fetch_add(1, Ordering::Relaxed);
         println!(
             "coa:       id={} src={}",
@@ -192,11 +203,11 @@ impl Handler for CoaHandler {
         // and None on anything else — but the router guarantees we
         // only see CoA-Request here, so the unwrap is structurally
         // safe.
-        HandlerResult::Reply(
+        std::future::ready(HandlerResult::Reply(
             request
                 .coa_ack()
                 .expect("CodeRouter guarantees CoA-Request"),
-        )
+        ))
     }
 }
 
@@ -207,18 +218,21 @@ struct DisconnectHandler {
 }
 
 impl Handler for DisconnectHandler {
-    async fn handle(&self, request: Request<'_>) -> HandlerResult {
+    fn handle(
+        &self,
+        request: Request<'_>,
+    ) -> impl std::future::Future<Output = HandlerResult> + Send {
         self.stats.disconnect.fetch_add(1, Ordering::Relaxed);
         println!(
             "disc:      id={} src={}",
             request.identifier(),
             request.src(),
         );
-        HandlerResult::Reply(
+        std::future::ready(HandlerResult::Reply(
             request
                 .coa_ack()
                 .expect("CodeRouter guarantees Disconnect-Request"),
-        )
+        ))
     }
 }
 

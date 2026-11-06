@@ -267,7 +267,7 @@ mod tests {
         assert_eq!(h.length, 20);
         assert_eq!(h.authenticator[0], 0xa0);
         assert_eq!(h.authenticator[15], 0xaf);
-        assert!(attrs.is_empty());
+        assert_eq!(attrs, []);
     }
 
     #[test]
@@ -287,7 +287,7 @@ mod tests {
         let buf = build(1, 1, 20, 28);
         let (h, attrs) = Header::parse(&buf).unwrap();
         assert_eq!(h.length, 20);
-        assert!(attrs.is_empty());
+        assert_eq!(attrs, []);
     }
 
     #[test]

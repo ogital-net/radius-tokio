@@ -91,15 +91,18 @@ impl EapMd5 {
 }
 
 impl Handler for EapMd5 {
-    async fn handle(&self, request: Request<'_>) -> HandlerResult {
+    fn handle(
+        &self,
+        request: Request<'_>,
+    ) -> impl std::future::Future<Output = HandlerResult> + Send {
         if request.code() != Code::ACCESS_REQUEST {
-            return HandlerResult::Drop;
+            return std::future::ready(HandlerResult::Drop);
         }
         let eap_buf = request.eap_message();
         let Ok(eap_pkt) = eap::Packet::parse(&eap_buf) else {
-            return HandlerResult::Drop;
+            return std::future::ready(HandlerResult::Drop);
         };
-        match (eap_pkt.code(), eap_pkt.typ(), request.state()) {
+        std::future::ready(match (eap_pkt.code(), eap_pkt.typ(), request.state()) {
             // Round 1: Response/Identity → Challenge.
             (eap::Code::RESPONSE, Some(eap::Type::IDENTITY), None) => {
                 let state = self.token(1);
@@ -122,14 +125,14 @@ impl Handler for EapMd5 {
             // Round 2: Response/MD5-Challenge → Accept or Reject.
             (eap::Code::RESPONSE, Some(eap::Type::MD5_CHALLENGE), Some(state)) => {
                 let Ok(key): Result<[u8; 16], _> = state.try_into() else {
-                    return HandlerResult::Drop;
+                    return std::future::ready(HandlerResult::Drop);
                 };
                 let Some((id, challenge)) = self.sessions.lock().unwrap().remove(&key) else {
-                    return HandlerResult::Drop;
+                    return std::future::ready(HandlerResult::Drop);
                 };
                 let body = eap_pkt.type_data();
                 if body.len() < 17 || body[0] != 16 {
-                    return HandlerResult::Drop;
+                    return std::future::ready(HandlerResult::Drop);
                 }
                 let mut response = [0u8; 16];
                 response.copy_from_slice(&body[1..17]);
@@ -158,7 +161,7 @@ impl Handler for EapMd5 {
                 }
             }
             _ => HandlerResult::Drop,
-        }
+        })
     }
 }
 

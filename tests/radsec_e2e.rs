@@ -50,8 +50,8 @@ use radius_tokio::Code;
 struct AcceptAll;
 
 impl Handler for AcceptAll {
-    async fn handle(&self, request: Request<'_>) -> HandlerResult {
-        HandlerResult::Reply(request.reply(Code::ACCESS_ACCEPT))
+    fn handle(&self, request: Request<'_>) -> impl Future<Output = HandlerResult> + Send {
+        std::future::ready(HandlerResult::Reply(request.reply(Code::ACCESS_ACCEPT)))
     }
 }
 
@@ -80,8 +80,8 @@ impl ClientStore for SanStore {
     // so opening the gate to any source is safe — the mTLS
     // handshake against the listener's trust store rejects
     // anyone without the test client cert.
-    async fn admit_radsec(&self, _src: SocketAddr) -> bool {
-        true
+    fn admit_radsec(&self, _src: SocketAddr) -> impl Future<Output = bool> + Send {
+        std::future::ready(true)
     }
 
     fn lookup_radsec_by_cert(

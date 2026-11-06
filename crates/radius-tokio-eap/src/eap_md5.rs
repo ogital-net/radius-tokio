@@ -108,12 +108,16 @@ impl StaticCredentials {
 }
 
 impl Credentials for StaticCredentials {
-    async fn lookup<'a>(&'a self, _outer: &'a Outer<'a>, username: &'a [u8]) -> Option<Vec<u8>> {
-        if username == self.username.as_slice() {
+    fn lookup<'a>(
+        &'a self,
+        _outer: &'a Outer<'a>,
+        username: &'a [u8],
+    ) -> impl std::future::Future<Output = Option<Vec<u8>>> + Send + 'a {
+        std::future::ready(if username == self.username.as_slice() {
             Some(self.password.clone())
         } else {
             None
-        }
+        })
     }
 }
 

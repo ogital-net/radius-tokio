@@ -50,12 +50,15 @@ const SHELL_PRIV_LVL_15: &str = "shell:priv-lvl=15";
 struct AcceptWithCiscoAvPair;
 
 impl Handler for AcceptWithCiscoAvPair {
-    async fn handle(&self, request: Request<'_>) -> HandlerResult {
+    fn handle(
+        &self,
+        request: Request<'_>,
+    ) -> impl std::future::Future<Output = HandlerResult> + Send {
         let mut reply = request.reply(Code::ACCESS_ACCEPT);
         reply
             .add_vsa(CISCO_AVPAIR, SHELL_PRIV_LVL_15)
             .expect("Cisco-AVPair fits in one attribute");
-        HandlerResult::Reply(reply)
+        std::future::ready(HandlerResult::Reply(reply))
     }
 }
 

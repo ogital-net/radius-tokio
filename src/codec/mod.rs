@@ -732,7 +732,7 @@ mod tests {
         // Length placeholder = MIN_PACKET_LEN until seal.
         assert_eq!(h.length as usize, MIN_PACKET_LEN);
         assert_eq!(h.authenticator, [0; 16]);
-        assert!(pkt.attributes().is_empty());
+        assert_eq!(pkt.attributes(), []);
     }
 
     #[test]

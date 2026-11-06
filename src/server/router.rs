@@ -265,9 +265,12 @@ mod tests {
     }
 
     impl Handler for Recorder {
-        async fn handle(&self, request: Request<'_>) -> HandlerResult {
+        fn handle(
+            &self,
+            request: Request<'_>,
+        ) -> impl std::future::Future<Output = HandlerResult> + Send {
             self.hits.fetch_add(1, Ordering::SeqCst);
-            HandlerResult::Reply(request.reply(self.reply_code))
+            std::future::ready(HandlerResult::Reply(request.reply(self.reply_code)))
         }
     }
 
@@ -401,9 +404,12 @@ mod tests {
             reply: Code,
         }
         impl Handler for Counting {
-            async fn handle(&self, request: Request<'_>) -> HandlerResult {
+            fn handle(
+                &self,
+                request: Request<'_>,
+            ) -> impl std::future::Future<Output = HandlerResult> + Send {
                 self.shared.fetch_add(1, Ordering::SeqCst);
-                HandlerResult::Reply(request.reply(self.reply))
+                std::future::ready(HandlerResult::Reply(request.reply(self.reply)))
             }
         }
 

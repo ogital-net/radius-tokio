@@ -104,11 +104,9 @@ impl EapMschapV2Handler {
         out[8..].copy_from_slice(&(n.wrapping_mul(0x9E37_79B9_7F4A_7C15)).to_be_bytes());
         out
     }
-}
 
-impl Handler for EapMschapV2Handler {
     #[allow(clippy::too_many_lines)]
-    async fn handle(&self, request: Request<'_>) -> HandlerResult {
+    fn handle_request(&self, request: &Request<'_>) -> HandlerResult {
         if request.code() != Code::ACCESS_REQUEST {
             return HandlerResult::Drop;
         }
@@ -264,6 +262,15 @@ impl Handler for EapMschapV2Handler {
             }
             _ => HandlerResult::Drop,
         }
+    }
+}
+
+impl Handler for EapMschapV2Handler {
+    fn handle(
+        &self,
+        request: Request<'_>,
+    ) -> impl std::future::Future<Output = HandlerResult> + Send {
+        std::future::ready(self.handle_request(&request))
     }
 }
 

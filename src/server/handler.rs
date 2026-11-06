@@ -925,7 +925,7 @@ mod tests {
         assert_eq!(req.code(), Code::ACCESS_REQUEST);
         assert_eq!(req.identifier(), 0);
         assert_eq!(req.dst().port(), 1812);
-        assert!(req.raw_attributes().is_empty());
+        assert_eq!(req.raw_attributes(), []);
     }
 
     #[test]

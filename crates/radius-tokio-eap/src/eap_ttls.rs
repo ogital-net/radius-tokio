@@ -270,19 +270,19 @@ impl StaticPapCredentials {
 }
 
 impl PapCredentials for StaticPapCredentials {
-    async fn verify<'a>(
+    fn verify<'a>(
         &'a self,
         _outer: &'a Outer<'a>,
         username: &'a [u8],
         password: &'a [u8],
-    ) -> bool {
+    ) -> impl std::future::Future<Output = bool> + Send + 'a {
         // Constant-time compare on the password to avoid timing
         // leaks on the secret half; username equality is fine to
         // short-circuit.
         if username != self.username.as_slice() {
-            return false;
+            return std::future::ready(false);
         }
-        radius_tokio::ct_eq(password, &self.password)
+        std::future::ready(radius_tokio::ct_eq(password, &self.password))
     }
 }
 

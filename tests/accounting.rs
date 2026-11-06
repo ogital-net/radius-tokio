@@ -37,7 +37,10 @@ struct AcctHandler {
 }
 
 impl Handler for AcctHandler {
-    async fn handle(&self, request: Request<'_>) -> HandlerResult {
+    fn handle(
+        &self,
+        request: Request<'_>,
+    ) -> impl std::future::Future<Output = HandlerResult> + Send {
         // This fixture only enumerates Accounting-Request handling;
         // reject any other code so a bug surfaces clearly.
         assert_eq!(request.code(), Code::ACCOUNTING_REQUEST);
@@ -55,7 +58,9 @@ impl Handler for AcctHandler {
                 self.counts.other.fetch_add(1, Ordering::Relaxed);
             }
         }
-        HandlerResult::Reply(request.reply(Code::ACCOUNTING_RESPONSE))
+        std::future::ready(HandlerResult::Reply(
+            request.reply(Code::ACCOUNTING_RESPONSE),
+        ))
     }
 }
 

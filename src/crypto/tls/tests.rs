@@ -87,7 +87,7 @@ fn peer_certificate_exposes_subject_der_and_spki() {
         peer.subject_display()
     );
     let der = peer.to_der().unwrap();
-    assert!(!der.is_empty());
+    assert_ne!(der, [] as [u8; 0]);
     let spki = peer.spki_sha256().unwrap();
     assert_ne!(spki, [0u8; 32]);
     let sans = peer.subject_alt_names().unwrap();
@@ -569,7 +569,7 @@ fn pending_output_is_empty_before_handshake() {
     let ctx =
         TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
     let mut conn = TlsConnection::accept(&ctx).unwrap();
-    assert!(conn.pending_output().is_empty());
+    assert_eq!(conn.pending_output(), []);
 }
 
 #[test]

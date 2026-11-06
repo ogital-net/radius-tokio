@@ -478,9 +478,12 @@ mod tests {
     }
 
     impl Handler for AcceptCounter {
-        async fn handle(&self, request: Request<'_>) -> HandlerResult {
+        fn handle(
+            &self,
+            request: Request<'_>,
+        ) -> impl std::future::Future<Output = HandlerResult> + Send {
             *self.calls.lock().unwrap() += 1;
-            HandlerResult::Reply(request.reply(Code::ACCESS_ACCEPT))
+            std::future::ready(HandlerResult::Reply(request.reply(Code::ACCESS_ACCEPT)))
         }
     }
 

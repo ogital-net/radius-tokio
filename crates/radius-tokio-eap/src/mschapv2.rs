@@ -186,19 +186,19 @@ impl StaticCredentials {
 }
 
 impl Credentials for StaticCredentials {
-    async fn lookup<'a>(
+    fn lookup<'a>(
         &'a self,
         _outer: &'a Outer<'a>,
         username: &'a [u8],
-    ) -> Option<CredentialSecret> {
-        if username == self.username.as_slice() {
+    ) -> impl std::future::Future<Output = Option<CredentialSecret>> + Send + 'a {
+        std::future::ready(if username == self.username.as_slice() {
             Some(match &self.secret {
                 CredentialSecret::Cleartext(s) => CredentialSecret::Cleartext(s.clone()),
                 CredentialSecret::NtHash(h) => CredentialSecret::NtHash(*h),
             })
         } else {
             None
-        }
+        })
     }
 }
 

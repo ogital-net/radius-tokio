@@ -201,13 +201,13 @@ impl<I: InnerEap> Peap<I> {
         }
         // Form (2): wrap everything buffered as an EAP-Response
         // using the most recent request id.
-        let type_and_data: Vec<u8> = self.inner_rx_buf.drain(..).collect();
-        let total = u16::try_from(4 + type_and_data.len()).unwrap_or(u16::MAX);
+        let total = u16::try_from(4 + self.inner_rx_buf.len()).unwrap_or(u16::MAX);
         let mut pkt = Vec::with_capacity(usize::from(total));
         pkt.push(2); // EAP Code = Response
         pkt.push(self.last_inner_request_id);
         pkt.extend_from_slice(&total.to_be_bytes());
-        pkt.extend_from_slice(&type_and_data);
+        pkt.extend_from_slice(&self.inner_rx_buf);
+        self.inner_rx_buf.clear();
         Some(pkt)
     }
 

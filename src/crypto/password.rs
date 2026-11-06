@@ -331,7 +331,7 @@ mod tests {
         ] {
             let ct = user_password_encrypt(password, secret, &auth);
             assert_eq!(ct.len() % 16, 0);
-            assert!(!ct.is_empty());
+            assert_ne!(ct, [] as [u8; 0]);
             let pt = user_password_decrypt(&ct, secret, &auth).expect("decrypt");
             assert_eq!(pt.as_bytes(), password);
         }

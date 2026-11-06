@@ -70,13 +70,13 @@ use radius_tokio::Code;
 struct AcceptAll;
 
 impl Handler for AcceptAll {
-    async fn handle(&self, request: Request<'_>) -> HandlerResult {
+    fn handle(&self, request: Request<'_>) -> impl Future<Output = HandlerResult> + Send {
         if request.code() != Code::ACCESS_REQUEST {
-            return HandlerResult::Drop;
+            return std::future::ready(HandlerResult::Drop);
         }
         let mut reply = request.reply(Code::ACCESS_ACCEPT);
         reply.add(attrs::SESSION_TIMEOUT, 3600u32).unwrap();
-        HandlerResult::Reply(reply)
+        std::future::ready(HandlerResult::Reply(reply))
     }
 }
 
@@ -102,8 +102,8 @@ impl ClientStore for MixedStore {
     // this to a CIDR allow-list or wire it to a per-IP rate
     // limiter — the default returns `false` precisely so consumers
     // are forced to make this call deliberately.
-    async fn admit_radsec(&self, _src: SocketAddr) -> bool {
-        true
+    fn admit_radsec(&self, _src: SocketAddr) -> impl Future<Output = bool> + Send {
+        std::future::ready(true)
     }
 
     fn lookup_radsec_by_cert(

@@ -786,7 +786,7 @@ mod tests {
         let (flags, total, slice) = frames[0];
         assert_eq!(flags.to_byte(), Flags::S);
         assert_eq!(total, None);
-        assert!(slice.is_empty());
+        assert_eq!(slice, []);
     }
 
     #[test]

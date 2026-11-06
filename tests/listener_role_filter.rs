@@ -31,9 +31,12 @@ struct CountHandler {
 }
 
 impl Handler for CountHandler {
-    async fn handle(&self, request: Request<'_>) -> HandlerResult {
+    fn handle(
+        &self,
+        request: Request<'_>,
+    ) -> impl std::future::Future<Output = HandlerResult> + Send {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        HandlerResult::Reply(request.reply(Code::ACCESS_ACCEPT))
+        std::future::ready(HandlerResult::Reply(request.reply(Code::ACCESS_ACCEPT)))
     }
 }
 

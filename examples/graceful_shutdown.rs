@@ -41,8 +41,11 @@ use radius_tokio::Code;
 struct AcceptAll;
 
 impl Handler for AcceptAll {
-    async fn handle(&self, request: Request<'_>) -> HandlerResult {
-        HandlerResult::Reply(request.reply(Code::ACCESS_ACCEPT))
+    fn handle(
+        &self,
+        request: Request<'_>,
+    ) -> impl std::future::Future<Output = HandlerResult> + Send {
+        std::future::ready(HandlerResult::Reply(request.reply(Code::ACCESS_ACCEPT)))
     }
 }
 
