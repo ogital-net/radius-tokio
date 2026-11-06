@@ -251,6 +251,13 @@ pub(crate) async fn dispatch_validated<H: Handler>(
         identifier: header.identifier,
         request_authenticator: header.authenticator,
     };
+    if let Some(cached) = cache.lookup(&dedup_key) {
+        return Dispatched::Replay {
+            bytes: cached,
+            code: header.code,
+            identifier: header.identifier,
+        };
+    }
     let _reservation = cache.lock_request(&dedup_key).await;
     if let Some(cached) = cache.lookup(&dedup_key) {
         return Dispatched::Replay {
@@ -507,7 +514,16 @@ mod tests {
             &cache,
             None,
         );
-        let second = dispatch_validated(header, &[], peer, local, &client, &handler, &cache, None);
+        let second = dispatch_validated(
+            header.clone(),
+            &[],
+            peer,
+            local,
+            &client,
+            &handler,
+            &cache,
+            None,
+        );
         let release = async {
             handler.entered.acquire().await.unwrap().forget();
             handler.release.add_permits(2);
@@ -517,5 +533,20 @@ mod tests {
         assert_eq!(first.bytes(), second.bytes());
         assert!(matches!(first, Dispatched::Reply { .. }));
         assert!(matches!(second, Dispatched::Replay { .. }));
+        let request_key = DedupKey {
+            src: peer,
+            code: header.code.0,
+            identifier: header.identifier,
+            request_authenticator: header.authenticator,
+        };
+        let _held = cache.lock_request(&request_key).await;
+        let cached = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatch_validated(header, &[], peer, local, &client, &handler, &cache, None),
+        )
+        .await
+        .expect("cached replies must bypass the reservation");
+        assert!(matches!(cached, Dispatched::Replay { .. }));
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
     }
 }

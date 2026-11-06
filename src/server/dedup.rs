@@ -74,11 +74,41 @@ impl ReplyShard {
 const SHARD_COUNT: usize = 16;
 const SHARD_MASK: usize = SHARD_COUNT - 1;
 
+type RequestGate = tokio::sync::Mutex<RequestCleanup>;
+type RequestShard = Arc<Mutex<HashMap<Key, Weak<RequestGate>>>>;
+
+#[derive(Debug)]
+struct RequestCleanup {
+    gate: Weak<RequestGate>,
+    shard: RequestShard,
+    key: Key,
+}
+
+impl Drop for RequestCleanup {
+    fn drop(&mut self) {
+        let mut shard = self
+            .shard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if shard
+            .get(&self.key)
+            .is_some_and(|gate| Weak::ptr_eq(gate, &self.gate))
+        {
+            shard.remove(&self.key);
+        }
+    }
+}
+
+/// Held while processing a request; releases its lock before its gate.
+pub(crate) struct RequestReservation {
+    _guard: tokio::sync::OwnedMutexGuard<RequestCleanup>,
+}
+
 /// Bounded-lifetime, sharded dedup + retransmit cache.
 #[derive(Debug)]
 pub(crate) struct DedupCache {
     shards: [Mutex<ReplyShard>; SHARD_COUNT],
-    in_flight: [Mutex<HashMap<Key, Weak<tokio::sync::Mutex<()>>>>; SHARD_COUNT],
+    in_flight: [RequestShard; SHARD_COUNT],
     ttl: Duration,
 }
 
@@ -87,7 +117,7 @@ impl DedupCache {
     pub(crate) fn new(ttl: Duration) -> Self {
         Self {
             shards: std::array::from_fn(|_| Mutex::new(ReplyShard::default())),
-            in_flight: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            in_flight: std::array::from_fn(|_| Arc::new(Mutex::new(HashMap::new()))),
             ttl,
         }
     }
@@ -104,21 +134,29 @@ impl DedupCache {
     }
 
     /// Serialize processing of one request key, releasing on cancellation.
-    pub(crate) async fn lock_request(&self, key: &Key) -> tokio::sync::OwnedMutexGuard<()> {
+    pub(crate) async fn lock_request(&self, key: &Key) -> RequestReservation {
+        let request_shard = &self.in_flight[Self::shard_for(key)];
         let gate = {
-            let mut shard = self.in_flight[Self::shard_for(key)]
+            let mut shard = request_shard
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            shard.retain(|_, gate| gate.strong_count() > 0);
             if let Some(gate) = shard.get(key).and_then(Weak::upgrade) {
                 gate
             } else {
-                let gate = Arc::new(tokio::sync::Mutex::new(()));
+                let gate = Arc::new_cyclic(|gate| {
+                    tokio::sync::Mutex::new(RequestCleanup {
+                        gate: gate.clone(),
+                        shard: Arc::clone(request_shard),
+                        key: key.clone(),
+                    })
+                });
                 shard.insert(key.clone(), Arc::downgrade(&gate));
                 gate
             }
         };
-        gate.lock_owned().await
+        RequestReservation {
+            _guard: gate.lock_owned().await,
+        }
     }
 
     /// Look up a cached reply. Returns `None` on miss or expiry.
@@ -290,12 +328,41 @@ mod tests {
             .await
             .expect("reservation must release on cancellation");
         drop(next);
-        let _other = cache.lock_request(&key(2)).await;
+        drop(cache.lock_request(&key(2)).await);
         let retained: usize = cache
             .in_flight
             .iter()
             .map(|shard| shard.lock().unwrap().len())
             .sum();
-        assert!(retained <= 2);
+        assert_eq!(retained, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_waiter_and_owner_removes_reservation_metadata() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let cache = DedupCache::new(Duration::from_secs(30));
+        let request_key = key(1);
+        let owner = cache.lock_request(&request_key).await;
+        let mut waiter = Box::pin(cache.lock_request(&request_key));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        drop(waiter);
+        assert_eq!(
+            cache.in_flight[DedupCache::shard_for(&request_key)]
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(owner);
+        assert!(cache.in_flight[DedupCache::shard_for(&request_key)]
+            .lock()
+            .unwrap()
+            .is_empty());
     }
 }
