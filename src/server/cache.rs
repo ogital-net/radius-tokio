@@ -166,6 +166,22 @@ enum Action {
     Resolve(broadcast::Sender<Option<Arc<Client>>>),
 }
 
+struct PendingLookup<'a, S> {
+    cache: &'a CachedStore<S>,
+    key: IpAddr,
+    tx: broadcast::Sender<Option<Arc<Client>>>,
+}
+
+impl<S> Drop for PendingLookup<'_, S> {
+    fn drop(&mut self) {
+        let mut map = self.cache.lock_state();
+        if matches!(map.get(&self.key), Some(Slot::Pending(current)) if current.same_channel(&self.tx))
+        {
+            map.remove(&self.key);
+        }
+    }
+}
+
 impl<S: ClientStore> ClientStore for CachedStore<S> {
     fn lookup_udp(&self, src: SocketAddr) -> impl Future<Output = Option<Arc<Client>>> + Send {
         let key = src.ip();
@@ -194,7 +210,17 @@ impl<S: ClientStore> ClientStore for CachedStore<S> {
             count!(metrics::CLIENT_CACHE_HITS);
         }
 
+        let pending = match &action {
+            Action::Resolve(tx) => Some(PendingLookup {
+                cache: self,
+                key,
+                tx: tx.clone(),
+            }),
+            _ => None,
+        };
+
         async move {
+            let _pending = pending;
             match action {
                 Action::Hit(value) => value,
                 Action::Wait(mut rx) => {
@@ -477,5 +503,60 @@ mod tests {
         assert_send(&fut);
         let boxed: Pin<Box<dyn Future<Output = _> + Send>> = Box::pin(fut);
         drop(boxed);
+    }
+
+    #[tokio::test]
+    async fn dropping_unpolled_resolver_allows_retry() {
+        let cache = CachedStore::with_defaults(CountingStore::new(None));
+        let src = addr("10.0.0.1");
+        drop(cache.lookup_udp(src));
+        tokio::time::timeout(Duration::from_secs(1), cache.lookup_udp(src))
+            .await
+            .expect("abandoned lookup must not leave a pending slot");
+        assert_eq!(cache.inner().calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_running_resolver_allows_retry() {
+        let gate = Arc::new(Notify::new());
+        let cache = CachedStore::with_defaults(CountingStore::with_gate(None, gate.clone()));
+        let src = addr("10.0.0.1");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), cache.lookup_udp(src))
+                .await
+                .is_err()
+        );
+        gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), cache.lookup_udp(src))
+            .await
+            .expect("cancelled resolver must allow a new lookup");
+        assert_eq!(cache.inner().calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelling_resolver_wakes_existing_waiter() {
+        use std::task::Poll;
+
+        let gate = Arc::new(Notify::new());
+        let cache = CachedStore::with_defaults(CountingStore::with_gate(None, gate.clone()));
+        let src = addr("10.0.0.1");
+        let mut resolver = Box::pin(cache.lookup_udp(src));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(resolver.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        let mut waiter = Box::pin(cache.lookup_udp(src));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        drop(resolver);
+        gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("cancelled resolver must wake waiters");
+        assert_eq!(cache.inner().calls(), 2);
     }
 }
