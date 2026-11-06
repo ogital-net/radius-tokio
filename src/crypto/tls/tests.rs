@@ -84,6 +84,11 @@ fn production_client_validates_server_name_and_context_role() {
         TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, &pki.ca_pem).unwrap();
     let client =
         TlsContext::client(&pki.client_chain_pem, &pki.client_key_pem, &pki.ca_pem).unwrap();
+    assert!(server.requires_client_certificate());
+    assert!(!client.requires_client_certificate());
+    let unauthenticated =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
+    assert!(!unauthenticated.requires_client_certificate());
     assert!(TlsConnection::accept(&client).is_err());
     assert!(TlsConnection::connect(&server, "radsec.test").is_err());
     assert!(TlsConnection::connect(&client, "").is_err());

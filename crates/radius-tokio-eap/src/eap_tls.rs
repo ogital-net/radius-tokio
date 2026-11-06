@@ -74,9 +74,14 @@ impl EapTls {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] if the per-session SSL handle cannot
-    /// be allocated.
+    /// Returns [`Error::Tls`] if `ctx` does not require and validate client
+    /// certificates, or if the per-session SSL handle cannot be allocated.
     pub fn new(ctx: &TlsContext) -> Result<Self, Error> {
+        if !ctx.requires_client_certificate() {
+            return Err(Error::Tls(
+                "EAP-TLS requires a server context with client certificate authentication".into(),
+            ));
+        }
         Ok(Self {
             tunnel: TlsTunnel::new(ctx, DEFAULT_FRAME_MTU)?,
         })

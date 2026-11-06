@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- EAP-TLS rejects TLS contexts that do not require and validate client
+	certificates, preventing authentication without a client certificate.
 - TTLS-PAP rejects duplicate credential AVPs and unsupported mandatory AVPs
 	instead of authenticating an ambiguous or incompletely understood request.
 - `IssuedCertificate` debug output redacts private key material.

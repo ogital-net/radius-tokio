@@ -1192,6 +1192,7 @@ fn dns_name_matches(presented: &str, expected: &str) -> bool {
 pub struct TlsContext {
     inner: Arc<SslCtx>,
     is_client: bool,
+    requires_client_certificate: bool,
 }
 
 impl std::fmt::Debug for TlsContext {
@@ -1201,6 +1202,16 @@ impl std::fmt::Debug for TlsContext {
 }
 
 impl TlsContext {
+    /// Whether this server context requires a trusted client certificate.
+    ///
+    /// Returns `false` for client contexts and for server contexts created
+    /// with [`Self::server_without_client_auth`]. Certificate-authenticated
+    /// protocols such as EAP-TLS must require this property.
+    #[must_use]
+    pub fn requires_client_certificate(&self) -> bool {
+        self.requires_client_certificate
+    }
+
     /// Build a server-side context with the supplied PEM
     /// materials.
     ///
@@ -1448,6 +1459,7 @@ impl TlsContext {
         Ok(Self {
             inner: Arc::new(ctx),
             is_client,
+            requires_client_certificate: !is_client && client_ca_pem.is_some(),
         })
     }
 }

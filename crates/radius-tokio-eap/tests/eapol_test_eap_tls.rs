@@ -38,6 +38,7 @@ use radius_tokio::pki::{CertificateAuthority, SubjectAltName};
 use radius_tokio::server::{Client, IpCidr, Server, StaticClients};
 use radius_tokio::tls::TlsContext;
 use radius_tokio_eap::eap_tls::EapTlsFactory;
+use radius_tokio_eap::method::MethodFactory;
 use radius_tokio_eap::EapHandler;
 
 const SHARED_SECRET: &str = "testing123";
@@ -92,6 +93,26 @@ fn eapol_test_available() -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok()
+}
+
+#[test]
+fn eap_tls_rejects_contexts_without_verified_client_certificates() {
+    let pki = build_pki();
+    let unauthenticated =
+        TlsContext::server_without_client_auth(&pki.server_chain_pem, &pki.server_key_pem).unwrap();
+    assert!(radius_tokio_eap::eap_tls::EapTls::new(&unauthenticated).is_err());
+    assert!(EapTlsFactory::new(Arc::new(unauthenticated))
+        .create()
+        .is_err());
+
+    let authenticated =
+        TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, &pki.ca_pem).unwrap();
+    assert!(radius_tokio_eap::eap_tls::EapTls::new(&authenticated).is_ok());
+    assert!(EapTlsFactory::new(Arc::new(authenticated)).create().is_ok());
+
+    let client =
+        TlsContext::client(&pki.client_chain_pem, &pki.client_key_pem, &pki.ca_pem).unwrap();
+    assert!(radius_tokio_eap::eap_tls::EapTls::new(&client).is_err());
 }
 
 #[tokio::test(flavor = "current_thread")]
