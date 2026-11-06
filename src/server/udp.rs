@@ -60,6 +60,7 @@ use std::time::Duration;
 
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 use crate::codec::header::MAX_PACKET_LEN;
 #[cfg(feature = "metrics")]
@@ -100,19 +101,24 @@ where
     // `[::]:port` — see `Request::dst` for the caveat.
     let local_addr = socket.local_addr()?;
     let mut buf = vec![0u8; MAX_PACKET_LEN];
-    loop {
+    let mut packets = JoinSet::new();
+    let result = loop {
         tokio::select! {
             biased;
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    return Ok(());
+                    break Ok(());
                 }
             }
+            _ = packets.join_next(), if !packets.is_empty() => {}
             res = socket.recv_from(&mut buf) => {
                 // Tokio's I/O driver retries `WouldBlock`/`EINTR`
                 // internally, so any error surfaced here is terminal
                 // for the socket (e.g. ENOTCONN, EBADF). Bubble it up.
-                let (len, src) = res?;
+                let (len, src) = match res {
+                    Ok(received) => received,
+                    Err(error) => break Err(error),
+                };
 
                 // Inline admission gate: identify the peer before any
                 // allocation beyond the receive buffer. Unknown sources
@@ -134,7 +140,7 @@ where
                 let handler = Arc::clone(&handler);
                 let cache = Arc::clone(&cache);
                 let status_policy = Arc::clone(&status_policy);
-                tokio::spawn(async move {
+                packets.spawn(async move {
                     process_packet(
                         &socket,
                         datagram,
@@ -150,7 +156,9 @@ where
                 });
             }
         }
-    }
+    };
+    while packets.join_next().await.is_some() {}
+    result
 }
 
 /// Spawned per-packet pipeline: parse the header, validate
@@ -480,6 +488,72 @@ mod tests {
         let sock = TokioUdp::bind("127.0.0.1:0").await.unwrap();
         let addr = sock.local_addr().unwrap();
         (sock, addr)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_drains_admitted_packet_tasks() {
+        use tokio::sync::Semaphore;
+
+        struct DrainHandler {
+            entered: Semaphore,
+            release: Semaphore,
+        }
+
+        impl Handler for DrainHandler {
+            async fn handle(&self, request: Request<'_>) -> HandlerResult {
+                self.entered.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+                HandlerResult::Reply(request.reply(Code::ACCESS_ACCEPT))
+            }
+        }
+
+        let secret = b"shared";
+        let (socket, addr) = bind_loopback().await;
+        let store = StaticClients::builder()
+            .add(
+                IpCidr::host(Ipv4Addr::LOCALHOST.into()),
+                Arc::new(Client::new(secret.as_slice())),
+            )
+            .build();
+        let handler = Arc::new(DrainHandler {
+            entered: Semaphore::new(0),
+            release: Semaphore::new(0),
+        });
+        let (shutdown, rx) = watch::channel(false);
+        let task = tokio::spawn(serve_udp_test(
+            socket,
+            Arc::new(store),
+            handler.clone(),
+            Arc::new(DedupCache::new(DEFAULT_DEDUP_TTL)),
+            rx,
+        ));
+        let (sender, _) = bind_loopback().await;
+        let (_, packet) = build_access_request(7, secret);
+        sender.send_to(&packet, addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handler.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        shutdown.send(true).unwrap();
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "shutdown must wait for the handler");
+        handler.release.add_permits(1);
+        let mut reply = [0; 4096];
+        tokio::time::timeout(Duration::from_secs(1), sender.recv_from(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply[0], Code::ACCESS_ACCEPT.0);
+        assert!(
+            TokioUdp::bind(addr).await.is_ok(),
+            "drained listener must release its socket"
+        );
     }
 
     fn build_access_request(identifier: u8, secret: &[u8]) -> ([u8; 16], Vec<u8>) {
