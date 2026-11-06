@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
@@ -151,8 +152,20 @@ pub trait SessionStore: Send + Sync + 'static {
 /// listener handles every request in a session. For HA / multi-process
 /// deployments use an out-of-process store (Redis, `DynamoDB`, …) so
 /// any worker can serve any session.
+///
+/// Sessions expire after two idle minutes by default, with at most
+/// 4096 stored sessions. Expired entries are removed lazily; at
+/// capacity the earliest-expiring entry is evicted. Override these
+/// limits with [`Self::with_limits`].
 pub struct InMemorySessionStore<M: EapMethod> {
-    inner: Arc<Mutex<HashMap<SessionId, Session<M>>>>,
+    inner: Arc<Mutex<HashMap<SessionId, StoredSession<M>>>>,
+    idle_timeout: Duration,
+    capacity: usize,
+}
+
+struct StoredSession<M: EapMethod> {
+    session: Session<M>,
+    expires_at: Instant,
 }
 
 impl<M: EapMethod> Default for InMemorySessionStore<M> {
@@ -165,8 +178,22 @@ impl<M: EapMethod> InMemorySessionStore<M> {
     /// Build an empty in-memory store.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_limits(Duration::from_secs(120), 4096)
+    }
+
+    /// Build a store with an idle timeout and a hard session limit.
+    /// Reinserting a session after a round refreshes its idle timeout.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is zero.
+    #[must_use]
+    pub fn with_limits(idle_timeout: Duration, capacity: usize) -> Self {
+        assert!(capacity > 0, "session capacity must be positive");
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            idle_timeout,
+            capacity,
         }
     }
 }
@@ -175,11 +202,34 @@ impl<M: EapMethod + 'static> SessionStore for InMemorySessionStore<M> {
     type Method = M;
 
     async fn insert(&self, id: SessionId, session: Session<Self::Method>) {
-        self.inner.lock().await.insert(id, session);
+        let mut entries = self.inner.lock().await;
+        let now = Instant::now();
+        entries.retain(|_, entry| entry.expires_at > now);
+        if entries.len() >= self.capacity && !entries.contains_key(&id) {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(id, _)| *id)
+            {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(
+            id,
+            StoredSession {
+                session,
+                expires_at: now + self.idle_timeout,
+            },
+        );
     }
 
     async fn take(&self, id: SessionId) -> Option<Session<Self::Method>> {
-        self.inner.lock().await.remove(&id)
+        self.inner
+            .lock()
+            .await
+            .remove(&id)
+            .filter(|entry| entry.expires_at > Instant::now())
+            .map(|entry| entry.session)
     }
 }
 
@@ -231,5 +281,42 @@ mod tests {
         store.insert(id, Session::new(Dummy)).await;
         assert!(store.take(id).await.is_some());
         assert!(store.take(id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_state_cannot_resume_a_session() {
+        let store = InMemorySessionStore::with_limits(Duration::ZERO, 2);
+        let id = SessionId([1; 16]);
+        store.insert(id, Session::new(Dummy)).await;
+        assert!(store.take(id).await.is_none());
+        assert!(store.inner.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn insert_removes_abandoned_expired_sessions() {
+        let store = InMemorySessionStore::with_limits(Duration::ZERO, 2);
+        for value in 0..10 {
+            store
+                .insert(SessionId([value; 16]), Session::new(Dummy))
+                .await;
+            assert_eq!(store.inner.lock().await.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn capacity_evicts_earliest_expiring_session() {
+        let store = InMemorySessionStore::with_limits(Duration::from_secs(120), 2);
+        let first = SessionId([1; 16]);
+        let second = SessionId([2; 16]);
+        let third = SessionId([3; 16]);
+        store.insert(first, Session::new(Dummy)).await;
+        store.inner.lock().await.get_mut(&first).unwrap().expires_at =
+            Instant::now() + Duration::from_secs(30);
+        store.insert(second, Session::new(Dummy)).await;
+        store.insert(third, Session::new(Dummy)).await;
+        assert_eq!(store.inner.lock().await.len(), 2);
+        assert!(store.take(first).await.is_none());
+        assert!(store.take(second).await.is_some());
+        assert!(store.take(third).await.is_some());
     }
 }
