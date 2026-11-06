@@ -3,12 +3,17 @@
 ## Architecture at a glance
 
 `radius-tokio` is a **library**, not a daemon — there is no `main`, no
-config file, and no global state. Consumers construct a `Server`,
+config file, and no global state. Independent `server` and `client`
+features share the protocol, crypto, and transport layers.
+Server consumers construct a `Server`,
 plug in two traits (`ClientStore` and `Handler`), and drive it from
 their own Tokio runtime. The source tree mirrors that split:
 
 - `src/codec/` — zero-copy wire decode, typed attribute encode, reply
-  sealing. No I/O, no allocation on the hot read path.
+  sealing, outgoing request builders, and verified response views. No I/O.
+- `src/exchange.rs` — shared pending-exchange registry and identifier leases.
+- `src/transport/` — outgoing UDP socket and shared async TLS/framing.
+- `src/client/` — public client API and multiplexed RadSec connection driver.
 - `src/crypto/` — safe wrappers over `aws-lc-sys` for MD5, HMAC-MD5,
   HMAC-SHA*, AES, DES, RNG, and the RadSec `SSL` layer. Every
   `unsafe` block is FFI-only and carries a `// SAFETY:` comment.
@@ -35,7 +40,7 @@ see [`BENCHMARKS.md`](BENCHMARKS.md).
 ## Development prerequisites
 
 - Rust **1.83** or later (pinned via `rust-version` in each `Cargo.toml`).
-- Native build deps for `aws-lc-sys` when the `radsec` feature is on:
+- Native build deps for `aws-lc-sys` when `tls` or `radsec` is on:
   - **Linux:** `cmake`, `clang`, `libclang-dev`
   - **macOS:** `cmake` (via Homebrew)
   - **Windows:** `cmake` (preinstalled on `windows-latest`) + NASM
@@ -58,6 +63,7 @@ Always pass `--locked` so a stray dependency change fails loudly:
 ```sh
 cargo build --workspace --locked
 cargo test --workspace --all-features --locked
+cargo test -p radius-tokio --no-default-features --features client,radsec --locked
 ```
 
 ## Lints
@@ -66,8 +72,8 @@ All lints are enforced in CI. Before pushing, run:
 
 ```sh
 cargo fmt --all
-cargo clippy --workspace --all-features --all-targets -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 ```
 
 The crate enforces:

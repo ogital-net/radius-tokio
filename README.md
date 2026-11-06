@@ -1,9 +1,11 @@
 # radius-tokio
 
-An async RADIUS server library for Rust on top of Tokio. The crate
-is meant to be embedded: there is no `main`, no config file, no
-daemonisation. You construct a `Server`, plug in two traits
-(`ClientStore` and `Handler`), and drive it from your own runtime.
+An async RADIUS client and server library for Rust on top of Tokio,
+with UDP and mutually authenticated RadSec. Enable either role or both;
+they share the wire codec, crypto, dictionaries, and TLS transport.
+The crate is meant to be embedded: there is no `main`, config file, or
+daemonisation. Server applications construct a `Server` with two traits
+(`ClientStore` and `Handler`) and drive it from their own runtime.
 The library handles the wire-level work — decoding, deduplication,
 authenticator verification, reply sealing, RadSec mTLS — and stays
 out of the policy layer.
@@ -37,7 +39,7 @@ and bare EAP-MSCHAPv2.
 ## Status
 
 `0.1`. The wire codec, dedup pipeline, UDP and RadSec listeners,
-CoA originator, Status-Server responder and the EAP method drivers
+UDP/RadSec clients, CoA originator, Status-Server responder and the EAP method drivers
 are all in. Breaking API changes are still on the table until
 `1.0`; the wire-touching internals are settling first, the
 trait-facing surface second.
@@ -65,6 +67,73 @@ trait-facing surface second.
 | RFC 8044 / 6158 | Data type guidance                     | dict types            |
 
 ## Quickstart
+
+Server support remains enabled by default. Client-only consumers use:
+
+```toml
+radius-tokio = { version = "0.1", default-features = false, features = ["client", "radsec", "dict-rfc", "fast-md5"] }
+```
+
+### Client
+
+```rust,no_run
+# #[cfg(all(feature = "client", feature = "dict-rfc"))]
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+use radius_tokio::client::{ClientConfig, Request, UdpClient};
+use radius_tokio::dict::rfc::attrs;
+use radius_tokio::{AttributesView, Code};
+
+let client = UdpClient::bind("0.0.0.0:0".parse()?, ClientConfig::default()).await?;
+let mut request = Request::access();
+request.add(attrs::USER_NAME, "alice")?;
+request.user_password(b"example-password")?;
+let response = client.send("127.0.0.1:1812".parse()?, b"example-secret", request).await?;
+match response.code() {
+    Code::ACCESS_ACCEPT => {}
+    Code::ACCESS_REJECT => {}
+    Code::ACCESS_CHALLENGE => {
+        let mut next = Request::access();
+        next.add(attrs::USER_NAME, "alice")?;
+        if let Some(state) = response.attributes().state() {
+            next.add_state(state)?;
+        }
+        // Add the challenge response before sending `next`.
+    }
+    _ => unreachable!(),
+}
+# Ok(())
+# }
+```
+
+For RadSec, construct `tls::TlsContext::client(client_chain, private_key,
+server_ca_bundle)`, then call `RadsecClient::connect(endpoint, &context,
+expected_server_name, config).await` and `client.send(request).await`.
+The client requires a matching DNS/IP SAN, sends SNI for DNS names, and
+never falls back to Common Name or an unverified TLS connection.
+See the runnable [UDP](examples/udp_client.rs) and
+[RadSec](examples/radsec_client.rs) examples for credential configuration.
+
+Requests support Access, Accounting, Status-Server, CoA, and Disconnect.
+Responses are owned, verified, and expose `AttributesView` through
+`response.attributes()`. Reject and Challenge are protocol outcomes,
+not transport errors. EAP-Message and State can be carried without adding
+supplicant-side EAP state machines.
+
+UDP retries send identical bytes. RadSec uses a persistent multiplexed
+connection and never retransmits or automatically reconnects/replays a
+request. Cancellation may finish an already-started write; a timeout or
+disconnect does not prove that the server did not process the request.
+Reconnect explicitly and decide whether replay is safe for the operation.
+Call `RadsecClient::close().await` for best-effort close-notify.
+Incoming CoA/Disconnect requests receive NAK with Error-Cause 406
+(Unsupported-Extension); there is no client-side session-control handler.
+
+Access, Status, and dynamic-authorization replies require a valid
+Message-Authenticator. Accounting replies may omit it; any present tag
+must verify. UDP replies also require the expected source endpoint,
+identifier, response code, and Response Authenticator.
+
+### Server
 
 A minimal Access-Request → Access-Accept loop, UDP only:
 
@@ -178,6 +247,8 @@ for attr in request.attributes_iter().flatten() {
 
 | File                          | What it shows                                       |
 |-------------------------------|-----------------------------------------------------|
+| `udp_client.rs`               | PAP authentication using the UDP client.           |
+| `radsec_client.rs`            | PAP authentication over mutually authenticated TLS. |
 | `routing_dispatcher.rs`       | Routing on `Service-Type` / VSA via `CodeRouter`.   |
 | `mutable_clients.rs`          | Runtime-mutable in-memory `ClientStore`.            |
 | `sqlite_clients.rs`           | SQLite-backed `ClientStore` behind `CachedStore`.   |
@@ -223,9 +294,12 @@ under `crates/radius-tokio-eap/tests/`.
 
 | Feature           | Default | Effect                                              |
 |-------------------|---------|-----------------------------------------------------|
+| `server`          | yes     | Server runtime, handler-facing auth helpers, and compatible CoA originator API. |
+| `client`          | no      | Outgoing requests, verified responses, and UDP client. |
+| `tls`             | no      | Shared memory-BIO TLS and PKI, without RadSec socket I/O. |
 | `dict-rfc`        | yes     | RFC dictionaries (small, recommended).              |
 | `fast-md5`        | yes     | Swap the MD5 block compressor from `aws-lc-sys` to the [`fast-md5`](https://crates.io/crates/fast-md5) crate (hand-written x86_64 + aarch64 assembly, portable Rust fallback, `#![no_std]`). |
-| `radsec`          | no      | RADIUS-over-TLS (RFC 6614) listener + `tls` / `pki` modules. |
+| `radsec`          | no      | RADIUS-over-TLS for enabled roles; includes `tls`. |
 | `tracing`         | no      | Structured spans/events around accept and dispatch. |
 | `metrics`         | no      | Counters / histograms via the `metrics` facade.     |
 | `test-util`       | no      | `server::test_support::MockRequest` for downstream handler tests. |
@@ -233,15 +307,17 @@ under `crates/radius-tokio-eap/tests/`.
 | `dict-<vendor>`   | no      | Per-vendor VSAs: `airespace`, `aruba`, `ascend`, `cisco`, `eleven`, `fortinet`, `hp`, `juniper`, `meraki`, `microsoft`, `mikrotik`, `ruckus`, `tplink`, `wispr`. |
 
 Vendor VSA dictionaries are opt-in to keep generated code small.
-The `radsec` feature pulls in `aws-lc-sys`'s `ssl` build, which
+The `tls` feature (also enabled by `radsec`) pulls in `aws-lc-sys`'s `ssl` build, which
 runs `bindgen` and adds ~30s to a cold build (requires `cmake` and
 `clang`/`libclang`).
 
 `fast-md5` has no native build dependency — it uses Rust inline
 assembly for x86_64 and aarch64 and a portable fallback elsewhere.
-For a build with no optional native code: `--no-default-features
---features dict-rfc` falls back to `aws-lc-sys`'s MD5. The public
-API is unchanged.
+For a server using the `aws-lc-sys` MD5 backend instead of `fast-md5`, use
+`--no-default-features --features server,dict-rfc`. Neither role requires
+the other; both disabled leaves the shared protocol APIs. Cargo features
+are additive, so another dependency enabling `server` also enables it
+for your build.
 
 ### `radius-tokio-eap`
 
@@ -249,7 +325,7 @@ API is unchanged.
 |----------------|---------|-----------------------------------------------------|
 | `eap-md5`      | no      | EAP-MD5-Challenge.                                  |
 | `eap-mschapv2` | no      | Native EAP-MSCHAPv2 (legacy wired 802.1X).          |
-| `eap-tls`      | no      | EAP-TLS (pulls `radius-tokio/radsec`).              |
+| `eap-tls`      | no      | EAP-TLS (pulls `radius-tokio/tls`).                 |
 | `peap`         | no      | PEAP v0 + EAP-MSCHAPv2 inner.                       |
 | `eap-ttls`     | no      | EAP-TTLS with bundled PAP inner.                    |
 | `all-methods`  | no      | Umbrella over every method above.                   |
@@ -258,7 +334,13 @@ API is unchanged.
 
 ## RadSec (RFC 6614)
 
-Enable the `radsec` feature, then add a TLS listener to the builder.
+The RadSec client always uses the RFC 6614 legacy packet secret `radsec`;
+TLS provides confidentiality and peer authentication. Configure RadSec
+server-side `Client` records with `b"radsec"` as well. Keep UDP shared
+secrets distinct and private. Existing server APIs still allow an
+explicit secret for legacy deployments.
+
+Enable `server` and `radsec`, then add a TLS listener to the builder.
 The pipeline for every accepted connection is:
 
 1. **Pre-handshake DoS gate.** `ClientStore::admit_radsec(src) -> bool`

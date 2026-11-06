@@ -22,8 +22,9 @@ fail-over across pool members). Operators who need a proxy reach for
 for that role.
 
 Consumers can still build a forwarder on top of `CoaOriginator`-style
-client primitives if they want narrow point-to-point relaying inside
-their own handler.
+client primitives (`client::UdpClient` / `client::RadsecClient`) if they
+want narrow point-to-point relaying inside their own handler. Providing
+client exchanges does not add proxy routing or automatic upstream pools.
 
 ### RADIUS/TCP plain (RFC 6613)
 
@@ -40,13 +41,14 @@ Status-Client packet" and notes there is no widely deployed use
 case. Status-Server (code 12) is fully supported and covers the
 operational need.
 
-### Server-originated Interim-Update
+### Server-generated Interim-Update data
 
 Already a non-goal in `src/server/accounting.rs`: the *NAS* sends
 Interim-Update when its `Acct-Interim-Interval` timer fires; the
-AAA server's job is to accept those and respond. This library will
-not synthesize Interim-Update packets toward a NAS — that would be
-inventing accounting data the NAS never authored.
+AAA server's job is to accept those and respond. The server will not
+synthesize Interim-Update packets toward a NAS. The client API can send
+consumer-authored accounting records to an AAA server, but does not
+invent session data or run an accounting scheduler.
 
 ## Operations
 

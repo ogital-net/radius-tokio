@@ -35,14 +35,14 @@ pub mod server;
 
 // Re-export the TLS wrapper as a public submodule. Lives under
 // `crypto/` because it shares the same `aws-lc-sys` boundary, but
-// is consumer-visible because RadSec listeners need to configure it.
-// Only available with the `radsec` feature, which turns on the
+// is consumer-visible because both roles and EAP need to configure it.
+// Available with the `tls` feature (also enabled by `radsec`), which turns on the
 // `ssl` feature of `aws-lc-sys`.
 #[cfg(feature = "tls")]
 pub use crypto::tls;
 
 /// Sensible-defaults PKI helpers (CA + leaf issuance) for RadSec
-/// onboarding. Only available with the `radsec` feature.
+/// onboarding. Available with the `tls` feature (also enabled by `radsec`).
 #[cfg(feature = "tls")]
 pub use crypto::pki;
 

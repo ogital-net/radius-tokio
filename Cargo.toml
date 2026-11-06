@@ -76,7 +76,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "A high-performance, async RADIUS server library (RFC 2865/2866/6614)"
+description = "Async RADIUS client and server library with UDP and RadSec support"
 keywords = ["radius", "aaa", "networking", "tokio"]
 categories = ["network-programming", "asynchronous"]
 # Allow-list of files shipped in the published crate. Anything not
@@ -98,8 +98,11 @@ include = [
 
 [features]
 default = ["server", "dict-rfc", "fast-md5"]
+# Independent roles; neither requires the other. Shared protocol APIs remain
+# available with both disabled. Keep server enabled by default for compatibility.
 server = []
 client = []
+# Memory-BIO TLS and PKI, also used by the EAP companion without RadSec I/O.
 tls = ["aws-lc-sys/ssl"]
 # Emit `tracing` spans/events around accept, decode, dispatch, reply,
 # and CoA lifecycle. Off by default — pulls in the `tracing` crate.
@@ -218,6 +221,14 @@ arc-swap = "1"
 # `CachedStore` + `tokio::task::spawn_blocking`. Example-only; the
 # library itself never depends on it.
 rusqlite = { version = "0.31", features = ["bundled"] }
+
+[[example]]
+name = "udp_client"
+required-features = ["client"]
+
+[[example]]
+name = "radsec_client"
+required-features = ["client", "radsec"]
 
 [[example]]
 name = "dhat_hot_path"
