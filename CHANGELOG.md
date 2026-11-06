@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- MPPE key decryption with retained request authenticators for verified client
+	responses, reusing the existing zeroizing salted-MD5 implementation.
 - Independent `server` (default) and `client` roles sharing protocol and crypto.
 - Multiplexed UDP and mutually authenticated RadSec clients, outgoing request
 	builders, owned verified responses, and PAP password hiding.

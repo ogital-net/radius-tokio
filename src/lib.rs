@@ -52,6 +52,9 @@ pub use crypto::pki;
 /// unpredictable.
 pub use crypto::rand;
 
+/// `MS-MPPE-Send-Key` and `MS-MPPE-Recv-Key` decryption for Access-Accept consumers.
+pub use crypto::mppe;
+
 // Re-export the consumer-visible codec surface. The receive- and
 // reply-handling types are needed by anyone implementing a `Handler`.
 pub use codec::attributes::AttributesView;

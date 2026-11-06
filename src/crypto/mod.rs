@@ -28,6 +28,7 @@ pub(crate) mod des;
 pub(crate) mod hmac_md5;
 pub(crate) mod md4;
 pub(crate) mod md5;
+pub mod mppe;
 pub(crate) mod password;
 #[cfg(feature = "tls")]
 pub mod pki;

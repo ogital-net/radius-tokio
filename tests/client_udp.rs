@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use radius_tokio::client::{ClientConfig, ClientError, Request, UdpClient};
-use radius_tokio::{AttributesView, Code, Reply};
+use radius_tokio::typed::{VsaAttr, WBytes};
+use radius_tokio::{attributes, mppe, AttributesView, Code, Reply};
 use tokio::net::UdpSocket;
 
 fn config() -> ClientConfig {
@@ -13,6 +14,44 @@ fn config() -> ClientConfig {
         max_retries: 1,
         max_in_flight_per_target: 64,
         ..ClientConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn access_accept_mppe_keys_decrypt_with_original_authenticator() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target = server.local_addr().unwrap();
+    let mock = tokio::spawn(async move {
+        let mut packet = [0; 4096];
+        let (_, source) = server.recv_from(&mut packet).await.unwrap();
+        let auth = packet[4..20].try_into().unwrap();
+        let mut reply = Reply::new(Code::ACCESS_ACCEPT, packet[1]);
+        reply
+            .add_mppe_keys(&[0x11; 32], &[0x22; 32], &auth, b"secret")
+            .unwrap();
+        server
+            .send_to(reply.seal_for(&auth, b"secret").as_bytes(), source)
+            .await
+            .unwrap();
+        auth
+    });
+    let client = UdpClient::bind("127.0.0.1:0".parse().unwrap(), config())
+        .await
+        .unwrap();
+    let reply = client
+        .send(target, b"secret", Request::access())
+        .await
+        .unwrap();
+    assert_eq!(reply.code(), Code::ACCESS_ACCEPT);
+    assert_eq!(reply.request_authenticator(), &mock.await.unwrap());
+    for (vendor_type, expected) in [(16, [0x11; 32]), (17, [0x22; 32])] {
+        let value = attributes::first_vsa(
+            reply.attributes().raw_attributes(),
+            VsaAttr::<WBytes>::new(311, vendor_type),
+        )
+        .unwrap();
+        let key = mppe::mppe_key_decrypt(value, b"secret", reply.request_authenticator()).unwrap();
+        assert_eq!(key.as_bytes(), expected);
     }
 }
 

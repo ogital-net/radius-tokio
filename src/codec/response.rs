@@ -12,6 +12,7 @@ use super::{authenticator, message_authenticator};
 pub struct Response {
     header: Header,
     packet: Vec<u8>,
+    request_authenticator: [u8; 16],
 }
 
 impl Response {
@@ -25,6 +26,14 @@ impl Response {
     #[must_use]
     pub fn identifier(&self) -> u8 {
         self.header.identifier
+    }
+
+    /// Authenticator from the original request, not the response header.
+    ///
+    /// Use this with [`crate::mppe::mppe_key_decrypt`] to recover MPPE keys.
+    #[must_use]
+    pub fn request_authenticator(&self) -> &[u8; 16] {
+        &self.request_authenticator
     }
 
     /// The verified wire packet, excluding UDP padding.
@@ -71,6 +80,7 @@ impl Response {
         Some(Self {
             header,
             packet: packet.to_vec(),
+            request_authenticator: *request_authenticator,
         })
     }
 }
@@ -112,6 +122,11 @@ mod tests {
         assert_eq!(response.code(), Code::ACCESS_CHALLENGE);
         assert_eq!(response.as_bytes().len(), length);
         assert_eq!(response.attributes().state(), Some(b"state".as_slice()));
+        assert_eq!(response.request_authenticator(), &[3; 16]);
+        assert_ne!(
+            response.request_authenticator(),
+            &response.as_bytes()[4..20]
+        );
     }
 
     #[test]

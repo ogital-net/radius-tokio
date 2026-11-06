@@ -251,6 +251,7 @@ fn unsupported_dynamic_request(packet: &[u8]) -> io::Result<Option<crate::Packet
 mod tests {
     use super::*;
     use crate::crypto::tls::test_client::build_pki;
+    use crate::typed::{VsaAttr, WBytes};
     use crate::AttributesView;
     use std::time::Duration;
     use tokio::net::TcpListener;
@@ -279,6 +280,44 @@ mod tests {
             .await
             .unwrap();
         connection
+    }
+
+    #[tokio::test]
+    async fn access_accept_mppe_keys_decrypt_with_radsec_secret() {
+        let (server_context, client_context) = contexts();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut connection = accept(listener, server_context).await;
+            let mut frames = FrameReader::new();
+            let packet = frames.read(&mut connection).await.unwrap().unwrap();
+            let (header, _) = Header::parse(packet).unwrap();
+            let mut reply = Reply::new(Code::ACCESS_ACCEPT, header.identifier);
+            reply
+                .add_mppe_keys(&[0x11; 32], &[0x22; 32], &header.authenticator, SECRET)
+                .unwrap();
+            connection
+                .write_all(reply.seal_for(&header.authenticator, SECRET).as_bytes())
+                .await
+                .unwrap();
+            header.authenticator
+        });
+        let client = RadsecClient::connect(peer, &client_context, "radsec.test", config())
+            .await
+            .unwrap();
+        let reply = client.send(Request::access()).await.unwrap();
+        assert_eq!(reply.code(), Code::ACCESS_ACCEPT);
+        assert_eq!(reply.request_authenticator(), &server.await.unwrap());
+        for (vendor_type, expected) in [(16, [0x11; 32]), (17, [0x22; 32])] {
+            let value = attributes::first_vsa(
+                reply.attributes().raw_attributes(),
+                VsaAttr::<WBytes>::new(311, vendor_type),
+            )
+            .unwrap();
+            let key = crate::mppe::mppe_key_decrypt(value, SECRET, reply.request_authenticator())
+                .unwrap();
+            assert_eq!(key.as_bytes(), expected);
+        }
     }
 
     #[tokio::test]

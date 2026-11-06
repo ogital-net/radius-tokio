@@ -119,6 +119,33 @@ Responses are owned, verified, and expose `AttributesView` through
 not transport errors. EAP-Message and State can be carried without adding
 supplicant-side EAP state machines.
 
+MPPE keys in a verified Access-Accept can be decrypted with
+`mppe::mppe_key_decrypt`. Pass the salt-plus-ciphertext VSA value and
+`response.request_authenticator()`, not the reply's Authenticator field:
+
+```rust,no_run
+# #[cfg(feature = "client")]
+# fn example(response: &radius_tokio::client::Response, secret: &[u8]) -> Result<(), radius_tokio::mppe::MppeError> {
+use radius_tokio::typed::{VsaAttr, WBytes};
+use radius_tokio::{attributes, mppe, AttributesView, Code};
+
+if response.code() == Code::ACCESS_ACCEPT {
+    let recv_key = VsaAttr::<WBytes>::new(311, 17);
+    if let Some(value) = attributes::first_vsa(response.attributes().raw_attributes(), recv_key) {
+        let key = mppe::mppe_key_decrypt(value, secret, response.request_authenticator())?;
+        # drop(key);
+    }
+}
+# Ok(())
+# }
+```
+
+Microsoft vendor type 16 is Send-Key; type 17 is Recv-Key. No dictionary
+feature is required for these explicit handles. Use the UDP exchange's
+shared secret, or `b"radsec"` for RadSec. Returned keys are `ZeroizingBytes`
+and are scrubbed on drop. MPPE decryption is not an integrity check and
+cannot reliably detect a wrong secret on its own.
+
 UDP retries send identical bytes. RadSec uses a persistent multiplexed
 connection and never retransmits or automatically reconnects/replays a
 request. Cancellation may finish an already-started write; a timeout or
