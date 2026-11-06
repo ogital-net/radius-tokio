@@ -49,6 +49,74 @@ fn drive(server: &mut TlsConnection, client: &mut client_side::ClientSsl) -> Res
 // Tests
 // -----------------------------------------------------------------
 
+fn drive_pair(server: &mut TlsConnection, client: &mut TlsConnection) -> Result<(), TlsError> {
+    let mut buffer = [0; 16 * 1024];
+    for _ in 0..64 {
+        let server_state = server.process()?;
+        let client_state = client.process()?;
+        for from_server in [true, false] {
+            let (source, destination) = if from_server {
+                (&mut *server, &mut *client)
+            } else {
+                (&mut *client, &mut *server)
+            };
+            loop {
+                let length = source.take_output(&mut buffer)?;
+                if length == 0 {
+                    break;
+                }
+                destination.feed_input(&buffer[..length])?;
+            }
+        }
+        if server_state == HandshakeState::Established
+            && client_state == HandshakeState::Established
+        {
+            return Ok(());
+        }
+    }
+    Err(TlsError::Handshake("test handshake stalled".into()))
+}
+
+#[test]
+fn production_client_validates_server_name_and_context_role() {
+    let pki = build_pki();
+    let server =
+        TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, &pki.ca_pem).unwrap();
+    let client =
+        TlsContext::client(&pki.client_chain_pem, &pki.client_key_pem, &pki.ca_pem).unwrap();
+    assert!(TlsConnection::accept(&client).is_err());
+    assert!(TlsConnection::connect(&server, "radsec.test").is_err());
+    assert!(TlsConnection::connect(&client, "").is_err());
+    assert!(TlsConnection::connect(&client, "bad\0name").is_err());
+    drive_pair(
+        &mut TlsConnection::accept(&server).unwrap(),
+        &mut TlsConnection::connect(&client, "radsec.test").unwrap(),
+    )
+    .unwrap();
+    let mut wrong_name = TlsConnection::connect(&client, "other.test").unwrap();
+    assert!(drive_pair(
+        &mut TlsConnection::accept(&server).unwrap(),
+        &mut wrong_name
+    )
+    .is_err());
+    assert!(wrong_name.is_handshaking());
+}
+
+#[test]
+fn production_client_rejects_untrusted_server() {
+    let pki = build_pki();
+    let other = build_pki();
+    let server =
+        TlsContext::server(&pki.server_chain_pem, &pki.server_key_pem, &pki.ca_pem).unwrap();
+    let client =
+        TlsContext::client(&pki.client_chain_pem, &pki.client_key_pem, &other.ca_pem).unwrap();
+    assert!(drive_pair(
+        &mut TlsConnection::accept(&server).unwrap(),
+        &mut TlsConnection::connect(&client, "radsec.test").unwrap()
+    )
+    .is_err());
+}
+
 #[test]
 fn handshake_succeeds_with_valid_chain() {
     let pki = build_pki();

@@ -1,4 +1,4 @@
-//! TLS server-side wrapper for RadSec (RFC 6614), built on
+//! TLS client/server wrapper for RadSec (RFC 6614), built on
 //! `aws-lc-sys`'s libssl surface.
 //!
 //! # Design
@@ -25,12 +25,9 @@
 //! threadpool worker, or a fuzz harness, without `BIO_set_nbio`
 //! gymnastics.
 //!
-//! # Server-side only (for now)
-//!
-//! The crate is a RADIUS *server*. RadSec listeners always speak
-//! TLS server, so [`TlsContext`] hard-codes `TLS_server_method` and
-//! [`TlsConnection`] hard-codes `SSL_accept`. An outbound RadSec
-//! proxy (post-0.1) will need a parallel client-side path.
+//! Client contexts use the same record layer with `SSL_connect`.
+//! Client connections require a configured server identity and validate it
+//! before exposing an established connection.
 //!
 //! # Authorization model
 //!
@@ -69,7 +66,7 @@
     clippy::match_same_arms
 )]
 
-use std::ffi::{c_char, c_int, c_void, CStr};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -93,6 +90,9 @@ use aws_lc_sys::{
     SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE, SSL_ERROR_ZERO_RETURN, SSL_KEY_UPDATE_NONE,
     SSL_KEY_UPDATE_REQUESTED, SSL_OP_NO_TICKET, SSL_VERIFY_FAIL_IF_NO_PEER_CERT, SSL_VERIFY_PEER,
     TLS1_2_VERSION, TLS1_3_VERSION, X509, X509_STORE,
+};
+use aws_lc_sys::{
+    SSL_CTX_add_extra_chain_cert, SSL_connect, SSL_set_tlsext_host_name, TLS_client_method,
 };
 
 // ============================================================================
@@ -1191,6 +1191,7 @@ fn dns_name_matches(presented: &str, expected: &str) -> bool {
 #[derive(Clone)]
 pub struct TlsContext {
     inner: Arc<SslCtx>,
+    is_client: bool,
 }
 
 impl std::fmt::Debug for TlsContext {
@@ -1232,7 +1233,23 @@ impl TlsContext {
         key_pem: &[u8],
         client_ca_pem: &[u8],
     ) -> Result<Self, TlsError> {
-        Self::build_server(cert_chain_pem, key_pem, Some(client_ca_pem))
+        Self::build(cert_chain_pem, key_pem, Some(client_ca_pem), false)
+    }
+
+    /// Build a mutually authenticated client context with explicit trust anchors.
+    ///
+    /// Supply the client certificate chain (leaf first), its private key, and
+    /// a PEM bundle of trusted server CAs. There is no system-store fallback.
+    /// The expected DNS name or IP is set on `TlsConnection::connect`.
+    ///
+    /// # Errors
+    /// Returns initialization, certificate, key, or trust-store errors.
+    pub fn client(
+        cert_chain_pem: &[u8],
+        key_pem: &[u8],
+        server_ca_pem: &[u8],
+    ) -> Result<Self, TlsError> {
+        Self::build(cert_chain_pem, key_pem, Some(server_ca_pem), true)
     }
 
     /// Build a server-side context that does **not** require the
@@ -1272,20 +1289,27 @@ impl TlsContext {
         cert_chain_pem: &[u8],
         key_pem: &[u8],
     ) -> Result<Self, TlsError> {
-        Self::build_server(cert_chain_pem, key_pem, None)
+        Self::build(cert_chain_pem, key_pem, None, false)
     }
 
     /// Shared body for [`Self::server`] and
     /// [`Self::server_without_client_auth`]. `client_ca_pem ==
     /// None` switches off mandatory mTLS.
-    fn build_server(
+    fn build(
         cert_chain_pem: &[u8],
         key_pem: &[u8],
         client_ca_pem: Option<&[u8]>,
+        is_client: bool,
     ) -> Result<Self, TlsError> {
         // SAFETY: TLS_server_method returns a pointer to a static
         // SSL_METHOD, never NULL.
-        let method = unsafe { TLS_server_method() };
+        let method = unsafe {
+            if is_client {
+                TLS_client_method()
+            } else {
+                TLS_server_method()
+            }
+        };
         // SAFETY: SSL_CTX_new returns NULL on alloc failure; we
         // check.
         let raw_ctx = unsafe { SSL_CTX_new(method) };
@@ -1340,6 +1364,33 @@ impl TlsContext {
         // The X509 / EVP_PKEY can drop now; SSL_CTX bumped their refcounts.
         drop(cert);
         drop(key);
+
+        let chain = new_mem_bio_readonly(cert_chain_pem)?;
+        let mut leaf = true;
+        loop {
+            // SAFETY: chain is a valid PEM BIO; NULL means no further certificate.
+            let raw = unsafe {
+                PEM_read_bio_X509(
+                    chain.0.as_ptr(),
+                    std::ptr::null_mut(),
+                    None,
+                    std::ptr::null_mut(),
+                )
+            };
+            let Some(raw) = NonNull::new(raw) else {
+                break;
+            };
+            let cert = X509Owned(raw);
+            if leaf {
+                leaf = false;
+                continue;
+            }
+            // SAFETY: ctx and cert are valid; ownership transfers only on success.
+            if unsafe { SSL_CTX_add_extra_chain_cert(ctx.0.as_ptr(), cert.0.as_ptr()) } != 1 {
+                return Err(TlsError::Ssl(pop_err("SSL_CTX_add_extra_chain_cert")));
+            }
+            std::mem::forget(cert);
+        }
 
         if let Some(pem) = client_ca_pem {
             // Trust anchors for the *client* certs. Required for
@@ -1396,6 +1447,7 @@ impl TlsContext {
 
         Ok(Self {
             inner: Arc::new(ctx),
+            is_client,
         })
     }
 }
@@ -1566,7 +1618,8 @@ pub struct TlsConnection {
     rbio: NonNull<BIO>, // input — we BIO_write here
     wbio: NonNull<BIO>, // output — we BIO_read here
     handshake_done: bool,
-    _ctx: TlsContext, // keep the SSL_CTX alive
+    expected_server_name: Option<String>,
+    context: TlsContext, // keep the SSL_CTX alive
 }
 
 // SAFETY: SSL objects can be sent between threads as long as no two
@@ -1581,6 +1634,40 @@ impl TlsConnection {
     /// Returns [`TlsError::Init`] if `SSL_new` or either `BIO_new`
     /// returns NULL.
     pub fn accept(ctx: &TlsContext) -> Result<Self, TlsError> {
+        if ctx.is_client {
+            return Err(TlsError::Init("server context required"));
+        }
+        Self::new(ctx)
+    }
+
+    /// Build a client connection, requiring a matching server DNS or IP SAN.
+    ///
+    /// DNS names are sent as SNI; IP addresses are verified without SNI.
+    /// Common-Name fallback is disabled.
+    ///
+    /// # Errors
+    /// Rejects server contexts, empty/NUL-containing names, and TLS init errors.
+    pub fn connect(ctx: &TlsContext, expected_name: &str) -> Result<Self, TlsError> {
+        if !ctx.is_client {
+            return Err(TlsError::Init("client context required"));
+        }
+        if expected_name.is_empty() {
+            return Err(TlsError::Init("server identity required"));
+        }
+        let name =
+            CString::new(expected_name).map_err(|_| TlsError::Init("invalid server identity"))?;
+        let mut connection = Self::new(ctx)?;
+        if expected_name.parse::<IpAddr>().is_err() {
+            // SAFETY: ssl is valid; libssl copies the NUL-terminated name.
+            if unsafe { SSL_set_tlsext_host_name(connection.ssl.0.as_ptr(), name.as_ptr()) } != 1 {
+                return Err(TlsError::Ssl(pop_err("SSL_set_tlsext_host_name")));
+            }
+        }
+        connection.expected_server_name = Some(expected_name.to_owned());
+        Ok(connection)
+    }
+
+    fn new(ctx: &TlsContext) -> Result<Self, TlsError> {
         // SAFETY: ctx valid.
         let raw_ssl = unsafe { SSL_new(ctx.inner.0.as_ptr()) };
         let ssl = SslHandle(NonNull::new(raw_ssl).ok_or(TlsError::Init("SSL_new"))?);
@@ -1604,7 +1691,8 @@ impl TlsConnection {
             rbio: NonNull::new(rbio_ptr).expect("non-null above"),
             wbio: NonNull::new(wbio_ptr).expect("non-null above"),
             handshake_done: false,
-            _ctx: ctx.clone(),
+            expected_server_name: None,
+            context: ctx.clone(),
         })
     }
 
@@ -1732,9 +1820,26 @@ impl TlsConnection {
             return Ok(HandshakeState::Established);
         }
         // SAFETY: ssl valid, not yet finished.
-        let r = unsafe { SSL_accept(self.ssl.0.as_ptr()) };
+        let r = unsafe {
+            if self.context.is_client {
+                SSL_connect(self.ssl.0.as_ptr())
+            } else {
+                SSL_accept(self.ssl.0.as_ptr())
+            }
+        };
         if r == 1 {
             self.handshake_done = true;
+            if let Some(expected) = &self.expected_server_name {
+                if !self
+                    .peer_certificate()
+                    .is_some_and(|peer| peer.matches_hostname(expected, false))
+                {
+                    self.handshake_done = false;
+                    return Err(TlsError::Handshake(
+                        "server certificate identity mismatch".into(),
+                    ));
+                }
+            }
             return Ok(HandshakeState::Established);
         }
         // SAFETY: ssl valid; SSL_get_error inspects ssl + the
@@ -1743,7 +1848,7 @@ impl TlsConnection {
         match err {
             SSL_ERROR_WANT_READ => Ok(HandshakeState::NeedsRead),
             SSL_ERROR_WANT_WRITE => Ok(HandshakeState::NeedsWrite),
-            _ => Err(TlsError::Handshake(pop_err("SSL_accept"))),
+            _ => Err(TlsError::Handshake(pop_err("TLS handshake"))),
         }
     }
 
