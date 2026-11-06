@@ -60,6 +60,8 @@ pub mod eap;
 pub mod encode;
 pub mod header;
 pub mod message_authenticator;
+pub(crate) mod request;
+pub(crate) mod response;
 pub mod typed;
 
 use attributes::AttributesIter;
@@ -96,6 +98,16 @@ pub enum CodecError {
     /// For example, `Tunnel-Password` (RFC 2868 §3.5) may only appear
     /// in an `Access-Accept` packet.
     WrongPacketType,
+    /// A request builder owns this attribute's encoding.
+    ReservedAttribute {
+        /// Attribute type managed by the builder.
+        typ: u8,
+    },
+    /// A PAP password exceeds the RFC 2865 maximum of 128 bytes.
+    PasswordTooLong {
+        /// Supplied plaintext length.
+        len: usize,
+    },
 }
 
 impl std::fmt::Display for CodecError {
@@ -111,6 +123,12 @@ impl std::fmt::Display for CodecError {
             ),
             CodecError::WrongPacketType => {
                 f.write_str("attribute not permitted in a packet of this type")
+            }
+            CodecError::ReservedAttribute { typ } => {
+                write!(f, "attribute {typ} is managed by the request builder")
+            }
+            CodecError::PasswordTooLong { len } => {
+                write!(f, "PAP password of {len} bytes exceeds 128 bytes")
             }
         }
     }

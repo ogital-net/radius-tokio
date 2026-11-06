@@ -2,6 +2,8 @@
 #![warn(missing_docs)]
 
 pub mod auth;
+#[cfg(feature = "client")]
+pub mod client;
 mod codec;
 mod crypto;
 

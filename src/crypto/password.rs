@@ -60,8 +60,8 @@ pub(crate) fn user_password_encrypt(
     // Pad password to a multiple of 16, minimum 16 bytes.
     let block_count = password.len().max(1).div_ceil(16);
     let padded_len = block_count * 16;
-    let mut plaintext = vec![0u8; padded_len];
-    plaintext[..password.len()].copy_from_slice(password);
+    let mut plaintext = super::ZeroizingBytes::new(vec![0u8; padded_len]);
+    plaintext.as_mut_bytes()[..password.len()].copy_from_slice(password);
 
     let mut out = vec![0u8; padded_len];
     let mut prev = *authenticator;
