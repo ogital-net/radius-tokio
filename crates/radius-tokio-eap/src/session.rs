@@ -22,7 +22,7 @@
 //!   adequate for single-process deployments; replace with a Redis
 //!   / DynamoDB-backed impl for HA.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,7 +38,7 @@ use crate::method::EapMethod;
 /// effectively unguessable, and it fits comfortably inside the
 /// 253-byte RADIUS attribute value cap with room to spare for any
 /// envelope a consumer might want to layer on top.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionId(pub [u8; 16]);
 
 impl SessionId {
@@ -154,11 +154,12 @@ pub trait SessionStore: Send + Sync + 'static {
 /// any worker can serve any session.
 ///
 /// Sessions expire after two idle minutes by default, with at most
-/// 4096 stored sessions. Expired entries are removed lazily; at
+/// 4096 stored sessions. Expired entries are indexed by deadline and
+/// removed lazily in bounded batches; at
 /// capacity the earliest-expiring entry is evicted. Override these
 /// limits with [`Self::with_limits`].
 pub struct InMemorySessionStore<M: EapMethod> {
-    inner: Arc<Mutex<HashMap<SessionId, StoredSession<M>>>>,
+    inner: Arc<Mutex<SessionTable<M>>>,
     idle_timeout: Duration,
     capacity: usize,
 }
@@ -166,6 +167,45 @@ pub struct InMemorySessionStore<M: EapMethod> {
 struct StoredSession<M: EapMethod> {
     session: Session<M>,
     expires_at: Instant,
+}
+
+struct SessionTable<M: EapMethod> {
+    entries: HashMap<SessionId, StoredSession<M>>,
+    expirations: BTreeSet<(Instant, SessionId)>,
+}
+
+impl<M: EapMethod> SessionTable<M> {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            expirations: BTreeSet::new(),
+        }
+    }
+
+    fn remove(&mut self, id: SessionId) -> Option<StoredSession<M>> {
+        let entry = self.entries.remove(&id)?;
+        self.expirations.remove(&(entry.expires_at, id));
+        Some(entry)
+    }
+
+    fn evict_first(&mut self) {
+        if let Some((_, id)) = self.expirations.pop_first() {
+            self.entries.remove(&id);
+        }
+    }
+
+    fn evict_expired(&mut self, now: Instant) {
+        for _ in 0..64 {
+            if self
+                .expirations
+                .first()
+                .is_none_or(|(deadline, _)| *deadline > now)
+            {
+                break;
+            }
+            self.evict_first();
+        }
+    }
 }
 
 impl<M: EapMethod> Default for InMemorySessionStore<M> {
@@ -191,7 +231,7 @@ impl<M: EapMethod> InMemorySessionStore<M> {
     pub fn with_limits(idle_timeout: Duration, capacity: usize) -> Self {
         assert!(capacity > 0, "session capacity must be positive");
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
+            inner: Arc::new(Mutex::new(SessionTable::new())),
             idle_timeout,
             capacity,
         }
@@ -204,30 +244,28 @@ impl<M: EapMethod + 'static> SessionStore for InMemorySessionStore<M> {
     async fn insert(&self, id: SessionId, session: Session<Self::Method>) {
         let mut entries = self.inner.lock().await;
         let now = Instant::now();
-        entries.retain(|_, entry| entry.expires_at > now);
-        if entries.len() >= self.capacity && !entries.contains_key(&id) {
-            if let Some(oldest) = entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.expires_at)
-                .map(|(id, _)| *id)
-            {
-                entries.remove(&oldest);
-            }
+        entries.evict_expired(now);
+        if entries.entries.len() >= self.capacity && !entries.entries.contains_key(&id) {
+            entries.evict_first();
         }
-        entries.insert(
+        let expires_at = now + self.idle_timeout;
+        if let Some(previous) = entries.entries.insert(
             id,
             StoredSession {
                 session,
-                expires_at: now + self.idle_timeout,
+                expires_at,
             },
-        );
+        ) {
+            entries.expirations.remove(&(previous.expires_at, id));
+        }
+        entries.expirations.insert((expires_at, id));
     }
 
     async fn take(&self, id: SessionId) -> Option<Session<Self::Method>> {
         self.inner
             .lock()
             .await
-            .remove(&id)
+            .remove(id)
             .filter(|entry| entry.expires_at > Instant::now())
             .map(|entry| entry.session)
     }
@@ -289,7 +327,8 @@ mod tests {
         let id = SessionId([1; 16]);
         store.insert(id, Session::new(Dummy)).await;
         assert!(store.take(id).await.is_none());
-        assert!(store.inner.lock().await.is_empty());
+        assert!(store.inner.lock().await.entries.is_empty());
+        assert!(store.inner.lock().await.expirations.is_empty());
     }
 
     #[tokio::test]
@@ -299,7 +338,7 @@ mod tests {
             store
                 .insert(SessionId([value; 16]), Session::new(Dummy))
                 .await;
-            assert_eq!(store.inner.lock().await.len(), 1);
+            assert_eq!(store.inner.lock().await.entries.len(), 1);
         }
     }
 
@@ -310,13 +349,58 @@ mod tests {
         let second = SessionId([2; 16]);
         let third = SessionId([3; 16]);
         store.insert(first, Session::new(Dummy)).await;
-        store.inner.lock().await.get_mut(&first).unwrap().expires_at =
-            Instant::now() + Duration::from_secs(30);
         store.insert(second, Session::new(Dummy)).await;
         store.insert(third, Session::new(Dummy)).await;
-        assert_eq!(store.inner.lock().await.len(), 2);
+        assert_eq!(store.inner.lock().await.entries.len(), 2);
         assert!(store.take(first).await.is_none());
         assert!(store.take(second).await.is_some());
         assert!(store.take(third).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn repeated_rounds_keep_one_expiration_per_session() {
+        let store = InMemorySessionStore::new();
+        let id = SessionId([1; 16]);
+        for _ in 0..1000 {
+            store.insert(id, Session::new(Dummy)).await;
+            let table = store.inner.lock().await;
+            assert_eq!(table.entries.len(), 1);
+            assert_eq!(table.expirations.len(), 1);
+        }
+        for _ in 0..1000 {
+            let session = store.take(id).await.unwrap();
+            assert!(store.inner.lock().await.expirations.is_empty());
+            store.insert(id, session).await;
+        }
+        assert_eq!(store.inner.lock().await.expirations.len(), 1);
+    }
+
+    #[test]
+    fn expiration_work_is_bounded_and_preserves_live_sessions() {
+        let mut table = SessionTable::new();
+        let now = Instant::now();
+        for counter in 0..129 {
+            let id = SessionId([counter; 16]);
+            let expires_at = if counter == 128 {
+                now + Duration::from_secs(30)
+            } else {
+                now
+            };
+            table.entries.insert(
+                id,
+                StoredSession {
+                    session: Session::new(Dummy),
+                    expires_at,
+                },
+            );
+            table.expirations.insert((expires_at, id));
+        }
+        table.evict_expired(now);
+        assert_eq!(table.entries.len(), 65);
+        assert_eq!(table.expirations.len(), 65);
+        table.evict_expired(now);
+        assert_eq!(table.entries.len(), 1);
+        assert!(table.entries.contains_key(&SessionId([128; 16])));
+        assert_eq!(table.expirations.len(), 1);
     }
 }
