@@ -6,6 +6,13 @@ pub mod auth;
 pub mod client;
 mod codec;
 mod crypto;
+#[cfg(any(feature = "server", feature = "client"))]
+mod exchange;
+mod secret;
+#[cfg(any(feature = "server", feature = "client"))]
+mod transport;
+
+pub use secret::SecretBytes;
 
 /// Constant-time byte-slice equality, backed by `CRYPTO_memcmp`.
 /// Use this in any handler or EAP inner method that compares a

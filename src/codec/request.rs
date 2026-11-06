@@ -25,6 +25,13 @@ impl std::fmt::Debug for Request {
 }
 
 impl Request {
+    pub(crate) fn from_buffer(buf: PacketBuffer) -> Self {
+        Self {
+            buf,
+            password: None,
+        }
+    }
+
     fn new(code: Code) -> Self {
         let mut buf = PacketBuffer::new(code, 0);
         message_authenticator::append_zeroed_slot(&mut buf)

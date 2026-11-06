@@ -256,6 +256,10 @@ name = "mixed_udp_radsec"
 required-features = ["server", "radsec"]
 
 [[test]]
+name = "client_udp"
+required-features = ["client"]
+
+[[test]]
 name = "accounting"
 required-features = ["server"]
 

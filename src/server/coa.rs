@@ -45,19 +45,16 @@
 //! Identifier, same Authenticator) on each retry; the NAS's dedup
 //! cache will fold the duplicate.
 
-use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::net::UdpSocket;
-use tokio::sync::{oneshot, Semaphore};
-use tokio::time::timeout;
-
-use crate::codec::header::{Code, Header, MAX_PACKET_LEN};
-use crate::codec::message_authenticator::Verification;
-use crate::codec::{authenticator, message_authenticator, CodecError, PacketBuffer};
+use crate::codec::header::Code;
+use crate::codec::request::Request;
+use crate::codec::{message_authenticator, CodecError, PacketBuffer};
+use crate::exchange::{ClientConfig, ClientError};
+use crate::transport::udp::UdpClient;
+use crate::AttributesView;
 
 /// Which dynamic-authorization request the NAS sent us (RFC 5176).
 ///
@@ -334,75 +331,19 @@ impl From<CodecError> for CoaError {
     }
 }
 
-/// One in-flight slot. Dropping the `Sender` (originator shutdown)
-/// gives the waiter `CoaError::Cancelled`.
-struct Inflight {
-    reply_tx: Option<oneshot::Sender<CoaOutcome>>,
-    code: Code,
-    authenticator: [u8; 16],
-    secret: super::client::SecretBytes,
-}
-
-struct Registration {
-    state: Arc<Mutex<HashMap<SocketAddr, TargetState>>>,
-    target: SocketAddr,
-    identifier: u8,
-}
-
-impl Drop for Registration {
-    fn drop(&mut self) {
-        if let Some(target) = self
-            .state
-            .lock()
-            .expect("registry poisoned")
-            .get_mut(&self.target)
-        {
-            target.inflight.remove(&self.identifier);
-        }
-    }
-}
-
-/// Per-target state. Identifier allocation and the in-flight registry
-/// live here; the rate-limit semaphore is kept separately so it can
-/// be cloned cheaply per send.
-#[derive(Default)]
-struct TargetState {
-    inflight: HashMap<u8, Inflight>,
-    next_identifier: u8,
-}
-
-impl TargetState {
-    /// Walk the Identifier space starting at `next_identifier`,
-    /// returning the first value not currently in flight. `None` if
-    /// every value is taken.
-    fn find_free_identifier(&mut self) -> Option<u8> {
-        for step in 0..=u8::MAX {
-            let candidate = self.next_identifier.wrapping_add(step);
-            if !self.inflight.contains_key(&candidate) {
-                self.next_identifier = candidate.wrapping_add(1);
-                return Some(candidate);
-            }
-        }
-        None
-    }
-}
-
 /// `CoA` / Disconnect originator over UDP.
 ///
 /// One instance owns one bound UDP socket and a background reader
-/// task. Share via [`Arc`] across the application.
+/// task. Share via `Arc` across the application.
 pub struct CoaOriginator {
-    socket: Arc<UdpSocket>,
-    state: Arc<Mutex<HashMap<SocketAddr, TargetState>>>,
-    semaphores: Arc<Mutex<HashMap<SocketAddr, Arc<Semaphore>>>>,
+    transport: UdpClient,
     config: CoaConfig,
-    reader: tokio::task::JoinHandle<()>,
 }
 
 impl std::fmt::Debug for CoaOriginator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CoaOriginator")
-            .field("local_addr", &self.socket.local_addr().ok())
+            .field("local_addr", &self.transport.local_addr().ok())
             .field("config", &self.config)
             .finish_non_exhaustive()
     }
@@ -415,20 +356,21 @@ impl CoaOriginator {
     ///
     /// # Errors
     ///
-    /// Forwards any I/O error from [`UdpSocket::bind`].
+    /// Forwards any I/O error from [`tokio::net::UdpSocket::bind`].
     pub async fn bind(local_addr: SocketAddr, config: CoaConfig) -> io::Result<Self> {
-        let socket = Arc::new(UdpSocket::bind(local_addr).await?);
-        debug!(event = "coa_bind", local = %socket.local_addr()?);
-        let state: Arc<Mutex<HashMap<SocketAddr, TargetState>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let reader = tokio::spawn(reader_loop(Arc::clone(&socket), Arc::clone(&state)));
-        Ok(Self {
-            socket,
-            state,
-            semaphores: Arc::new(Mutex::new(HashMap::new())),
-            config,
-            reader,
-        })
+        let transport = UdpClient::bind(
+            local_addr,
+            ClientConfig {
+                initial_timeout: config.initial_timeout,
+                max_retries: config.max_retries,
+                backoff_multiplier: config.backoff_multiplier,
+                max_in_flight_per_target: config.max_in_flight_per_target,
+                ..ClientConfig::default()
+            },
+        )
+        .await?;
+        debug!(event = "coa_bind", local = %transport.local_addr()?);
+        Ok(Self { transport, config })
     }
 
     /// Local address the reader is listening on (the port the NAS
@@ -437,9 +379,9 @@ impl CoaOriginator {
     ///
     /// # Errors
     ///
-    /// Forwards [`UdpSocket::local_addr`].
+    /// Forwards [`tokio::net::UdpSocket::local_addr`].
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.socket.local_addr()
+        self.transport.local_addr()
     }
 
     /// Send a `CoA-Request` to `target` and await `CoA-ACK` or
@@ -498,233 +440,49 @@ impl CoaOriginator {
     where
         F: FnOnce(&mut PacketBuffer) -> Result<(), CodecError>,
     {
-        // ---- per-target rate limit ---------------------------------
-        let sem = self.semaphore_for(target);
-        let _permit = sem
-            .try_acquire_owned()
-            .map_err(|_| CoaError::InFlightLimit)?;
-
-        // ---- build packet body (M-A slot reserved up front) --------
         let mut buf = PacketBuffer::new(code, 0);
-        let ma_offset = message_authenticator::append_zeroed_slot(&mut buf)?;
+        message_authenticator::append_zeroed_slot(&mut buf)?;
         build(&mut buf)?;
-
-        // ---- allocate Identifier + register in-flight slot --------
-        let (identifier, reply_rx) = {
-            let mut all = self.state.lock().expect("registry poisoned");
-            let slot = all.entry(target).or_default();
-            let identifier = slot
-                .find_free_identifier()
-                .ok_or(CoaError::IdentifierExhausted)?;
-            buf.set_identifier(identifier);
-
-            // Order matters: for Accounting/CoA/Disconnect requests
-            // the Authenticator is `MD5(packet-with-zeroed-auth ||
-            // secret)`, so it depends on the M-A bytes already being
-            // in place. The M-A in turn must be computed with the
-            // Authenticator field treated as zero (chicken-and-egg
-            // resolved by RFC 5176 §3.1 / RFC 2866 §3 convention):
-            //   1. Patch length, leave auth = 0, compute M-A with
-            //      a zero substitute, patch M-A.
-            //   2. Compute the zeroed-request authenticator over the
-            //      packet with M-A populated and auth still 0; set
-            //      the Authenticator field.
-            buf.patch_length();
-            let tag = message_authenticator::compute(buf.as_bytes(), &[0u8; 16], secret);
-            message_authenticator::patch(&mut buf, ma_offset, &tag);
-            let auth = authenticator::compute_zeroed_request(buf.as_bytes(), secret);
-            buf.set_authenticator(auth);
-
-            let (reply_tx, reply_rx) = oneshot::channel();
-            slot.inflight.insert(
-                identifier,
-                Inflight {
-                    reply_tx: Some(reply_tx),
-                    code,
-                    authenticator: auth,
-                    secret: secret.into(),
-                },
-            );
-            (identifier, reply_rx)
-        };
-        let _registration = Registration {
-            state: Arc::clone(&self.state),
-            target,
-            identifier,
-        };
-
-        // ---- send + retry loop ------------------------------------
-        let bytes = buf.as_bytes().to_vec();
-        debug!(
-            event = "coa_send",
-            %target,
-            code = code.0,
-            id = identifier,
-            len = bytes.len(),
-        );
+        debug!(event = "coa_send", %target, code = code.0);
         count!("radius_tokio.coa_requests_sent", "code" => code.0.to_string());
-        let outcome = send_and_await(&self.socket, target, &bytes, reply_rx, &self.config).await;
-
-        #[cfg(feature = "metrics")]
-        if let Err(e) = &outcome {
-            count!(
-                "radius_tokio.coa_outcomes",
-                "outcome" => if matches!(e, CoaError::Timeout) { "timeout" } else { "error" }
-            );
-        }
-        let result = outcome;
+        let response = self
+            .transport
+            .send(target, secret, Request::from_buffer(buf))
+            .await
+            .map_err(|error| match error {
+                ClientError::Io(error) => CoaError::Io(error),
+                ClientError::Codec(error) => CoaError::Codec(error),
+                ClientError::Timeout => CoaError::Timeout,
+                ClientError::InFlightLimit => CoaError::InFlightLimit,
+                ClientError::IdentifierExhausted => CoaError::IdentifierExhausted,
+                ClientError::Closed => CoaError::Cancelled,
+            });
+        let result = response.map(|response| {
+            let attributes = response.attributes().raw_attributes().to_vec();
+            if matches!(response.code(), Code::COA_ACK | Code::DISCONNECT_ACK) {
+                CoaOutcome::Ack { attributes }
+            } else {
+                CoaOutcome::Nak { attributes }
+            }
+        });
         #[allow(clippy::match_same_arms)]
         // arms differ in obs calls; identical only when both features are off
         match &result {
             Ok(CoaOutcome::Ack { .. }) => {
-                debug!(event = "coa_ack", %target, code = code.0, id = identifier);
+                debug!(event = "coa_ack", %target, code = code.0);
                 count!("radius_tokio.coa_outcomes", "outcome" => "ack");
             }
             Ok(CoaOutcome::Nak { .. }) => {
-                debug!(event = "coa_nak", %target, code = code.0, id = identifier);
+                debug!(event = "coa_nak", %target, code = code.0);
                 count!("radius_tokio.coa_outcomes", "outcome" => "nak");
             }
             Err(_e) => {
-                debug!(event = "coa_error", %target, code = code.0, id = identifier, error = %_e);
+                debug!(event = "coa_error", %target, code = code.0, error = %_e);
                 count!("radius_tokio.coa_outcomes", "outcome" => "error");
             }
         }
         result
     }
-
-    fn semaphore_for(&self, target: SocketAddr) -> Arc<Semaphore> {
-        let mut map = self.semaphores.lock().expect("semaphore map poisoned");
-        Arc::clone(
-            map.entry(target)
-                .or_insert_with(|| Arc::new(Semaphore::new(self.config.max_in_flight_per_target))),
-        )
-    }
-}
-
-impl Drop for CoaOriginator {
-    fn drop(&mut self) {
-        // Stop the reader task. Inflight oneshot senders are dropped
-        // with it, so any waiter sees `CoaError::Cancelled`.
-        self.reader.abort();
-    }
-}
-
-/// Background task: read every datagram off `socket`, decode the
-/// header, look up the matching in-flight slot by `(src, identifier)`,
-/// and deliver authenticated replies to the waiter via its `oneshot`.
-///
-/// Anything we cannot match (unknown identifier, malformed header,
-/// reply for a slot whose waiter has already given up) is silently
-/// dropped — the NAS will retransmit if it cares.
-async fn reader_loop(socket: Arc<UdpSocket>, state: Arc<Mutex<HashMap<SocketAddr, TargetState>>>) {
-    let mut buf = vec![0u8; MAX_PACKET_LEN];
-    loop {
-        let Ok((len, src)) = socket.recv_from(&mut buf).await else {
-            // Socket closed; reader exits.
-            return;
-        };
-        let datagram = &buf[..len];
-        let Ok((header, _)) = Header::parse(datagram) else {
-            continue;
-        };
-        let mut all = state.lock().expect("registry poisoned");
-        let Some(slot) = all
-            .get_mut(&src)
-            .and_then(|target| target.inflight.get_mut(&header.identifier))
-        else {
-            continue;
-        };
-        if slot.reply_tx.is_none() {
-            continue;
-        }
-        let Ok(outcome) = validate_and_classify(
-            slot.code,
-            datagram,
-            &slot.authenticator,
-            slot.secret.as_bytes(),
-        ) else {
-            continue;
-        };
-        if let Some(reply_tx) = slot.reply_tx.take() {
-            let _ = reply_tx.send(outcome);
-        }
-    }
-}
-
-/// Send the packet and wait for either the oneshot or the timeout,
-/// retransmitting up to `config.max_retries` times.
-async fn send_and_await(
-    socket: &UdpSocket,
-    target: SocketAddr,
-    bytes: &[u8],
-    mut reply_rx: oneshot::Receiver<CoaOutcome>,
-    config: &CoaConfig,
-) -> Result<CoaOutcome, CoaError> {
-    let mut wait = config.initial_timeout;
-    let attempts = u16::from(config.max_retries) + 1;
-    for attempt in 0..attempts {
-        socket.send_to(bytes, target).await?;
-        if attempt > 0 {
-            debug!(event = "coa_retransmit", %target, attempt, len = bytes.len());
-        }
-        match timeout(wait, &mut reply_rx).await {
-            Ok(Ok(reply)) => return Ok(reply),
-            Ok(Err(_)) => return Err(CoaError::Cancelled),
-            Err(_) => {
-                if attempt + 1 < attempts {
-                    wait = wait.saturating_mul(config.backoff_multiplier.max(1));
-                }
-            }
-        }
-    }
-    debug!(event = "coa_timeout", %target, attempts);
-    Err(CoaError::Timeout)
-}
-
-/// Validate the inbound reply (code + Response Authenticator + M-A)
-/// and turn it into a [`CoaOutcome`].
-fn validate_and_classify(
-    request_code: Code,
-    datagram: &[u8],
-    request_authenticator: &[u8; 16],
-    secret: &[u8],
-) -> Result<CoaOutcome, CoaError> {
-    let (ack_code, nak_code) = match request_code {
-        Code::COA_REQUEST => (Code::COA_ACK, Code::COA_NAK),
-        Code::DISCONNECT_REQUEST => (Code::DISCONNECT_ACK, Code::DISCONNECT_NAK),
-        // Originator only emits the two request codes above.
-        other => return Err(CoaError::UnexpectedReplyCode(other)),
-    };
-
-    let (header, attrs) = Header::parse(datagram).map_err(|_| CoaError::AuthenticatorMismatch)?;
-    let datagram = &datagram[..usize::from(header.length)];
-
-    if header.code != ack_code && header.code != nak_code {
-        return Err(CoaError::UnexpectedReplyCode(header.code));
-    }
-
-    if !authenticator::verify_response(datagram, request_authenticator, secret) {
-        return Err(CoaError::AuthenticatorMismatch);
-    }
-
-    match message_authenticator::verify(datagram, request_authenticator, secret) {
-        Verification::Valid => {}
-        // RFC 5176 §3.5 makes M-A mandatory on replies; treat absent
-        // and invalid identically.
-        Verification::Absent | Verification::Invalid => {
-            return Err(CoaError::MessageAuthenticatorInvalid);
-        }
-    }
-
-    Ok(if header.code == ack_code {
-        CoaOutcome::Ack {
-            attributes: attrs.to_vec(),
-        }
-    } else {
-        CoaOutcome::Nak {
-            attributes: attrs.to_vec(),
-        }
-    })
 }
 
 #[cfg(test)]

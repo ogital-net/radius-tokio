@@ -10,7 +10,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::crypto::cleanse;
+pub use crate::SecretBytes;
 
 /// Opaque, process-unique identifier for a [`Client`].
 ///
@@ -49,58 +49,6 @@ impl fmt::Display for ClientId {
     /// Renders the underlying counter as a plain decimal number.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0.get())
-    }
-}
-
-/// Owned shared-secret bytes. The buffer is overwritten with
-/// `OPENSSL_cleanse` on drop.
-///
-/// Display / Debug deliberately do not reveal contents.
-///
-/// # Clone
-///
-/// Deliberately not `Clone`: duplicating the secret would defeat the
-/// `OPENSSL_cleanse`-on-drop guarantee — the original allocation
-/// could be freed while a copy keeps the bytes resident. Callers that
-/// need to share a secret across tasks hold the owning
-/// [`Client`] inside an [`Arc`](std::sync::Arc).
-pub struct SecretBytes(Box<[u8]>);
-
-impl SecretBytes {
-    /// Wrap an existing byte buffer.
-    #[must_use]
-    pub fn new(bytes: impl Into<Box<[u8]>>) -> Self {
-        Self(bytes.into())
-    }
-
-    /// Borrow the secret bytes.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl From<&[u8]> for SecretBytes {
-    fn from(b: &[u8]) -> Self {
-        Self::new(b.to_vec().into_boxed_slice())
-    }
-}
-
-impl<const N: usize> From<&[u8; N]> for SecretBytes {
-    fn from(b: &[u8; N]) -> Self {
-        Self::new(b.as_slice().to_vec().into_boxed_slice())
-    }
-}
-
-impl Drop for SecretBytes {
-    fn drop(&mut self) {
-        cleanse(&mut self.0);
-    }
-}
-
-impl fmt::Debug for SecretBytes {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SecretBytes({} bytes)", self.0.len())
     }
 }
 
