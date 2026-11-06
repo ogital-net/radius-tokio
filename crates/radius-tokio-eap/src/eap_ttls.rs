@@ -324,12 +324,18 @@ impl<C: PapCredentials> TtlsInner for PapInner<C> {
             let mut pass = None;
             self.authenticated_username = None;
             for avp in avps {
-                if avp.vendor.is_some() {
-                    continue;
-                }
-                match avp.code {
-                    AVP_USER_NAME => user = Some(avp.data.as_slice()),
-                    AVP_USER_PASSWORD => pass = Some(avp.data.as_slice()),
+                match (avp.vendor, avp.code) {
+                    (None, AVP_USER_NAME) => {
+                        if user.replace(avp.data.as_slice()).is_some() {
+                            return Ok(TtlsInnerOutcome::Failure);
+                        }
+                    }
+                    (None, AVP_USER_PASSWORD) => {
+                        if pass.replace(avp.data.as_slice()).is_some() {
+                            return Ok(TtlsInnerOutcome::Failure);
+                        }
+                    }
+                    _ if avp.mandatory => return Ok(TtlsInnerOutcome::Failure),
                     _ => {}
                 }
             }
@@ -648,6 +654,63 @@ mod tests {
             other => panic!("expected Success, got {other:?}"),
         }
         assert_eq!(inner.authenticated_identity(), Some(b"alice".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn pap_inner_rejects_ambiguous_credentials_and_unknown_mandatory_avps() {
+        let creds = Arc::new(StaticPapCredentials::cleartext("alice", "hello123"));
+        let credentials = vec![
+            Avp {
+                code: AVP_USER_NAME,
+                vendor: None,
+                mandatory: true,
+                data: b"alice".to_vec(),
+            },
+            Avp {
+                code: AVP_USER_PASSWORD,
+                vendor: None,
+                mandatory: true,
+                data: b"hello123".to_vec(),
+            },
+        ];
+        for extra in [
+            credentials[0].clone(),
+            credentials[1].clone(),
+            Avp {
+                code: 999,
+                vendor: None,
+                mandatory: true,
+                data: Vec::new(),
+            },
+            Avp {
+                code: AVP_USER_NAME,
+                vendor: Some(311),
+                mandatory: true,
+                data: Vec::new(),
+            },
+        ] {
+            let mut inner = PapInner::new(Arc::clone(&creds));
+            let mut avps = credentials.clone();
+            avps.push(extra);
+            assert!(matches!(
+                inner.process(&avps, &[]).await.unwrap(),
+                TtlsInnerOutcome::Failure
+            ));
+            assert_eq!(inner.authenticated_identity(), None);
+        }
+
+        let mut inner = PapInner::new(creds);
+        let mut avps = credentials;
+        avps.push(Avp {
+            code: 999,
+            vendor: Some(311),
+            mandatory: false,
+            data: Vec::new(),
+        });
+        assert!(matches!(
+            inner.process(&avps, &[]).await.unwrap(),
+            TtlsInnerOutcome::Success
+        ));
     }
 
     #[tokio::test]

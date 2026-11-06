@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- TTLS-PAP rejects duplicate credential AVPs and unsupported mandatory AVPs
+	instead of authenticating an ambiguous or incompletely understood request.
 - `IssuedCertificate` debug output redacts private key material.
 - Access-Requests carrying EAP-Message require Message-Authenticator even
 	when the client permits legacy non-EAP requests without it.
