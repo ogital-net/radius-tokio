@@ -92,8 +92,17 @@ pub(crate) fn cleanse(buf: &mut [u8]) {
 /// `Clone`: copying the secret material would defeat the purpose.
 /// Borrow `&[u8]` via [`as_bytes`](Self::as_bytes) (or via the `Deref`
 /// impl) to feed it into APIs that consume a slice.
-#[derive(Debug)]
 pub struct ZeroizingBytes(Vec<u8>);
+
+impl std::fmt::Debug for ZeroizingBytes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "ZeroizingBytes([REDACTED; {} bytes])",
+            self.0.len()
+        )
+    }
+}
 
 impl ZeroizingBytes {
     /// Take ownership of `buf`. The buffer's bytes are scrubbed when
@@ -154,6 +163,15 @@ impl Eq for ZeroizingBytes {}
 #[cfg(test)]
 mod tests {
     use super::{cleanse, ct_eq, ZeroizingBytes};
+
+    #[test]
+    fn zeroizing_bytes_debug_redacts_plaintext() {
+        let secret = ZeroizingBytes::new(b"private-password".to_vec());
+        assert_eq!(
+            format!("{secret:?}"),
+            "ZeroizingBytes([REDACTED; 16 bytes])"
+        );
+    }
 
     #[test]
     fn ct_eq_handles_unequal_lengths() {

@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `ZeroizingBytes` debug output redacts decrypted passwords and key material.
 - Tunnel-Password and MPPE encryption salts are guaranteed unique within
 	each reply, retrying random collisions instead of reusing an encryption mask.
 - `MsChapSecret` debug output redacts cleartext passwords and NT hashes;
